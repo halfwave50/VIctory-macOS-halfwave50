@@ -1314,7 +1314,75 @@ mod tests {
     use super::*;
     use crate::profile::Filter;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{
+        AtomicBool, AtomicU64, AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release},
+    };
+
+    /// Serializes sampler tests: `Sampler::step` writes the process-global
+    /// `ON`, `ROUND` and `QUIET_ROUNDS` atomics, and the fault tests share
+    /// `GUARDED` and `on_fault`. Running two fault tests in parallel
+    /// overwrites `GUARDED` while the other test's worker writes to its
+    /// read-only page, ending the process with an unhandled page fault.
+    static SAMPLER_TEST: Mutex<()> = Mutex::new(());
+
+    struct SamplerTestGuard(std::sync::MutexGuard<'static, ()>);
+
+    impl SamplerTestGuard {
+        fn enter() -> Self {
+            let guard = SAMPLER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            ON.store(false, Relaxed);
+            ROUND.store(0, Relaxed);
+            QUIET_ROUNDS.store(0, Relaxed);
+            SamplerTestGuard(guard)
+        }
+    }
+
+    impl Drop for SamplerTestGuard {
+        fn drop(&mut self) {
+            ON.store(false, Relaxed);
+            ROUND.store(0, Relaxed);
+            QUIET_ROUNDS.store(0, Relaxed);
+            let _ = &self.0;
+        }
+    }
+
+    /// A guarded page and its vectored handler for a sampler fault test,
+    /// cleaned up on drop (declared before worker guards so workers are
+    /// stopped and joined before the page is freed).
+    struct GuardedPage {
+        page: usize,
+        handler: *mut c_void,
+    }
+
+    impl GuardedPage {
+        fn new() -> Self {
+            use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+            // SAFETY: our handler, removed in Drop.
+            let handler = unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
+            assert!(!handler.is_null());
+            // SAFETY: a fresh page of ours, freed in Drop.
+            let page =
+                unsafe { VirtualAlloc(null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
+                    as usize;
+            assert_ne!(page, 0);
+            GUARDED.store(page, Release);
+            GuardedPage { page, handler }
+        }
+    }
+
+    impl Drop for GuardedPage {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+            GUARDED.store(0, Release);
+            // SAFETY: registered and allocated in `new`, not used again once
+            // workers have stopped.
+            unsafe {
+                RemoveVectoredExceptionHandler(self.handler);
+                VirtualFree(self.page as *mut c_void, 0, MEM_RELEASE);
+            }
+        }
+    }
 
     fn config(threads: &str, file: &str) -> Config {
         Config {
@@ -1406,6 +1474,7 @@ mod tests {
     /// and running, and the walk finds the function that called it.
     #[test]
     fn a_spinning_thread_is_found_in_its_function() {
+        let _test = SamplerTestGuard::enter();
         let (id, stop, worker) = spinner();
         let mut s = Sampler::new(config(&id.to_string(), "NUL"), Vec::new()).unwrap();
         run_for(&mut s, Duration::from_millis(1500));
@@ -1468,6 +1537,7 @@ mod tests {
     /// Threads blocked in a channel, a sleep and an event wait read as waiting.
     #[test]
     fn waiting_threads_read_as_waiting() {
+        let _test = SamplerTestGuard::enter();
         use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
         let (tx, rx) = std::sync::mpsc::channel::<u32>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1563,6 +1633,7 @@ mod tests {
     /// in the image it started in; another thread doing the same runs.
     #[test]
     fn audio_timer_threads_count_as_waiting() {
+        let _test = SamplerTestGuard::enter();
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
         let workers: Vec<_> = (0..2)
@@ -1618,6 +1689,7 @@ mod tests {
     /// blocked in a registry watch as waiting; neither as running.
     #[test]
     fn file_reads_and_registry_watches_are_not_running() {
+        let _test = SamplerTestGuard::enter();
         use windows_sys::Win32::System::Registry::{
             HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_NOTIFY_CHANGE_LAST_SET, REG_OPTION_VOLATILE, REG_SZ,
             RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegNotifyChangeKeyValue, RegSetValueExW,
@@ -1715,7 +1787,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, VirtualProtect};
         // SAFETY: the system passes valid exception pointers.
         let record = unsafe { &*(*info).ExceptionRecord };
-        let page = GUARDED.load(Relaxed);
+        let page = GUARDED.load(Acquire);
         if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || page == 0 {
             return 0;
         }
@@ -1737,23 +1809,16 @@ mod tests {
     /// tracking does; Wine's write watch, handled inside Wine), that call
     /// the system all the time, and that spin, all go on and end normally.
     fn survive(kinds: &[u32], time: Duration) {
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
-        };
+        let _test = SamplerTestGuard::enter();
         use windows_sys::Win32::System::Memory::{
             MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS, PAGE_READONLY, ResetWriteWatch,
             VirtualProtect, VirtualQuery,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         use windows_sys::Win32::System::Threading::SwitchToThread;
-        // SAFETY: our handler, removed below.
-        let handler = unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
-        assert!(!handler.is_null());
+        let guarded_page = GuardedPage::new();
+        let guarded = guarded_page.page;
         // SAFETY: fresh pages of ours.
-        let guarded =
-            unsafe { VirtualAlloc(null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
-                as usize;
-        // SAFETY: as above.
         let watched = unsafe {
             VirtualAlloc(
                 null(),
@@ -1762,14 +1827,36 @@ mod tests {
                 PAGE_READWRITE,
             )
         } as usize;
-        assert!(guarded != 0 && watched != 0);
-        GUARDED.store(guarded, Relaxed);
+        assert_ne!(watched, 0);
+        struct WatchedPages(usize);
+        impl Drop for WatchedPages {
+            fn drop(&mut self) {
+                // SAFETY: allocated above, freed after workers join.
+                unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE) };
+            }
+        }
+        let _watched_pages = WatchedPages(watched);
+        struct Workers {
+            stop: Arc<AtomicBool>,
+            handles: Vec<std::thread::JoinHandle<u64>>,
+        }
+        impl Drop for Workers {
+            fn drop(&mut self) {
+                self.stop.store(true, Relaxed);
+                for w in self.handles.drain(..) {
+                    let _ = w.join();
+                }
+            }
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut workers = Vec::new();
+        let mut workers = Workers {
+            stop: stop.clone(),
+            handles: Vec::new(),
+        };
         for &kind in kinds {
             let (stop, tx) = (stop.clone(), tx.clone());
-            workers.push(std::thread::spawn(move || {
+            workers.handles.push(std::thread::spawn(move || {
                 // SAFETY: a plain query.
                 tx.send((unsafe { GetCurrentThreadId() }, kind)).unwrap();
                 let mut n = 0u64;
@@ -1827,17 +1914,13 @@ mod tests {
         run_for(&mut s, time);
         stop.store(true, Relaxed);
         let counts: Vec<u64> = workers
-            .into_iter()
+            .handles
+            .drain(..)
             .map(|w| w.join().expect("a worker ended early"))
             .collect();
         let faults = FAULTS.load(Relaxed) - faults_before;
-        GUARDED.store(0, Relaxed);
-        // SAFETY: ours, not used again.
-        unsafe {
-            RemoveVectoredExceptionHandler(handler);
-            VirtualFree(guarded as *mut c_void, 0, MEM_RELEASE);
-            VirtualFree(watched as *mut c_void, 0, MEM_RELEASE);
-        }
+        drop(_watched_pages);
+        drop(guarded_page);
         eprintln!(
             "faulting, calling and spinning threads: {}; {faults} guard faults; loops {counts:?}; samples per thread {:?}",
             stats(&s),
@@ -1872,25 +1955,50 @@ mod tests {
     /// faulting thread's left-out looks are never running.
     #[test]
     fn a_thread_running_beside_waiting_reading_and_faulting_ones_is_alone() {
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
-        };
+        let _test = SamplerTestGuard::enter();
         use windows_sys::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READONLY, VirtualProtect};
-        // SAFETY: our handler, removed below.
-        let handler = unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
-        assert!(!handler.is_null());
-        // SAFETY: a fresh page of ours.
-        let guarded = unsafe { VirtualAlloc(null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
-        assert_ne!(guarded, 0);
-        GUARDED.store(guarded, Relaxed);
+        let guarded_page = GuardedPage::new();
+        let guarded = guarded_page.page;
         let (mut read_end, mut write_end): (HANDLE, HANDLE) = (null_mut(), null_mut());
         // SAFETY: out pointers to two handles.
         assert_ne!(unsafe { CreatePipe(&mut read_end, &mut write_end, null(), 0) }, 0);
+        struct Pipe(HANDLE, HANDLE);
+        impl Drop for Pipe {
+            fn drop(&mut self) {
+                // SAFETY: pipe handles created above, closed after workers join.
+                unsafe {
+                    CloseHandle(self.0);
+                    CloseHandle(self.1);
+                }
+            }
+        }
+        let _pipe = Pipe(read_end, write_end);
         let read_at = read_end as usize;
+        let write_at = write_end as usize;
+        struct Workers {
+            stop: Arc<AtomicBool>,
+            write_at: usize,
+            handles: Vec<std::thread::JoinHandle<u64>>,
+        }
+        impl Drop for Workers {
+            fn drop(&mut self) {
+                self.stop.store(true, Relaxed);
+                if !self.handles.is_empty() {
+                    let mut written = 0;
+                    // SAFETY: pipe write end stays open until `_pipe` drops after us.
+                    unsafe {
+                        WriteFile(self.write_at as HANDLE, [1u8].as_ptr(), 1, &mut written, null_mut());
+                    }
+                    for w in self.handles.drain(..) {
+                        let _ = w.join();
+                    }
+                }
+            }
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
         // 0 spins, 1 sleeps, 2 reads a pipe, 3 faults on a guarded page.
-        let workers: Vec<_> = (0..4)
+        let handles: Vec<_> = (0..4)
             .map(|kind| {
                 let (stop, tx) = (stop.clone(), tx.clone());
                 std::thread::spawn(move || {
@@ -1925,6 +2033,11 @@ mod tests {
                 })
             })
             .collect();
+        let mut workers = Workers {
+            stop: stop.clone(),
+            write_at,
+            handles,
+        };
         let mut ids = [0u32; 4];
         for _ in 0..4 {
             let (kind, id) = rx.recv().unwrap();
@@ -1939,17 +2052,11 @@ mod tests {
             let mut written = 0;
             WriteFile(write_end, [1u8].as_ptr(), 1, &mut written, null_mut());
         }
-        for w in workers {
+        for w in workers.handles.drain(..) {
             w.join().unwrap();
         }
-        GUARDED.store(0, Relaxed);
-        // SAFETY: ours, not used again.
-        unsafe {
-            RemoveVectoredExceptionHandler(handler);
-            VirtualFree(guarded as *mut c_void, 0, MEM_RELEASE);
-            CloseHandle(read_end);
-            CloseHandle(write_end);
-        }
+        drop(_pipe);
+        drop(guarded_page);
         eprintln!("spinner beside waiting, reading and faulting threads: {}", stats(&s));
         let acc_of = |id: u32| s.threads.iter().find(|t| t.id == id).unwrap().totals.acc;
         for (kind, &id) in ids.iter().enumerate() {
@@ -2038,6 +2145,7 @@ mod tests {
     #[test]
     #[ignore = "an experiment; run by hand"]
     fn fault_hazard() {
+        let _test = SamplerTestGuard::enter();
         use windows_sys::Win32::System::Diagnostics::Debug::{
             AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
         };
@@ -2077,7 +2185,7 @@ mod tests {
                 PAGE_READWRITE,
             )
         } as usize;
-        GUARDED.store(guarded, Relaxed);
+        GUARDED.store(guarded, Release);
         let stop = Arc::new(AtomicBool::new(false));
         let beat = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2213,7 +2321,7 @@ mod tests {
         } else {
             worker.join().unwrap();
         }
-        GUARDED.store(0, Relaxed);
+        GUARDED.store(0, Release);
         // SAFETY: ours, not used again.
         unsafe {
             for h in handlers {
@@ -2226,6 +2334,7 @@ mod tests {
     /// this test's executable as the runtime's image.
     #[test]
     fn the_report_is_written_with_the_images() {
+        let _test = SamplerTestGuard::enter();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("profile.txt");
         let (id, stop, worker) = spinner();
@@ -2258,6 +2367,7 @@ mod tests {
     #[test]
     #[ignore = "writes a report for the symbolizer; run by hand"]
     fn a_report_for_the_symbolizer() {
+        let _test = SamplerTestGuard::enter();
         let file = std::env::var("PROFILE_REPORT").expect("PROFILE_REPORT names the file");
         let (id, stop, worker) = spinner();
         let mut s = Sampler::new(config(&id.to_string(), &file), Vec::new()).unwrap();
