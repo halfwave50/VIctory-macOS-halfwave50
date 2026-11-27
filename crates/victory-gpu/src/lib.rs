@@ -130,6 +130,10 @@ mod tdr;
 mod texback;
 #[cfg(windows)]
 mod texture;
+// mac: stage 2's tile plan (`VICTORY_ALIAS_PHYSICAL`); plain std, so its
+// tests run everywhere.
+#[cfg(any(windows, test))]
+mod tile_plan;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
