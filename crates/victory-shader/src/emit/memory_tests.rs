@@ -516,6 +516,7 @@ fn runs_from_just_before_a_copy_read_its_first_dwords() {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        uav_size_level0: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
         bias_as_gradients: false,
