@@ -584,4 +584,360 @@ mod tests {
             "{on}"
         );
     }
+
+    /// The counts kept by the replay below: none, as first merged
+    /// (901f2697: a vector of every address's page before a call and
+    /// another after it), or as now.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Counts {
+        Off,
+        First,
+        Now,
+    }
+
+    /// `xmem`'s own bookkeeping of title views (`Physical::views` and
+    /// `Physical::shown`, as `map`, `unmap`, `XMemMapPhysicalPages` and
+    /// `map_alias` keep them, without the host calls), with stage 2's counts
+    /// kept as `counts` says, through the same functions `xmem` calls.
+    struct Replay {
+        counts: Counts,
+        views: Views,
+        shown: std::collections::HashMap<(usize, usize), Vec<usize>>,
+        tally: [usize; 4],
+        /// Time in the counts of the calls (not the per-page
+        /// `shown_delta`s), and the longest of one call.
+        spent: std::time::Duration,
+        longest: std::time::Duration,
+    }
+
+    impl Replay {
+        fn new(counts: Counts) -> Self {
+            Replay {
+                counts,
+                views: Views::new(),
+                shown: Default::default(),
+                tally: [0; 4],
+                spent: std::time::Duration::ZERO,
+                longest: std::time::Duration::ZERO,
+            }
+        }
+
+        fn counting(&self) -> bool {
+            self.counts != Counts::Off
+        }
+
+        /// The page shown at `at` (`xmem::slice_at`).
+        fn key_at(&self, at: usize) -> Option<(usize, usize)> {
+            self.views
+                .range(..=at)
+                .next_back()
+                .filter(|(base, (len, _))| at < **base + len)
+                .map(|(base, (_, first))| key(first, (at - base) / PAGE))
+        }
+
+        /// `xmem::map`'s bookkeeping.
+        fn view(&mut self, base: usize, len: usize, first: (usize, usize)) {
+            let mut twice = [0; 2];
+            for k in 0..len / PAGE {
+                let shown = self.shown.entry(key(&first, k)).or_default();
+                shown.push(base + k * PAGE);
+                if self.counts != Counts::Off {
+                    let [d, e] = shown_delta(shown.len() - 1, shown.len());
+                    twice = [twice[0] + d, twice[1] + e];
+                }
+            }
+            if self.counting() {
+                shown_changed(twice);
+                VIEWS_NOW.fetch_add(1, Relaxed);
+            }
+            self.views.insert(base, (len, first));
+        }
+
+        /// `xmem::unmap`'s bookkeeping, the remnants of views reaching past
+        /// the range mapped again.
+        fn unview(&mut self, base: usize, len: usize) {
+            if len == 0 {
+                return;
+            }
+            let end = base + len;
+            let hit: Vec<usize> = reaching(&self.views, base, end)
+                .map(|(at, _)| *at)
+                .collect();
+            for at in hit {
+                let (size, first) = self.views.remove(&at).expect("listed");
+                let mut twice = [0; 2];
+                for k in 0..size / PAGE {
+                    let page = key(&first, k);
+                    if let Some(addresses) = self.shown.get_mut(&page) {
+                        let before = addresses.len();
+                        addresses.retain(|&a| a != at + k * PAGE);
+                        if self.counts != Counts::Off {
+                            let [d, e] = shown_delta(before, addresses.len());
+                            twice = [twice[0] + d, twice[1] + e];
+                        }
+                        if addresses.is_empty() {
+                            self.shown.remove(&page);
+                        }
+                    }
+                }
+                if self.counting() {
+                    shown_changed(twice);
+                    VIEWS_NOW.fetch_sub(1, Relaxed);
+                }
+                if at < base {
+                    self.view(at, base - at, first);
+                }
+                if at + size > end {
+                    self.view(end, at + size - end, key(&first, (end - at) / PAGE));
+                }
+            }
+        }
+
+        fn timed(&mut self, t: std::time::Duration) {
+            self.spent += t;
+            self.longest = self.longest.max(t);
+        }
+
+        fn add(&mut self, n: [usize; 4]) {
+            for (t, n) in self.tally.iter_mut().zip(n) {
+                *t += n;
+            }
+            pages_changed(n);
+        }
+
+        /// As first merged: every address's page, in a vector.
+        fn first_showing(&self, at: usize, n: usize) -> Vec<Option<(usize, usize)>> {
+            let mut out = vec![None; n];
+            let end = at.saturating_add(n.saturating_mul(PAGE));
+            if end <= at {
+                return out;
+            }
+            let starts: Vec<usize> = reaching(&self.views, at, end).map(|(b, _)| *b).collect();
+            for base in starts {
+                let (size, first) = &self.views[&base];
+                let (from, to) = (at.max(base), end.min(base + size));
+                for page in (from..to).step_by(PAGE) {
+                    out[(page - at) / PAGE] = Some(key(first, (page - base) / PAGE));
+                }
+            }
+            out
+        }
+
+        /// As first merged: the pairs of what each address showed before
+        /// and after.
+        fn first_changed(&mut self, at: usize, before: Vec<Option<(usize, usize)>>) {
+            let after = self.first_showing(at, before.len());
+            let mut n = [0; 4];
+            for (b, a) in before.into_iter().zip(after) {
+                let k = match (b, a) {
+                    (None, Some(_)) => 0,
+                    (Some(b), Some(a)) if b == a => 3,
+                    (Some(_), Some(_)) => 1,
+                    (Some(_), None) => 2,
+                    (None, None) => continue,
+                };
+                n[k] += 1;
+            }
+            self.add(n);
+        }
+
+        /// `XMemMapPhysicalPages(base, n, pages)`; `None` unmaps.
+        fn map_pages(&mut self, base: usize, n: usize, pages: Option<&[(usize, usize)]>) {
+            if let Some(p) = pages
+                && (0..n).all(|k| self.key_at(base + k * PAGE) == Some(p[k]))
+            {
+                if self.counting() {
+                    self.add([0, 0, 0, n]);
+                }
+                return;
+            }
+            let clock = std::time::Instant::now();
+            let tally = (self.counts == Counts::Now).then(|| match pages {
+                None => [0, 0, mapped_in(&self.views, base, n), 0],
+                Some(p) => tally_call(&self.views, key, base, n, |k| Some(p[k])),
+            });
+            let before = (self.counts == Counts::First).then(|| self.first_showing(base, n));
+            let mut spent = clock.elapsed();
+            self.unview(base, n * PAGE);
+            if let Some(p) = pages {
+                let mut i = 0;
+                while i < n {
+                    let run = 1
+                        + (i + 1..n)
+                            .take_while(|&j| p[j] == key(&p[i], j - i))
+                            .count();
+                    self.view(base + i * PAGE, run * PAGE, p[i]);
+                    i += run;
+                }
+            }
+            let clock = std::time::Instant::now();
+            if let Some(tally) = tally {
+                self.add(tally);
+            }
+            if let Some(before) = before {
+                self.first_changed(base, before);
+            }
+            spent += clock.elapsed();
+            if self.counting() {
+                self.timed(spent);
+            }
+        }
+
+        /// `map_alias(to, from, n pages)`; `from` `None` unmaps.
+        fn alias(&mut self, to: usize, from: Option<usize>, n: usize) {
+            if let Some(f) = from
+                && (0..n).all(|k| {
+                    self.key_at(f + k * PAGE)
+                        .is_some_and(|s| self.key_at(to + k * PAGE) == Some(s))
+                })
+            {
+                if self.counting() {
+                    self.add([0, 0, 0, n]);
+                }
+                return;
+            }
+            let clock = std::time::Instant::now();
+            let tally = (self.counts == Counts::Now).then(|| match from {
+                None => [0, 0, mapped_in(&self.views, to, n), 0],
+                Some(f) => tally_call(&self.views, key, to, n, |k| self.key_at(f + k * PAGE)),
+            });
+            let before = (self.counts == Counts::First).then(|| self.first_showing(to, n));
+            let mut spent = clock.elapsed();
+            self.unview(to, n * PAGE);
+            if let Some(f) = from {
+                for k in 0..n {
+                    let page = self.key_at(f + k * PAGE).expect("a mapped source page");
+                    self.view(to + k * PAGE, PAGE, page);
+                }
+            }
+            let clock = std::time::Instant::now();
+            if let Some(tally) = tally {
+                self.add(tally);
+            }
+            if let Some(before) = before {
+                self.first_changed(to, before);
+            }
+            spent += clock.elapsed();
+            if self.counting() {
+                self.timed(spent);
+            }
+        }
+    }
+
+    /// Run r0 (27 November 21:37, `VICTORY_ALIAS_PHYSICAL=cpu`) counted, by
+    /// the world: 378,594 pages mapped fresh, 189,018 unmapped, 0 remapped,
+    /// 86,846 views, 33,916 pages at two or more addresses; at its first frame
+    /// line 113,594 fresh and 10,856 unmapped in 8 views. Its reservations:
+    /// two of 24 GiB, 6,236 and 3,378 MiB; its sections 710, 185 and 6,236
+    /// MiB. Replayed through `xmem`'s bookkeeping three times (no counts, as
+    /// first merged, as now), with the times printed, and a fourth phase of
+    /// 64 unmaps of a whole, nearly empty 24 GiB reservation; five rounds,
+    /// interleaved. It prints each run's time, the time inside the counts
+    /// themselves (the reads before a call and the adds after it; the
+    /// per-page `shown_delta`s are left in the totals) and the longest
+    /// single call's. A measurement:
+    /// `cargo test --release -p victory-gpu --lib boot_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn boot_scale_counting_cost() {
+        const R1: usize = 0x3_8c91_0000;
+        const R2: usize = 0x9_8c91_0000;
+        const R3: usize = 0xbd_e0d0_0000;
+        const R4: usize = 0xc6_1e94_0000;
+        let (s1, s2, s3) = ((1, 11_360), (2, 2_960), (3, 99_776));
+        let section = |(id, n): (usize, usize)| (0..n).map(|i| (id, i)).collect::<Vec<_>>();
+        let (pool_slots, heap_slots, rounds) = (54_048, 32_800, 132_500);
+        let mut results = Vec::new();
+        let order = [Counts::Off, Counts::First, Counts::Now];
+        for counts in (0..5).flat_map(|round| (0..3).map(move |i| order[(i + round) % 3])) {
+            let mut r = Replay::new(counts);
+            let mut phase = [std::time::Duration::ZERO; 3];
+            let started = std::time::Instant::now();
+            // Boot: the sections mapped whole, a part of one mapped and
+            // unmapped again.
+            r.map_pages(R3, s3.1, Some(&section(s3)));
+            r.map_pages(R1, s1.1, Some(&section(s1)));
+            r.map_pages(R1 + s1.1 * PAGE, s2.1, Some(&section(s2)));
+            r.map_pages(R2, 10_856, Some(&section(s1)[..10_856]));
+            r.map_pages(R2, 10_856, None);
+            phase[0] = started.elapsed();
+            // To the world, page by page: section 3's pages into a pool view
+            // (the scatter form), then from there into the tiled heap
+            // (`CopyPageMappingsBatchX`), each slot unmapped before reuse.
+            let heap = R1 + (s1.1 + s2.1) * PAGE;
+            for i in 0..rounds {
+                let slot = R4 + (i % pool_slots) * PAGE;
+                if i >= pool_slots {
+                    r.map_pages(slot, 1, None);
+                }
+                r.map_pages(slot, 1, Some(&[(3, i * 7_919 % s3.1)]));
+                let to = heap + (i % heap_slots) * PAGE;
+                if i >= heap_slots {
+                    r.alias(to, None, 1);
+                }
+                r.alias(to, Some(slot), 1);
+            }
+            phase[1] = started.elapsed() - phase[0];
+            // Whole reservations cleared (64 unmaps of 393,216 pages).
+            for _ in 0..64 {
+                r.map_pages(R2, 393_216, None);
+            }
+            phase[2] = started.elapsed() - phase[0] - phase[1];
+            let total = started.elapsed();
+            let twice = r.shown.values().filter(|a| a.len() >= 2).count();
+            eprintln!(
+                "{counts:?}: {:.1} ms (boot {:.1}, to the world {:.1}, 64 whole unmaps {:.1}), {:.1} ms of it in the \
+                 counts (longest call {:.2} ms); {} views, {twice} pages at two or more addresses, counted {:?}",
+                total.as_secs_f64() * 1e3,
+                phase[0].as_secs_f64() * 1e3,
+                phase[1].as_secs_f64() * 1e3,
+                phase[2].as_secs_f64() * 1e3,
+                r.spent.as_secs_f64() * 1e3,
+                r.longest.as_secs_f64() * 1e3,
+                r.views.len(),
+                r.tally,
+            );
+            if counts != Counts::Off {
+                assert_eq!(
+                    r.tally,
+                    [
+                        s1.1 + s2.1 + s3.1 + 10_856 + 2 * rounds,
+                        0,
+                        10_856 + 2 * rounds - pool_slots - heap_slots,
+                        0
+                    ]
+                );
+            }
+            results.push((counts, total, r.spent, r.longest, r.views.len()));
+        }
+        // Per kind: the least and the median of the five, in ms.
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let stats = |c: Counts,
+                     f: &dyn Fn(
+            &(
+                Counts,
+                std::time::Duration,
+                std::time::Duration,
+                std::time::Duration,
+                usize,
+            ),
+        ) -> f64| {
+            let mut v: Vec<f64> = results.iter().filter(|r| r.0 == c).map(f).collect();
+            v.sort_by(f64::total_cmp);
+            (v[0], v[v.len() / 2])
+        };
+        for c in order {
+            let (total_min, total_median) = stats(c, &|r| ms(r.1));
+            let (counts_min, counts_median) = stats(c, &|r| ms(r.2));
+            let (_, longest) = stats(c, &|r| ms(r.3));
+            eprintln!(
+                "{c:?}: total {total_min:.0} ms least, {total_median:.0} median; in the counts {counts_min:.0} least, \
+                 {counts_median:.0} median; longest call {longest:.2} ms (median)"
+            );
+        }
+        assert!(
+            results.iter().all(|r| r.4 == results[0].4),
+            "the same views every time"
+        );
+    }
 }
