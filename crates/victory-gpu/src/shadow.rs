@@ -1179,7 +1179,7 @@ impl Shadow {
     pub(crate) fn idle(&self) -> bool {
         self.tracked.is_some()
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty()
+            && self.before.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// [`Shadow::update`] made early, for a submission not yet prepared,

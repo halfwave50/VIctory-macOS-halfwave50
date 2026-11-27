@@ -21,6 +21,11 @@ struct SnapshotSpan {
 }
 
 impl Snapshot {
+    /// No bytes kept (the async prewarm's `Shadow::idle` asks).
+    pub(super) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.bytes.len()
