@@ -1421,19 +1421,56 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    /// Work to run while `make_read` makes the textures of a read slot (the
-    /// slot), outside the heaps' lock.
-    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
-
-    /// The work [`WHILE_MAKING`] runs.
+    /// The work [`WHILE_MAKING`] and `descriptor::host::tests::WHILE_PREPARING` run.
+    #[cfg(windows)]
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
 
+    #[cfg(windows)]
+    thread_local! {
+        /// Work to run on this thread while `make_read` makes the textures of a
+        /// read slot (the slot), outside the heaps' lock. Thread-local so
+        /// parallel tests cannot steal or overwrite each other's hook.
+        static WHILE_MAKING: std::cell::RefCell<Option<(u32, Work)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Installs a one-shot [`WHILE_MAKING`] hook for the current thread and
+    /// clears it on drop.
+    #[cfg(windows)]
+    pub(crate) struct MakingHook;
+
+    #[cfg(windows)]
+    impl MakingHook {
+        pub(crate) fn set(slot: u32, work: Work) -> Self {
+            WHILE_MAKING.with(|hook| *hook.borrow_mut() = Some((slot, work)));
+            MakingHook
+        }
+
+        pub(crate) fn ran(&self) -> bool {
+            WHILE_MAKING.with(|hook| hook.borrow().is_none())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for MakingHook {
+        fn drop(&mut self) {
+            WHILE_MAKING.with(|hook| {
+                hook.borrow_mut().take();
+            });
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn while_making(slots: &[u32]) {
-        let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
-        if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
-            && let Some((_, work)) = hook.take()
-        {
-            drop(hook);
+        let work = WHILE_MAKING.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot)) {
+                hook.take().map(|(_, work)| work)
+            } else {
+                None
+            }
+        });
+        if let Some(work) = work {
             work();
         }
     }

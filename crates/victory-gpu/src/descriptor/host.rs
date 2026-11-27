@@ -3111,11 +3111,39 @@ mod tests {
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
     }
 
-    /// Work to run while a view's texture is prepared, once (tests).
-    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+    thread_local! {
+        /// Work to run on this thread while a view's texture is prepared, once
+        /// (tests). Thread-local so parallel tests calling `mirror` cannot
+        /// steal or overwrite another test's hook.
+        static WHILE_PREPARING: std::cell::RefCell<Option<crate::descriptor::tests::Work>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Installs a one-shot [`WHILE_PREPARING`] hook for the current thread and
+    /// clears it on drop.
+    struct PreparingHook;
+
+    impl PreparingHook {
+        fn set(work: crate::descriptor::tests::Work) -> Self {
+            WHILE_PREPARING.with(|hook| *hook.borrow_mut() = Some(work));
+            PreparingHook
+        }
+
+        fn ran(&self) -> bool {
+            WHILE_PREPARING.with(|hook| hook.borrow().is_none())
+        }
+    }
+
+    impl Drop for PreparingHook {
+        fn drop(&mut self) {
+            WHILE_PREPARING.with(|hook| {
+                hook.borrow_mut().take();
+            });
+        }
+    }
 
     pub(crate) fn while_preparing() {
-        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let work = WHILE_PREPARING.with(|hook| hook.borrow_mut().take());
         if let Some(work) = work {
             work();
         }
@@ -3147,7 +3175,7 @@ mod tests {
             resource,
             0x10,
         );
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        let hook = PreparingHook::set(Box::new(move || {
             // The title's last reference goes while the view is being made.
             // The call must not wait for the make: this very thread is the
             // one making the view, so a wait would never end.
@@ -3164,7 +3192,7 @@ mod tests {
         }));
 
         let view = heap.mirror(0, at, false).expect("the current view");
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(hook.ran(), "the prepare ran");
         assert!(heap.made(0), "the view was made from the live resource");
         assert!(
             crate::descriptor::view(at).is_some(),
@@ -3203,7 +3231,7 @@ mod tests {
         let host = title_heap.host().expect("a host view heap");
         let (done, waited) = std::sync::mpsc::channel();
         let second_view = view_of(second);
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        let hook = PreparingHook::set(Box::new(move || {
             // The title writes the other record into the slot meanwhile.
             std::thread::spawn(move || {
                 crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
@@ -3213,6 +3241,7 @@ mod tests {
         }));
         // A draw reads the slot: its first record is prepared.
         assert!(host.mirror(s, at, true).is_some());
+        assert!(hook.ran(), "the prepare ran");
         let second_texture = crate::resource::texture_at(second, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(second_texture).expect("made").texture) as usize;
         assert_eq!(host.textures_at(&[s]), [raw], "the slot views the record written last");
@@ -3246,7 +3275,7 @@ mod tests {
         let heap_at = title_heap.start;
         let heap = heap as usize;
         let (done, waited) = std::sync::mpsc::channel();
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        let hook = PreparingHook::set(Box::new(move || {
             std::thread::spawn(move || {
                 let h = crate::descriptor::heap(heap as crate::object::This);
                 h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
@@ -3258,7 +3287,7 @@ mod tests {
             );
         }));
         assert!(host.mirror(first, slot(first), true).is_some());
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(hook.ran(), "the prepare ran");
         assert!(host.kept(first) && host.kept(second), "both made");
     }
 
@@ -3289,7 +3318,7 @@ mod tests {
         assert!(!host.kept(read), "left null until read");
         let (done, waited) = std::sync::mpsc::channel();
         let at = slot(written);
-        *crate::descriptor::tests::WHILE_MAKING.lock().unwrap() = Some((
+        let hook = crate::descriptor::tests::MakingHook::set(
             read,
             Box::new(move || {
                 std::thread::spawn(move || {
@@ -3301,9 +3330,9 @@ mod tests {
                     "a view written while a read slot's texture is made waits"
                 );
             }),
-        ));
+        );
         crate::descriptor::make_read(&[read]);
-        assert!(crate::descriptor::tests::WHILE_MAKING.lock().unwrap().is_none(), "the make ran");
+        assert!(hook.ran(), "the make ran");
         assert!(host.kept(read), "made for the read");
     }
 
