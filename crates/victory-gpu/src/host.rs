@@ -4202,8 +4202,39 @@ impl Batch {
             crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
             return self.title_written();
         }
-        self.flush();
         let (from, to) = touched(at, at.saturating_add(len));
+        if from >= to {
+            return;
+        }
+        // Flush only pending refreshes whose ranges overlap the destination
+        // window; disjoint copies stay queued so they coalesce across lists.
+        let mut overlapping = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let overlaps = {
+                let (shadow, ranges) = &self.refreshes[i];
+                let (start, slen) = shadow.range();
+                let (s_start, s_end) = (start as usize, start.saturating_add(slen) as usize);
+                s_start < to
+                    && s_end > from
+                    && ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from)
+            };
+            if overlaps {
+                let (shadow, ranges) = self.refreshes.swap_remove(i);
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                self.pending.remove(&key);
+                if let Some((moved, _)) = self.refreshes.get(i) {
+                    self.pending
+                        .insert(std::sync::Arc::as_ptr(moved) as usize, i);
+                }
+                overlapping.push((shadow, ranges));
+            } else {
+                i += 1;
+            }
+        }
+        if !overlapping.is_empty() {
+            self.flush_work(overlapping);
+        }
         // Only the copies whose memory the bytes can be in: the rest
         // hold nothing of the window, and what a no-op remove would
         // leave whole it leaves whole.
@@ -4216,10 +4247,22 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
-        #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let work = std::mem::take(&mut self.refreshes);
+        self.flush_work(work)
+    }
+
+    /// Runs `work` refreshes, recording their covered ranges into `current`
+    /// and `extents`; returns the bytes copied.
+    fn flush_work(
+        &mut self,
+        work: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    ) -> usize {
+        if work.is_empty() {
+            return 0;
+        }
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         let total_requested: usize = work
             .iter()
             .flat_map(|(_, ranges)| ranges.iter())
@@ -6042,14 +6085,124 @@ mod batch {
         batch.add(&b, pb, 4 * PAGE);
         assert_eq!(
             batch.flush(),
-            2 * PAGE,
-            "only the overlapping copy's destination"
+            2 * PAGE + 4 * PAGE,
+            "the overlapping copy's destination plus the disjoint copy deferred until flush"
         );
         assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1212_1212);
         assert_eq!(a.read_host((pa + 2 * PAGE) as u64, 1)[0], 0x3434_3434);
         assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(batch.flush(), 0, "both copies are now current");
         done(pa, Some(a));
         done(pb, Some(b));
+    }
+
+    /// A non-aliased title copy flushes only overlapping pending refreshes,
+    /// invalidates their destination coverage, and leaves disjoint pending
+    /// shadows queued so subsequent `add`s coalesce until final `flush()`.
+    #[test]
+    fn selective_title_copy_flushes_only_overlapping_pending_shadows() {
+        let Some((pa, a)) = plain(4) else {
+            return; // no host GPU here
+        };
+        let (pb, b) = plain(4).expect("second host buffer");
+        let (pc, c) = plain(2).expect("third host buffer");
+        fill(pa, 4 * PAGE, 0x11);
+        fill(pb, 4 * PAGE, 0x22);
+        fill(pc, 2 * PAGE, 0x33);
+
+        let mut batch = Batch::default();
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 3);
+        assert_eq!(batch.pending.len(), 3);
+
+        // Copy into `a` (overlapping) while `b` and `c` are disjoint.
+        let src = [0xAAu8; 64];
+        title_copy(&mut batch, pa + PAGE, src.as_ptr() as usize, src.len());
+
+        // `a` was flushed before the copy, while `b` and `c` stayed queued.
+        assert_eq!(
+            batch.refreshes.len(),
+            2,
+            "disjoint shadows remain queued across title_copied"
+        );
+        assert_eq!(batch.pending.len(), 2);
+        assert_eq!(
+            a.read_host(pa as u64, 1)[0],
+            0x1111_1111,
+            "overlapping shadow was flushed before title copy"
+        );
+        assert_eq!(
+            b.read_host(pb as u64, 1)[0],
+            0,
+            "disjoint shadow was not prematurely flushed"
+        );
+        assert_eq!(
+            c.read_host(pc as u64, 1)[0],
+            0,
+            "second disjoint shadow was not prematurely flushed"
+        );
+
+        // Subsequent adds for `b` and `c` coalesce into their still-pending
+        // entries; `a` queues only the invalidated destination window.
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 3);
+        assert_eq!(batch.pending.len(), 3);
+
+        let dest_len = if crate::watch::fault_tracking() {
+            PAGE
+        } else {
+            src.len()
+        };
+        assert_eq!(
+            batch.flush(),
+            dest_len + 4 * PAGE + 2 * PAGE,
+            "final flush copies only `a`'s destination plus the two deferred disjoint shadows once"
+        );
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0xAAAA_AAAA);
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0x2222_2222);
+        assert_eq!(c.read_host(pc as u64, 1)[0], 0x3333_3333);
+
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.flush(), 0, "all three shadows are current after final flush");
+
+        done(pa, Some(a));
+        done(pb, Some(b));
+        done(pc, Some(c));
+    }
+
+    /// An aliased title copy still falls back to flushing every pending
+    /// shadow conservatively, even disjoint ones.
+    #[test]
+    fn aliased_title_copy_still_flushes_pending_disjoint_shadows() {
+        let (a, _b) = crate::watch::tests::twin_views(2);
+        let Some((pd, d)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(pd, 2 * PAGE, 0x44);
+        let src = crate::watch::tests::pool(1);
+        fill(src, PAGE, 0x55);
+
+        let mut batch = Batch::default();
+        batch.add(&d, pd, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 1);
+        title_copy(&mut batch, a, src, PAGE);
+        assert_eq!(
+            batch.refreshes.len(),
+            0,
+            "aliased copy must conservatively flush pending disjoint shadows"
+        );
+        assert_eq!(d.read_host(pd as u64, 1)[0], 0x4444_4444);
+
+        done(pd, Some(d));
+        done(src, None);
     }
 
     /// Two copies of title memory, every list of a submission asking for
