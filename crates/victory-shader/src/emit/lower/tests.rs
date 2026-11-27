@@ -82,6 +82,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .map(|_| ())
@@ -139,6 +140,7 @@ fn lower_wave(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
 }
@@ -447,6 +449,7 @@ fn perm_features(selector: u32) -> u64 {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .unwrap();
@@ -1423,6 +1426,7 @@ fn lowered_result(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })
@@ -1651,6 +1655,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: true,
         view_marks: false,
     })
@@ -2330,6 +2335,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
         })
@@ -2428,6 +2434,7 @@ fn lower_ps_for_early_z(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks,
     })
@@ -2919,6 +2926,7 @@ fn lower_halves_io(
         bias_as_gradients: false,
         host_wave32: true,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
 }

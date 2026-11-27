@@ -158,6 +158,7 @@ fn lowered_with(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
+        uav_size_level0: false,
         host_wave32,
     })
 }

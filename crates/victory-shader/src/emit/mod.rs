@@ -475,6 +475,12 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// A size query on a writable image (`getDimensions`) asks for level 0,
+    /// where DXC (and the default here) leaves the level undefined. A
+    /// writable view has one level, so it is the same query, but D3DMetal
+    /// answers the undefined level with a size of 0. Off by default. The
+    /// translation differs, so the shader cache keys on it.
+    pub uav_size_level0: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -925,6 +931,7 @@ fn emit_pruned(
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
+        uav_size_level0: options.uav_size_level0,
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {
         // Discarded lanes kept on as helpers can read what no surviving

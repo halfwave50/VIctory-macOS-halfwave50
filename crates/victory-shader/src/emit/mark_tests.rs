@@ -83,6 +83,7 @@ fn lower(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks,
     })

@@ -156,6 +156,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })?;
 
@@ -1753,6 +1754,7 @@ fn lower_cs32_with(
         bias_as_gradients: super::host::under_wine(),
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .expect("lower");
@@ -2856,6 +2858,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })
@@ -3026,6 +3029,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
         })
@@ -3156,6 +3160,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
         })
