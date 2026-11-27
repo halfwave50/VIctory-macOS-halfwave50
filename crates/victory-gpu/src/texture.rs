@@ -12,8 +12,13 @@
 //!
 //! Both refresh paths detile only the subresources whose bytes changed: the
 //! tracked one those whose bytes hash differently from the bytes last
-//! detiled, the compared one those that a differing run touches. A change
-//! inside one mip does not detile the others.
+//! detiled (or, for a subresource that owns a changed page, only the rows
+//! whose tiled bytes changed, copied through a `D3D12_BOX`), the compared
+//! one those that a differing run touches. A change inside one mip does not
+//! detile the others.
+//!
+//! shortcut: a change to an untracked texture, or to a page the subresource
+//! shares with other data, detiles the whole subresource.
 //!
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
@@ -505,10 +510,10 @@ fn copies(
     texture: &ID3D12Resource,
     staging: &Staging,
     (buffer, at): (&ID3D12Resource, u64),
-    subresources: &[u32],
+    subresources: &[Sub],
 ) {
-    for &i in subresources {
-        let i = i as usize;
+    for (i, band) in subresources {
+        let i = *i as usize;
         let mut footprint = staging.footprints[i];
         footprint.Offset += at;
         let footprint = &footprint;
@@ -555,14 +560,42 @@ fn copies(
                 PlacedFootprint: *footprint,
             },
         };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        // Only the rows detiled: the staging buffer's other rows hold whatever
+        // its last user left.
+        let f = footprint.Footprint;
+        let block = staging.layout.desc.block.max(1);
+        match band {
+            Some(r) if *r != (0..staging.rows[i]) => {
+                let (top, bottom) = (r.start * block, (r.end * block).min(f.Height));
+                if top >= bottom {
+                    continue;
+                }
+                let rows = D3D12_BOX {
+                    left: 0,
+                    top,
+                    front: 0,
+                    right: f.Width,
+                    bottom,
+                    back: f.Depth,
+                };
+                // SAFETY: an open list; both locations name live resources,
+                // and the box lies inside the footprint.
+                unsafe { list.list.CopyTextureRegion(&to, 0, top, 0, &from, Some(&rows)) };
+            }
+            // SAFETY: an open list; both locations name live resources.
+            _ => unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) },
+        }
     }
 }
 
 /// What a refresh gives: a staging buffer, where its space starts in it,
-/// and the subresources detiled into it.
-pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
+/// and the subresources detiled into it with the rows (in elements) if only
+/// those were.
+pub(crate) type Upload = (ID3D12Resource, u64, Vec<Sub>);
+
+/// A subresource a refresh detiled, and its rows (in elements, every depth
+/// slice) if only those were.
+pub(crate) type Sub = (u32, Option<std::ops::Range<u32>>);
 
 /// The texture workers: up to a quarter of the CPUs (four at most), none
 /// where that is fewer than two.
@@ -635,7 +668,7 @@ impl Staging {
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
+        let (read, buffer) = self.refresh_now(Self::detile);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -644,7 +677,10 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
+    fn refresh_now(
+        &self,
+        detile: impl FnOnce(&Self, &[u8], &[Sub]) -> Option<(ID3D12Resource, u64)>,
+    ) -> (usize, Option<Upload>) {
         if self.tracked.is_none()
             && once_per_frame()
             && skip_same_frame(
@@ -655,7 +691,11 @@ impl Staging {
         {
             return (0, None);
         }
-        let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
+        let all = || {
+            (0..self.footprints.len() as u32)
+                .map(|i| (i, None))
+                .collect::<Vec<Sub>>()
+        };
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -667,7 +707,8 @@ impl Staging {
                 return (0, None);
             }
             let (copy, zero) = t.take_split(start, start + size);
-            if copy.is_empty() && zero.is_empty() {
+            let untracked = t.untracked(start, start + size);
+            if copy.is_empty() && zero.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
             let page = crate::watch::PAGE;
@@ -693,14 +734,16 @@ impl Staging {
             let touched: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
-                    if !overlaps(&copy, a, b) && !overlaps(&zero, a, b) {
+                    let dirty_untracked = overlaps(&untracked, a, b);
+                    if !overlaps(&copy, a, b) && !overlaps(&zero, a, b) && !dirty_untracked {
                         return false;
                     }
                     // Already uploaded as all-zeros and every page of the
                     // subresource is currently unmapped: nothing to read,
                     // hash, detile, or upload.
-                    !(last.states[i] == TrackedSubresource::AllZero
-                        && all_pages_unmapped(&last.unmapped, start + a, start + b))
+                    dirty_untracked
+                        || !(last.states[i] == TrackedSubresource::AllZero
+                            && all_pages_unmapped(&last.unmapped, start + a, start + b))
                 })
                 .collect();
             if touched.is_empty() {
@@ -713,18 +756,70 @@ impl Staging {
                 }
                 return (0, None);
             }
+            // A changed mapped page that holds only the subresource's bytes
+            // says it changed (never bypassed for unmapped `zero` runs): of
+            // it, only the rows whose tiled bytes the change touches are read
+            // and detiled (one page written into mip 0 of a 4K texture re-read
+            // and detiled all 16 MiB of it). Pages it shares with other data
+            // the title writes (small textures): its own bytes decide, and it
+            // is detiled whole. (Hashing a movie frame cost 8 ms a frame.)
+            let own = |i: usize| {
+                let (a, b) = span(i);
+                let (a0, b0) = (start + a, start + b);
+                // A mip spanning ordinary title memory must consider those
+                // bytes even when no tracked page was written.
+                !untracked.iter().any(|&(f, e)| f < b0 && a0 < e)
+                    && copy
+                        .iter()
+                        .any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+            };
+            // Every changed byte (mapped or newly unmapped) as offsets into
+            // the memory, for the layout.
+            let mut changed: Vec<(usize, usize)> = copy
+                .iter()
+                .chain(&zero)
+                .map(|&(f, e)| (f.max(start) - start, e.min(start + size) - start))
+                .filter(|r| r.0 < r.1)
+                .collect();
+            changed.sort_unstable();
+            let use_rows = dirty_rows_enabled();
+            type Band = Option<(std::ops::Range<u32>, std::ops::Range<usize>)>;
+            let plan: Vec<(usize, Band)> = touched
+                .into_iter()
+                .map(|i| {
+                    let s = i as u32;
+                    let band = if use_rows && own(i) {
+                        self.layout
+                            .touched_rows(s % self.mips, s / self.mips, &changed)
+                    } else {
+                        None
+                    };
+                    (i, band)
+                })
+                .collect();
+            if plan
+                .iter()
+                .all(|(_, band)| matches!(band, Some((rows, _)) if rows.is_empty()))
+            {
+                return (0, None);
+            }
             // Read only mapped spans through `copy_mapped`; pages known to be
             // unmapped from `take_split` are zeroed directly so `copy_mapped`
             // never enters its per-region `VirtualQuery` fallback on streamed
-            // holes. Only the touched spans are written, hashed, and detiled.
+            // holes. Only the bytes detiled are written, and only they are
+            // hashed and detiled.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
             let mut bytes = 0;
             let mut zeroed_bytes = 0;
             let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
+            for (i, band) in &plan {
+                let (a, b) = match band {
+                    Some((rows, _)) if rows.is_empty() => continue,
+                    Some((_, tiled)) => (tiled.start, tiled.end.min(size)),
+                    None => span(*i),
+                };
+                if a < b && !done.contains(&(a, b)) {
                     let (mapped, zeroed) = read_span_skipping_unmapped(
                         read,
                         start,
@@ -751,42 +846,42 @@ impl Staging {
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = zeroed_bytes;
-            // A changed mapped page that holds only the subresource's bytes
-            // says it changed (never bypassed for unmapped `zero` runs). Pages
-            // it shares with other data the title writes (small textures): its
-            // own bytes decide. (Hashing a movie frame cost 8 ms a frame.)
-            let fresh: Vec<u32> = touched
+            let fresh: Vec<Sub> = plan
                 .into_iter()
-                .filter(|&i| {
-                    let (a, b) = span(i);
-                    let (a0, b0) = (start + a, start + b);
-                    if copy
-                        .iter()
-                        .any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
-                    {
+                .filter_map(|(i, band)| match band {
+                    // None of its rows read the bytes changed.
+                    Some((rows, _)) if rows.is_empty() => None,
+                    Some((rows, _)) => {
                         last.states[i] = TrackedSubresource::Unknown;
-                        return true;
+                        Some((i as u32, Some(rows)))
                     }
-                    if all_pages_unmapped(&last.unmapped, a0, b0)
-                        || read[a..b].iter().all(|&x| x == 0)
-                    {
-                        let prev =
-                            std::mem::replace(&mut last.states[i], TrackedSubresource::AllZero);
-                        return prev != TrackedSubresource::AllZero;
+                    None if own(i) => {
+                        last.states[i] = TrackedSubresource::Unknown;
+                        Some((i as u32, None))
                     }
-                    let hash = blake3::hash(&read[a..b]);
-                    let prev =
-                        std::mem::replace(&mut last.states[i], TrackedSubresource::Hashed(hash));
-                    prev != TrackedSubresource::Hashed(hash)
+                    None => {
+                        let (a, b) = span(i);
+                        let (a0, b0) = (start + a, start + b);
+                        let state = if all_pages_unmapped(&last.unmapped, a0, b0)
+                            || read[a..b].iter().all(|&x| x == 0)
+                        {
+                            TrackedSubresource::AllZero
+                        } else {
+                            TrackedSubresource::Hashed(blake3::hash(&read[a..b]))
+                        };
+                        let prev = std::mem::replace(&mut last.states[i], state);
+                        (prev != state).then_some((i as u32, None))
+                    }
                 })
-                .map(|i| i as u32)
                 .collect();
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
+            let buffer = detile(self, read, &fresh);
             if buffer.is_none() {
-                for &i in &fresh {
+                let taken: Vec<(usize, usize)> = copy.iter().chain(&zero).copied().collect();
+                t.retry(&taken);
+                for &(i, _) in &fresh {
                     last.states[i as usize] = TrackedSubresource::Unknown;
                 }
             }
@@ -844,7 +939,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = detile(self, &zeros, &every);
             last.uploaded = buffer.is_some();
             return (0, buffer.map(|(b, at)| (b, at, every)));
         };
@@ -859,14 +954,18 @@ impl Staging {
         // no subresource lies in touch nothing, and detile nothing.)
         let n = self.footprints.len();
         let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-        let fresh: Vec<u32> = (0..n)
+        let fresh: Vec<Sub> = (0..n)
             .filter(|&i| {
                 let (a, b) = span(i);
                 touches(&runs, a, b)
             })
-            .map(|i| i as u32)
+            .map(|i| (i as u32, None))
             .collect();
-        let buffer = if fresh.is_empty() { None } else { self.detile(&last.read, &fresh) };
+        let buffer = if fresh.is_empty() {
+            None
+        } else {
+            detile(self, &last.read, &fresh)
+        };
         if buffer.is_some() {
             self.uploaded_once
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -884,8 +983,19 @@ impl Staging {
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+    fn detile(&self, tiled: &[u8], subresources: &[Sub]) -> Option<(ID3D12Resource, u64)> {
+        self.detile_into(tiled, subresources, &mut staging_space)
+    }
+
+    /// Detiles `subresources` of `tiled` into staging space returned by
+    /// `alloc`.
+    fn detile_into(
+        &self,
+        tiled: &[u8],
+        subresources: &[Sub],
+        alloc: &mut dyn FnMut(u64) -> Option<(ID3D12Resource, u64, *mut u8)>,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let (buffer, at, data) = alloc(self.size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -900,7 +1010,8 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
-        for &i in subresources {
+        for (i, band) in subresources {
+            let i = *i;
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
             let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
@@ -910,10 +1021,21 @@ impl Staging {
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let done = match band {
+                Some(r) => self.layout.detile_rows(
+                    tiled,
+                    mip,
+                    slice,
+                    linear,
+                    pitch,
+                    pitch * rows as usize,
+                    r.clone(),
+                ),
+                None => self
+                    .layout
+                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize),
+            };
+            if let Err(e) = done {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return None;
             }
@@ -1308,6 +1430,18 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     Some(s)
 }
 
+/// Whether tracked writes into a subresource that owns a changed page detile
+/// and upload only the touched rows (`VICTORY_DIRTY_ROWS=0` falls back to
+/// detiling the whole subresource).
+fn dirty_rows_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dirty_rows_from_env(std::env::var_os("VICTORY_DIRTY_ROWS").as_deref()))
+}
+
+fn dirty_rows_from_env(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
 /// Opt-in (`VICTORY_TEXTURE_ONCE_PER_FRAME=1`): check already-uploaded
 /// untracked textures at most once per presented frame instead of on every
 /// command-list submission (~35x/frame in GTA VI under Rosetta/Wine where
@@ -1328,8 +1462,119 @@ fn skip_same_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn untracked_bytes(staging: &Staging) -> Vec<(usize, usize)> {
+        let start = staging.memory as usize;
+        staging
+            .tracked
+            .as_ref()
+            .unwrap()
+            .untracked(start, start + staging.layout.size as usize)
+    }
+
+    /// Simulates unavailable staging space after the texture took its pages.
+    pub(crate) fn defer_one_upload(staging: &Staging) {
+        let mut attempted = false;
+        let (read, upload) = staging.refresh_now(|_, _, _| {
+            attempted = true;
+            None
+        });
+        assert!(attempted && read > 0 && upload.is_none());
+    }
+
+    #[test]
+    fn dirty_rows_switch_defaults_on_and_honors_zero() {
+        use std::ffi::OsStr;
+        assert!(dirty_rows_from_env(None));
+        assert!(dirty_rows_from_env(Some(OsStr::new("1"))));
+        assert!(!dirty_rows_from_env(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn single_page_write_in_bc7_mip_uploads_only_touched_block_rows() {
+        let Some(_host) = host() else {
+            return; // no host GPU here
+        };
+        let page = crate::watch::PAGE;
+        // 512x512 BC7 (format 98, 16 bytes/4x4 block = 128x128 block rows,
+        // 256 KiB = 4 pages in SW_64KB_S layout = 0x109).
+        let address = crate::watch::tests::pool(8);
+        let words: [u32; 14] = [
+            3,
+            0,
+            0,
+            0,
+            512,
+            0,
+            512,
+            1 | (1 << 16),
+            98, // DXGI_FORMAT_BC7_UNORM
+            1,
+            0,
+            0x109, // SW_64KB_S
+            0,
+            0,
+        ];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut out = std::ptr::null();
+        let hr = crate::resource::create_at_address(
+            std::ptr::null(),
+            address as u64,
+            words.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(hr, 0);
+        let tex = crate::resource::host_resource(out).expect("host texture");
+        let s = staging(out, &tex).expect("staging");
+        assert!(s.tracked.is_some());
+        assert_eq!(s.layout.size as usize, 4 * page);
+        assert_eq!(s.rows[0], 128, "512 px / 4 px per BC7 block");
+
+        // Initial refresh uploads the entire mip.
+        let (read0, upload0) = s.refresh_now(Staging::detile);
+        assert_eq!(read0, 4 * page);
+        let (_, _, subs0) = upload0.expect("initial upload");
+        assert_eq!(subs0, vec![(0, Some(0..128))]);
+
+        // Writing one 64 KiB page (page 2 of 4) touches only half the block rows
+        // (64 of 128) and reads only the 2 pages covering that row band (128 KiB),
+        // rather than all 256 KiB.
+        // SAFETY: page 2 of our 8-page pool.
+        unsafe { ((address + 2 * page) as *mut u8).write_bytes(0x5a, page) };
+        let (read1, upload1) = s.refresh_now(Staging::detile);
+        let (_, _, subs1) = upload1.expect("partial upload");
+        assert_eq!(subs1.len(), 1);
+        let (sub, band) = &subs1[0];
+        assert_eq!(*sub, 0);
+        let band = band.as_ref().expect("partial row band");
+        assert!(
+            !band.is_empty() && band.len() < s.rows[0] as usize,
+            "expected partial block-row band, got {band:?} of {}",
+            s.rows[0]
+        );
+        assert!(
+            read1 < 4 * page,
+            "expected fewer tiled bytes read ({read1}) than full mip ({})",
+            4 * page
+        );
+
+        // Clean up tracker reference.
+        if let Some(copy) = crate::resource::host_copy(out) {
+            copy.staging.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        drop(s);
+        crate::object::release(out);
+    }
 
     #[test]
     fn texture_scratch_reuses_growing_buffers_within_the_retained_capacity() {
@@ -1970,18 +2215,18 @@ mod tests {
 
         // First refresh: slice 0 is mapped (0x42), slice 1 is unmapped (zeros).
         let fb0 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb0, "no copy_mapped fallback on unmapped slice");
         assert_eq!(bytes, page, "only mapped slice read via copy_mapped");
         let upload = upload.expect("first upload initializes both slices");
-        assert_eq!(upload.2, vec![0, 1]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x42);
         assert_eq!(staging_byte(&upload, &s, 1, 0), 0x00);
 
         // Redundant remap notification on still-unmapped slice 1: skipped completely.
         crate::watch::title_memory_remapped(mem.base + page, page);
         let fb1 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb1);
         assert_eq!(bytes, 0);
         assert!(upload.is_none(), "already-zero unmapped slice must not re-upload");
@@ -1989,27 +2234,27 @@ mod tests {
         // Unmap previously non-zero slice 0: must upload zeros once without fallback.
         mem.unmap(0);
         let fb2 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb2);
         assert_eq!(bytes, 0, "unmapped slice zeroed directly without copy_mapped");
         let upload = upload.expect("unmapping non-zero slice must clear host texture");
-        assert_eq!(upload.2, vec![0]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x00);
 
         // A second remap notification on now-zero slice 0 is skipped.
         crate::watch::title_memory_remapped(mem.base, page);
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(bytes, 0);
         assert!(upload.is_none());
 
         // Map slice 1 with non-zero bytes: reads and uploads slice 1 cleanly.
         mem.map(1, 0x99);
         let fb3 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb3);
         assert_eq!(bytes, page);
         let upload = upload.expect("newly mapped slice must upload");
-        assert_eq!(upload.2, vec![1]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1]);
         assert_eq!(staging_byte(&upload, &s, 1, 0), 0x99);
 
         release_staging(obj, s);
@@ -2032,11 +2277,11 @@ mod tests {
 
         // First refresh: page 0 mapped (0x33), page 1 unmapped (zeros).
         let fb0 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb0);
         assert_eq!(bytes, page);
         let upload = upload.expect("initial partial upload");
-        assert_eq!(upload.2, vec![0]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x33);
         assert_eq!(staging_byte(&upload, &s, 0, page), 0x00);
 
@@ -2045,23 +2290,23 @@ mod tests {
         // SAFETY: page 0 is mapped and writable (write fault opens guard).
         unsafe { (mem.base as *mut u8).write_bytes(0x55, page) };
         let fb1 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb1);
         assert_eq!(bytes, page);
         let upload = upload.expect("prefix write re-uploads subresource");
-        assert_eq!(upload.2, vec![0]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x55);
-        assert_eq!(staging_byte(&upload, &s, 0, page), 0x00);
+        // (Page 1's rows are not detiled: the host texture keeps its zeros.)
 
-        // Map page 1 with 0x77: both pages are now read and uploaded.
+        // Map page 1 with 0x77: only the rows in page 1 are read and uploaded
+        // (page 0's rows keep what the host texture holds).
         mem.map(1, 0x77);
         let fb2 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb2);
-        assert_eq!(bytes, 2 * page);
+        assert_eq!(bytes, page);
         let upload = upload.expect("mapping tail re-uploads subresource");
-        assert_eq!(upload.2, vec![0]);
-        assert_eq!(staging_byte(&upload, &s, 0, 0), 0x55);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, page), 0x77);
 
         release_staging(obj, s);
