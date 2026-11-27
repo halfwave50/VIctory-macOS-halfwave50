@@ -159,7 +159,8 @@ pub use alias::{
     alias_region, committed as alias_committed, enabled as alias_buffers, unalias_region,
     uncommitted as alias_uncommitted,
 };
-#[cfg(all(windows, feature = "diagnostics"))]
+// mac: in every build (`VICTORY_ALIAS_PHYSICAL=cpu`).
+#[cfg(windows)]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
@@ -172,6 +173,7 @@ pub use physical_runs::{
     pages_changed as physical_pages_changed, reserved as physical_reserved,
     section as physical_section, shown_changed as physical_shown_changed,
     shown_delta as physical_shown_delta, tally_call as physical_tally_call,
+    view_remap_retried as physical_view_remap_retried,
 };
 #[cfg(windows)]
 pub use watch::{

@@ -1119,16 +1119,24 @@ pub(crate) fn heap_sync_threads(value: Option<&str>, split: bool, most: usize) -
 }
 
 /// mac: what `VICTORY_ALIAS_PHYSICAL` asks of the title's physical pages
-/// (stage 2, `notes/alias-physical-design.md`).
+/// (stage 2, `notes/alias-physical-design.md`; `crate::alias::physical_heap`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AliasPhysical {
-    /// Unset, empty or `0`: nothing, not even the counts (`crate::physical_runs`).
+    /// Unset, empty or `0`: nothing, not even the counts (`crate::physical_runs`);
+    /// each section is a pagefile section, as before.
     Off,
     /// `count`, or a value that names nothing built: stage 2's counts alone.
     Count,
+    /// `cpu`: each section is backed by a CPU-visible D3D12 heap and every
+    /// title view of its pages is remapped onto it (VIctory-macOS #275's
+    /// section heap): the heap backing alone, with the counts; the GPU still
+    /// reads the pages through host copies.
+    Cpu,
 }
 
 /// [`AliasPhysical`], read once (at the title's first `xmem` call that asks).
+/// `1`, the GPU side too, is not built yet: it and any other value give the
+/// counts alone, with a warning.
 pub(crate) fn alias_physical() -> AliasPhysical {
     static RULE: OnceLock<AliasPhysical> = OnceLock::new();
     *RULE.get_or_init(|| {
@@ -1136,7 +1144,7 @@ pub(crate) fn alias_physical() -> AliasPhysical {
         let (rule, known) = alias_physical_rule(value.as_deref());
         if !known {
             tracing::warn!(
-                "VICTORY_ALIAS_PHYSICAL={}: only =count is built so far; stage 2's counts alone",
+                "VICTORY_ALIAS_PHYSICAL={}: only =cpu and =count are built so far; stage 2's counts alone",
                 value.as_deref().unwrap_or_default()
             );
         }
@@ -1154,6 +1162,7 @@ fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
     match value.map(str::trim) {
         None | Some("" | "0") => (AliasPhysical::Off, true),
         Some("count") => (AliasPhysical::Count, true),
+        Some("cpu") => (AliasPhysical::Cpu, true),
         Some(_) => (AliasPhysical::Count, false),
     }
 }
@@ -1257,16 +1266,17 @@ pub(crate) mod tests {
                 "{off:?}"
             );
         }
-        assert_eq!(
-            alias_physical_rule(Some("count")),
-            (AliasPhysical::Count, true)
-        );
-        assert_eq!(
-            alias_physical_rule(Some(" count ")),
-            (AliasPhysical::Count, true)
-        );
-        // Any other value: the counts, with a warning.
-        for other in [Some("1"), Some("cpu"), Some("yes")] {
+        for (value, rule) in [
+            ("count", AliasPhysical::Count),
+            (" count ", AliasPhysical::Count),
+            ("cpu", AliasPhysical::Cpu),
+            (" cpu ", AliasPhysical::Cpu),
+        ] {
+            assert_eq!(alias_physical_rule(Some(value)), (rule, true), "{value:?}");
+        }
+        // Any other value (the GPU side, `=1`, is not built): the counts,
+        // with a warning.
+        for other in [Some("1"), Some("gpu"), Some("CPU"), Some("yes")] {
             assert_eq!(
                 alias_physical_rule(other),
                 (AliasPhysical::Count, false),

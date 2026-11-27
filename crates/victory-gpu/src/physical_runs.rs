@@ -21,7 +21,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 /// The 64 KiB page physical pages come in.
@@ -288,6 +288,43 @@ pub fn section(len: usize, sign: i64) {
     SECTIONS[1].fetch_add(sign * len as i64, Relaxed);
 }
 
+// mac: `VICTORY_ALIAS_PHYSICAL=cpu` (I2): the heap backing's counts, at the
+// end of stage 2's line while the switch is on.
+
+/// Whether the switch is on (`crate::alias::physical_heap`).
+static BACKING_ON: AtomicBool = AtomicBool::new(false);
+/// Heap-backed sections now and their bytes, heaps refused, view remaps that
+/// took a second try, and view remaps that failed (their maps failed).
+static BACKING: [AtomicI64; 5] = [const { AtomicI64::new(0) }; 5];
+
+pub(crate) fn backing_on() {
+    BACKING_ON.store(true, Relaxed);
+}
+
+/// A section's heap of `len` bytes was made: heap-backed sections now, and
+/// their bytes.
+pub(crate) fn heap_made(len: usize) -> [i64; 2] {
+    [
+        BACKING[0].fetch_add(1, Relaxed) + 1,
+        BACKING[1].fetch_add(len as i64, Relaxed) + len as i64,
+    ]
+}
+
+pub(crate) fn heap_freed(len: usize) {
+    BACKING[0].fetch_sub(1, Relaxed);
+    BACKING[1].fetch_sub(len as i64, Relaxed);
+}
+
+pub(crate) fn heap_refused() {
+    BACKING[2].fetch_add(1, Relaxed);
+}
+
+/// `xmem` remapped a title view onto its section's heap at the second try
+/// (`failed` false), or not at all.
+pub fn view_remap_retried(failed: bool) {
+    BACKING[if failed { 4 } else { 3 }].fetch_add(1, Relaxed);
+}
+
 /// What the reservations add up to.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Reservations {
@@ -317,12 +354,14 @@ fn reservations(all: &[(usize, usize)]) -> Reservations {
 
 /// Stage 2's line, per frame over `frames` frames: `window` the page counts
 /// since the last line, `total` since the start, `now` views, pages at two
-/// or more addresses, addresses past the first, sections and their bytes.
+/// or more addresses, addresses past the first, sections and their bytes;
+/// `backing` [`BACKING`] while `VICTORY_ALIAS_PHYSICAL` is on.
 fn stage2_line(
     window: [u64; 4],
     total: [u64; 4],
     now: [i64; 5],
     r: &Reservations,
+    backing: Option<[i64; 5]>,
     frames: f64,
 ) -> String {
     let [fresh, remapped, unmapped, again] = window.map(|n| n as f64 / frames.max(1.0));
@@ -344,7 +383,13 @@ fn stage2_line(
         r.low,
         r.pieces,
         section_bytes as f64 / 1e9,
-    )
+    ) + &backing.map_or(String::new(), |[heaps, bytes, refused, retried, failed]| {
+        format!(
+            "; VICTORY_ALIAS_PHYSICAL=cpu: {heaps} sections heap-backed {:.2} GB, {refused} heaps refused, {retried} \
+             view remaps retried, {failed} failed",
+            bytes as f64 / 1e9
+        )
+    })
 }
 
 /// Logs [`stage2_line`] once the title has reserved or allocated anything,
@@ -368,7 +413,10 @@ fn stage2_log(frames: f64) {
         sections[0],
         sections[1],
     ];
-    tracing::info!("{}", stage2_line(window, total, now, &r, frames));
+    let backing = BACKING_ON
+        .load(Relaxed)
+        .then(|| BACKING.each_ref().map(|n| n.load(Relaxed)));
+    tracing::info!("{}", stage2_line(window, total, now, &r, backing, frames));
 }
 
 #[cfg(test)]
@@ -503,6 +551,7 @@ mod tests {
             [1000, 30, 100, 8],
             [12, 3, 4, 1, 6_550_000_000],
             &r,
+            None,
             10.0,
         );
         assert!(line.starts_with("physical pages, per frame: 20.0 pages mapped where none was, 2.0 mapped over another page, 1.0 unmapped, 0.4 mapped again"), "{line}");
@@ -515,7 +564,24 @@ mod tests {
         assert!(line.ends_with("; 1 sections 6.55 GB"), "{line}");
         // No frames (a flip of `VICTORY_AB` can end a window early): per frame as one.
         assert!(
-            stage2_line([3, 0, 0, 0], [3, 0, 0, 0], [0; 5], &r, 0.0).contains(": 3.0 pages mapped")
+            stage2_line([3, 0, 0, 0], [3, 0, 0, 0], [0; 5], &r, None, 0.0)
+                .contains(": 3.0 pages mapped")
+        );
+        // `VICTORY_ALIAS_PHYSICAL=cpu`: the heap backing's counts, at the end.
+        let on = stage2_line(
+            [0; 4],
+            [0; 4],
+            [0; 5],
+            &r,
+            Some([1, 6_550_000_000, 0, 2, 0]),
+            1.0,
+        );
+        assert!(
+            on.ends_with(
+                "; 0 sections 0.00 GB; VICTORY_ALIAS_PHYSICAL=cpu: 1 sections heap-backed 6.55 GB, 0 heaps refused, \
+                 2 view remaps retried, 0 failed"
+            ),
+            "{on}"
         );
     }
 }

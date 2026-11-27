@@ -393,7 +393,10 @@ struct Section {
     size: usize,
     /// Optional shared CPU/GPU backing. The file still supplies Wine's
     /// placeholder-view metadata.
-    #[cfg(feature = "diagnostics")]
+    ///
+    /// mac: in every build, with `VICTORY_ALIAS_PHYSICAL=cpu`
+    /// (`victory_gpu::physical_heap`); every title view of the section's
+    /// pages is remapped onto it ([`map`]), and [`Section::whole`] is it.
     shared: Option<victory_gpu::PhysicalHeap>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
@@ -414,7 +417,6 @@ impl Section {
     /// The address of our view of the whole section, mapped the first time;
     /// `None` if the host would not map it.
     fn whole(&self) -> Option<usize> {
-        #[cfg(feature = "diagnostics")]
         if let Some(shared) = &self.shared {
             return Some(shared.cpu_address());
         }
@@ -593,7 +595,6 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let section = Arc::new(Section {
         handle,
         size,
-        #[cfg(feature = "diagnostics")]
         shared: victory_gpu::physical_heap(size),
         whole: OnceLock::new(),
     });
@@ -1030,21 +1031,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     let mapped = commit(base, len);
-    #[cfg(feature = "diagnostics")]
     let mapped = mapped
-        && slice.section.shared.as_ref().is_none_or(|shared| {
-            // SAFETY: this live view is ours. The slice will hold the
-            // backing heap until the view is unmapped.
-            let aliased = unsafe { shared.alias_view(base, slice.index * PAGE, len) };
-            if !aliased {
-                tracing::warn!(
-                    address = format_args!("{base:#x}"),
-                    len,
-                    "sharing the mapped XMem view with the host heap failed"
-                );
-            }
-            aliased
-        });
+        && slice
+            .section
+            .shared
+            .as_ref()
+            .is_none_or(|shared| view_on_heap(shared, base, slice.index, len));
     if !mapped {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
@@ -1071,6 +1063,47 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::physical_mapped(base, len, Arc::as_ptr(&slice.section) as usize, slice.index);
     physical.views.insert(base, (len, slice));
     true
+}
+
+/// mac: points the title view `[base, base + len)`, just mapped from page
+/// `index` of a heap-backed section, at the heap's pages
+/// (`VICTORY_ALIAS_PHYSICAL=cpu`, VIctory-macOS #275), with one retry.
+/// There is no safe fallback when both fail: the view left on the section's
+/// file would show other bytes than the heap does at the pages' other
+/// addresses and to DirectStorage. So the title's map fails, as #275's
+/// does; the first failure also goes to `crashes.log`.
+fn view_on_heap(shared: &victory_gpu::PhysicalHeap, base: usize, index: usize, len: usize) -> bool {
+    #[cfg(test)]
+    let refused = || tests::REFUSE_REMAPS.with(|n| n.replace(n.get().saturating_sub(1)) > 0);
+    #[cfg(not(test))]
+    let refused = || false;
+    // SAFETY: this live view is ours. The slice will hold the backing heap
+    // until the view is unmapped.
+    let remap = || !refused() && unsafe { shared.alias_view(base, index * PAGE, len) };
+    if remap() {
+        return true;
+    }
+    let again = remap();
+    victory_gpu::physical_view_remap_retried(!again);
+    if !again {
+        static FAILED: AtomicUsize = AtomicUsize::new(0);
+        let text = format!(
+            "VIctory: VICTORY_ALIAS_PHYSICAL: remapping a title view of physical pages onto its section's heap failed \
+             twice (at {base:#x}, {len} bytes from page {index}); the title's XMemMapPhysicalPages or page-mapping \
+             copy fails there, since a view left on the section's file would hold other bytes than the heap at the \
+             pages' other addresses."
+        );
+        // The first ten in the log, the first in `crashes.log` too; all are
+        // counted in the physical pages line.
+        let n = FAILED.fetch_add(1, Ordering::Relaxed);
+        if n < 10 {
+            tracing::error!("{text}");
+        }
+        if n == 0 {
+            victory_loader::log_crash(&text);
+        }
+    }
+    again
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -1445,6 +1478,156 @@ mod tests {
     thread_local! {
         /// Views this thread mapped for the title (`map`).
         pub(super) static MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// mac: how many of this thread's next remaps of a view onto its
+        /// section's heap fail (`view_on_heap`).
+        pub(super) static REFUSE_REMAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// mac: whether this test process runs with `VICTORY_ALIAS_PHYSICAL=cpu`
+    /// (with `VICTORY_ALIAS_BUFFERS=1` and `VICTORY_COPY_ORDER=split`, which
+    /// it needs): then its sections must be heap-backed, or the switch did
+    /// not take.
+    fn forced_heap() -> bool {
+        std::env::var("VICTORY_ALIAS_PHYSICAL").is_ok_and(|v| v.trim() == "cpu")
+            || cfg!(feature = "diagnostics")
+                && std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1")
+    }
+
+    /// The heap behind `page`, if its section has one: its CPU address and
+    /// the page's offset in it.
+    fn heap_of(page: usize) -> Option<(usize, usize)> {
+        let physical = physical();
+        let slice = &physical.pages[&page];
+        let heap = slice.section.shared.as_ref()?;
+        Some((heap.cpu_address(), slice.index * PAGE))
+    }
+
+    /// mac: with `VICTORY_ALIAS_PHYSICAL=cpu` a page is one RAM at every
+    /// title address and in its heap: written at one, through DirectStorage's
+    /// writes or the heap, it reads the same everywhere, also after a view is
+    /// unmapped and mapped again elsewhere. (Without the switch the file's
+    /// pages are shared the same way; the heap checks are skipped.)
+    #[test]
+    fn heap_backed_pages_are_one_ram_at_every_address() {
+        let pages = allocate(2);
+        let heap = heap_of(pages[1]);
+        assert_eq!(
+            heap.is_some(),
+            forced_heap(),
+            "heap-backed exactly when the switch is on"
+        );
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let second = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // The GPU's page-mapping copy: page 1 at `b` too.
+        assert!(map_alias(b as u64, second as u64, PAGE as u64));
+        // Wine sees committed read-write views, as before.
+        assert_eq!(query(second).host.State, MEM_COMMIT);
+        assert_eq!(query(b).host.Protect, PAGE_READWRITE);
+        let read = |p: *mut c_void, at: usize| {
+            // SAFETY: mapped read-write.
+            unsafe { p.cast::<u8>().add(at).read_volatile() }
+        };
+        // SAFETY: mapped read-write.
+        unsafe { second.cast::<u8>().add(10).write_volatile(0x41) };
+        assert_eq!(read(b, 10), 0x41);
+        // DirectStorage: through our view of the whole section (the heap).
+        assert!(write_physical(&pages[1..], 20, &[0x42]));
+        assert_eq!((read(second, 20), read(b, 20)), (0x42, 0x42));
+        if let Some((cpu, offset)) = heap {
+            assert_eq!(
+                physical().pages[&pages[1]].section.whole(),
+                Some(cpu),
+                "whole() is the heap"
+            );
+            // SAFETY: the heap's page, mapped while the section lives.
+            unsafe {
+                assert_eq!(
+                    ((cpu + offset + 10) as *const u8).read_volatile(),
+                    0x41,
+                    "title writes land in the heap"
+                );
+                ((cpu + offset + 30) as *mut u8).write_volatile(0x43);
+            }
+            assert_eq!(
+                (read(second, 30), read(b, 30)),
+                (0x43, 0x43),
+                "heap writes show at both addresses"
+            );
+        }
+        // Unmapped at `a`: `b` still shows it. Mapped again at `a`, page 1
+        // first: the same bytes there.
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(query(a).host.State, MEM_RESERVE);
+        assert_eq!(read(b, 20), 0x42);
+        let swapped = [pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(a, 2, swapped.as_ptr()), a);
+        assert_eq!((read(a, 10), read(a, 20)), (0x41, 0x42));
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().add(40).write_volatile(0x44) };
+        assert_eq!(read(b, 40), 0x44);
+        for at in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// mac: a view the heap's remap refuses once is remapped at the second
+    /// try; refused twice, the title's map fails and leaves a placeholder,
+    /// with no view of the file there (`VICTORY_ALIAS_PHYSICAL=cpu` only).
+    #[test]
+    fn a_view_the_heap_cannot_take_fails_the_map() {
+        let pages = allocate(2);
+        if heap_of(pages[0]).is_none() {
+            eprintln!("not heap-backed (VICTORY_ALIAS_PHYSICAL unset): nothing to check");
+            assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+            return;
+        }
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert!(write_physical(&pages, 0, &[0x51]));
+        // Refused once: the retry takes it.
+        REFUSE_REMAPS.with(|n| n.set(1));
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        let first = unsafe { a.cast::<u8>().read_volatile() };
+        assert_eq!(first, 0x51, "the heap's page");
+        // Refused twice: the map fails, the address is a placeholder again.
+        let second = a.wrapping_byte_add(PAGE);
+        REFUSE_REMAPS.with(|n| n.set(2));
+        assert!(XMemMapPhysicalPages(second, 1, pages[1..].as_ptr()).is_null());
+        assert_eq!(REFUSE_REMAPS.with(std::cell::Cell::get), 0);
+        assert_eq!(query(second).host.State, MEM_RESERVE);
+        assert!(
+            !physical().views.contains_key(&(second as usize)),
+            "no view registered"
+        );
+        assert_eq!(
+            shown_at(&pages[1..]),
+            Vec::<usize>::new(),
+            "page 1 is shown nowhere"
+        );
+        // The first page is untouched; the second maps once the heap takes it.
+        assert_eq!(XMemMapPhysicalPages(second, 1, pages[1..].as_ptr()), second);
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     #[test]
@@ -1529,12 +1712,14 @@ mod tests {
         let mut n = 3;
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
         assert_eq!(n, 3);
-        #[cfg(feature = "diagnostics")]
-        if std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1") {
+        // mac: forced on (`VICTORY_ALIAS_PHYSICAL=cpu`), the test runs on a
+        // heap-backed section.
+        if forced_heap() {
             let physical = physical();
             assert!(
                 physical.pages[&pages[0]].section.shared.is_some(),
-                "the test must use shared physical pages"
+                "the test must use heap-backed physical pages (VICTORY_ALIAS_PHYSICAL=cpu needs \
+                 VICTORY_ALIAS_BUFFERS=1 and VICTORY_COPY_ORDER=split, under Rosetta)"
             );
         }
         // Packed into 21 bits as `number >> 4`, as the title keeps them.
@@ -1576,10 +1761,14 @@ mod tests {
         assert_eq!(others(at(a, 2)), [at(b, 1) as usize]);
         assert_eq!(others(at(b, 1)), [at(a, 2) as usize]);
         assert!(others(a).is_empty());
-        // Writes into pages (DirectStorage's) show through their views.
+        // Writes into pages (DirectStorage's) show through their views: at
+        // both addresses of the page (mac: through the heap with
+        // `VICTORY_ALIAS_PHYSICAL=cpu`, whose `whole()` it is).
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(a, 2).cast::<u8>().add(1).read() }, 9);
 
         // Unmapping the middle page keeps its neighbours.
         assert_eq!(
