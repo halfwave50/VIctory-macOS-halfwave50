@@ -19,6 +19,11 @@ use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+fn sync_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FAST").as_deref() != Some(std::ffi::OsStr::new("0")))
+}
+
 /// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
 /// targeting a released heap's recycled address never free a newer heap's slots.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -892,12 +897,14 @@ impl HostHeap {
         if first >= last {
             return;
         }
+        let fast = sync_fast_enabled();
         let at = |i: u32| start + u64::from(i) * step;
         let forgot = views_forgot();
         let b_first = first / SYNC_BLOCK_SLOTS;
         let b_last = (last - 1) / SYNC_BLOCK_SLOTS;
-        let blocks_verified = (b_first..=b_last)
-            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
+        let blocks_verified = fast
+            && (b_first..=b_last)
+                .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let buf_end = buf_start.saturating_add(buf.len() as u64);
         let mut stale: Vec<u32> = Vec::new();
@@ -909,13 +916,23 @@ impl HostHeap {
                 let off = (addr - buf_start) as usize;
                 // SAFETY: `off + 12 <= buf.len()`, unaligned copy of 12 bytes.
                 unsafe { buf.as_ptr().add(off).cast::<[u32; 3]>().read_unaligned() }
+            } else if !buf.is_empty() {
+                let mut raw = [0u8; 12];
+                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                    continue;
+                }
+                [
+                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+                    u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+                ]
             } else {
-                // SAFETY: record in title heap memory the caller found mapped.
+                // SAFETY: direct test path (`sync_slots`) in committed memory.
                 unsafe { (addr as *const [u32; 3]).read_unaligned() }
             };
             let [tag, view, generation] = record;
             if tag != VIEW_TAG {
-                if self.made_is_nonzero(i) {
+                if !fast || self.made_is_nonzero(i) {
                     stale.push(i);
                 }
                 continue;
@@ -948,11 +965,13 @@ impl HostHeap {
             self.mirror(i, at(i), false);
         }
 
-        for b in b_first..=b_last {
-            let b_start = b * SYNC_BLOCK_SLOTS;
-            let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
-            if first <= b_start && last >= b_end {
-                self.block_forgot[b as usize].store(forgot, Ordering::Release);
+        if fast {
+            for b in b_first..=b_last {
+                let b_start = b * SYNC_BLOCK_SLOTS;
+                let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
+                if first <= b_start && last >= b_end {
+                    self.block_forgot[b as usize].store(forgot, Ordering::Release);
+                }
             }
         }
     }

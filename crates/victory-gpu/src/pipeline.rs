@@ -104,6 +104,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 // (`crate::ambient`; nothing while it is off).
                 #[cfg(windows)]
                 crate::ambient::note_program(&full.to_hex()[..16], bytes);
+                // So are the ray passes `VICTORY_RAY_SKIP` leaves out
+                // (`crate::ray_skip`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -484,6 +488,10 @@ struct Pipeline {
     /// bits, 0 for nothing (always while the stand-in is off).
     #[cfg(windows)]
     ambient: u8,
+    /// Which ray pass `VICTORY_RAY_SKIP` leaves out it is
+    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off).
+    #[cfg(windows)]
+    ray_pass: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -528,6 +536,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(windows)]
 pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
+}
+
+/// Whether a dispatch with the title pipeline is left out: it is one of
+/// the ray passes `VICTORY_RAY_SKIP` names (`crate::ray_skip`), and the
+/// acceleration-structure builder does not run this frame
+/// ([`builder::runs`]), so there is nothing to trace against. Counted
+/// there when it is.
+#[cfg(windows)]
+pub(crate) fn ray_pass_left_out(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let kind = pipeline(this).ray_pass;
+    if kind == 0 || builder::runs() {
+        return false;
+    }
+    crate::ray_skip::left_out(kind);
+    true
 }
 
 /// What the title pipeline's programs are to the ambient stand-in
@@ -691,6 +717,13 @@ fn hand_out(
     }
     #[cfg(windows)]
     let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
+    // Never a program the stand-in works after (it would not run).
+    #[cfg(windows)]
+    let ray_pass = if ambient == 0 {
+        crate::ray_skip::kind(shaders.iter().map(|s| s.hash.as_str()))
+    } else {
+        0
+    };
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -700,6 +733,8 @@ fn hand_out(
         builder,
         #[cfg(windows)]
         ambient,
+        #[cfg(windows)]
+        ray_pass,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

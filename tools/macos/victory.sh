@@ -11,6 +11,11 @@
 # VICTORY_DIAGNOSTICS=1 builds with the diagnostics feature (debug logs,
 # black-frame reports, frame capture and the other debugging switches).
 set -e
+# Resolve a caller-supplied relative path before entering the checkout.
+case "${WINE:-}" in
+    ''|/*) ;;
+    *) WINE="$PWD/$WINE" ;;
+esac
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
 TARGET=x86_64-pc-windows-gnullvm

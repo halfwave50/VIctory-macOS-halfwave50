@@ -99,8 +99,15 @@ else
     rmdir "$inner" "$outer" 2> /dev/null || true
   }
   trap unmount EXIT
-  hdiutil attach -quiet -nobrowse -readonly -mountpoint "$outer" "$dmg" \
-    || die "could not open ${dmg:t}. It may be an incomplete download: delete it, download it again and run ./setup.sh again"
+  if ! hdiutil attach -quiet -nobrowse -readonly -mountpoint "$outer" "$dmg"; then
+    # An intact download that macOS would not mount is not fixed by
+    # downloading it again: a sandboxed shell, such as an AI agent's, failed
+    # with "Device not configured" while the disk-image service was not running.
+    if hdiutil verify -quiet "$dmg" 2> /dev/null; then
+      die "macOS could not mount ${dmg:t}, though the file is intact. Run ./setup.sh again; if an AI agent or another sandboxed shell runs it and it fails again, run it from your own Terminal"
+    fi
+    die "could not open ${dmg:t}. It may be an incomplete download: delete it, download it again and run ./setup.sh again"
+  fi
   eval_dmg=("$outer"/Evaluation*.dmg(N))
   (( ${#eval_dmg} )) || die "${dmg:t} has no Evaluation .dmg inside. Check that it is Apple's Game Porting Toolkit"
   hdiutil attach -quiet -nobrowse -readonly -mountpoint "$inner" "$eval_dmg[1]" \

@@ -359,6 +359,7 @@ fn create() -> windows::core::Result<Host> {
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
         crate::ambient::announce();
+        crate::ray_skip::announce();
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -4468,6 +4469,8 @@ impl Meter {
                  max records {records:.0}/frame ({counted:.0} under a count)",
                 making = crate::pipeline::making()
             );
+            crate::ray_skip::log(report_frames);
+            crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

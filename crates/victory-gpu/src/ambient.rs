@@ -60,7 +60,10 @@ fn var(name: &str) -> Option<String> {
 
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
-    if on() {
+    // The estimate in its place (`VICTORY_AMBIENT=estimate`).
+    if crate::ambient_estimate::on() {
+        crate::ambient_estimate::announce();
+    } else if on() {
         tracing::info!("{}", set::start_line(level(), shade(), keep(), follow()));
     }
 }
@@ -77,9 +80,12 @@ pub(crate) fn note_program(hash: &str, container: &[u8]) {
         return;
     }
     let role = set::role_of(container);
-    if role != 0 {
-        tracing::info!(hash, "a program the ambient light follows: it {}", set::role_name(role));
-        FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).push((hash.to_owned(), role));
+    // The estimate's own programs (none while it is off).
+    let more = crate::ambient_estimate::role_of(container);
+    if role | more != 0 {
+        let name = if more != 0 { crate::ambient_estimate::role_name(more) } else { set::role_name(role) };
+        tracing::info!(hash, "a program the ambient light follows: it {name}");
+        FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).push((hash.to_owned(), role | more));
     }
 }
 
@@ -172,6 +178,16 @@ pub(crate) fn sky_drawn(image: usize) {
     if !held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
         *held = Some(copy);
     }
+}
+
+/// What the constant light is made of now, for the floor under the
+/// estimate (`crate::ambient_estimate`): its level and colour, the gain,
+/// least level and power with which it follows the sky (if it does), and
+/// the sky image the title last drew (if any).
+#[allow(clippy::type_complexity)]
+pub(crate) fn light_now() -> (f32, [f32; 3], Option<[f32; 3]>, Option<std::sync::Arc<HostTexture>>) {
+    let sky = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (live_level().unwrap_or_else(level), tint(), follow(), sky)
 }
 
 /// The light follows the sky: its level and colour are the sky image's mean
