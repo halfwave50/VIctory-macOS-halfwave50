@@ -165,6 +165,14 @@ pub use alias::{PhysicalHeap, physical_heap};
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use physical_runs::{mapped as physical_mapped, unmapped as physical_unmapped};
+// mac: stage 2's counts (`notes/alias-physical-design.md`, I0).
+#[cfg(windows)]
+pub use physical_runs::{
+    counting as physical_counts, mapped_in as physical_mapped_in,
+    pages_changed as physical_pages_changed, reserved as physical_reserved,
+    section as physical_section, shown_changed as physical_shown_changed,
+    shown_delta as physical_shown_delta, tally_call as physical_tally_call,
+};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

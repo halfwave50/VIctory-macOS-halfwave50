@@ -189,6 +189,12 @@ pub extern "system" fn XMemVirtualAlloc(
             && size.is_multiple_of(PAGE);
         victory_gpu::alias_committed(at as usize, size, base.is_null(), eligible, before.as_deref());
     }
+    // mac: stage 2's counts (`notes/alias-physical-design.md`, I0;
+    // `VICTORY_ALIAS_PHYSICAL` set): the reservations physical pages are
+    // mapped into, and their sizes.
+    if placeholder && !at.is_null() && victory_gpu::physical_counts() {
+        victory_gpu::physical_reserved(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -424,6 +430,10 @@ impl Section {
 impl Drop for Section {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // mac: stage 2's counts.
+        if victory_gpu::physical_counts() {
+            victory_gpu::physical_section(self.size, -1);
+        }
         if let Some(&at) = self.whole.get()
             && at != 0
         {
@@ -587,6 +597,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         shared: victory_gpu::physical_heap(size),
         whole: OnceLock::new(),
     });
+    // mac: stage 2's counts.
+    if victory_gpu::physical_counts() {
+        victory_gpu::physical_section(size, 1);
+    }
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -797,6 +811,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    // mac: stage 2's counts (`VICTORY_ALIAS_PHYSICAL` set), else nothing.
+    let counting = victory_gpu::physical_counts();
     let mut physical = physical();
     if !pages.is_null() {
         // SAFETY: the title passes `n` page numbers.
@@ -807,11 +823,32 @@ pub extern "system" fn XMemMapPhysicalPages(
                 .get(page)
                 .is_some_and(|slice| shows(&physical, at, slice))
         }) {
+            if counting {
+                victory_gpu::physical_pages_changed([0, 0, 0, n]);
+            }
             return address;
         }
     }
+    // mac: what the call changes, read before it does (added once it has).
+    let tally = counting.then(|| {
+        if pages.is_null() {
+            return [
+                0,
+                0,
+                victory_gpu::physical_mapped_in(&physical.views, base, n),
+                0,
+            ];
+        }
+        // SAFETY: the title passes `n` page numbers.
+        let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+        let to = |k: usize| physical.pages.get(&pages[k]).map(|s| s.key(0));
+        victory_gpu::physical_tally_call(&physical.views, Slice::key, base, n, to)
+    });
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
+        if let Some(tally) = tally {
+            victory_gpu::physical_pages_changed(tally);
+        }
         return address;
     }
     // SAFETY: the title passes `n` page numbers.
@@ -836,6 +873,9 @@ pub extern "system" fn XMemMapPhysicalPages(
             return std::ptr::null_mut();
         }
         i += run;
+    }
+    if let Some(tally) = tally {
+        victory_gpu::physical_pages_changed(tally);
     }
     address
 }
@@ -876,14 +916,33 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    // mac: stage 2's counts (`VICTORY_ALIAS_PHYSICAL` set), else nothing.
+    let counting = victory_gpu::physical_counts();
     let mut physical = physical();
     if from != 0
         && (0..len).step_by(PAGE).all(|k| {
             slice_at(&physical, from + k).is_some_and(|slice| shows(&physical, to + k, &slice))
         })
     {
+        if counting {
+            victory_gpu::physical_pages_changed([0, 0, 0, len.div_ceil(PAGE)]);
+        }
         return true;
     }
+    // mac: what the call changes, read before it does (added once it has).
+    let tally = counting.then(|| {
+        let n = len.div_ceil(PAGE);
+        if from == 0 {
+            return [
+                0,
+                0,
+                victory_gpu::physical_mapped_in(&physical.views, to, n),
+                0,
+            ];
+        }
+        let source = |k: usize| key_at(&physical, from + k * PAGE);
+        victory_gpu::physical_tally_call(&physical.views, Slice::key, to, n, source)
+    });
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -896,7 +955,21 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             return false;
         }
     }
+    if let Some(tally) = tally {
+        victory_gpu::physical_pages_changed(tally);
+    }
     true
+}
+
+/// mac: the key in `shown` of the page a title view shows at `at`, if any
+/// (stage 2's counts: [`slice_at`] without its clone).
+fn key_at(physical: &Physical, at: usize) -> Option<(usize, usize)> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (_, s))| s.key((at - base) / PAGE))
 }
 
 /// The page a title view shows at `at`, if any.
@@ -979,11 +1052,20 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    // mac: stage 2's counts of pages at two or more addresses, if kept.
+    let (counting, mut twice) = (victory_gpu::physical_counts(), [0; 2]);
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
+        if counting {
+            let [d, e] = victory_gpu::physical_shown_delta(shown.len() - 1, shown.len());
+            twice = [twice[0] + d, twice[1] + e];
+        }
+    }
+    if counting {
+        victory_gpu::physical_shown_changed(twice);
     }
     // mac: `VICTORY_PHYSICAL_RUNS` counts what refreshes copy from runs of a section's pages.
     victory_gpu::physical_mapped(base, len, Arc::as_ptr(&slice.section) as usize, slice.index);
@@ -1110,14 +1192,24 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::physical_unmapped(at);
+        // mac: stage 2's counts of pages at two or more addresses, if kept.
+        let (counting, mut twice) = (victory_gpu::physical_counts(), [0; 2]);
         for k in 0..size / PAGE {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {
+                let before = addresses.len();
                 addresses.retain(|&a| a != at + k * PAGE);
+                if counting {
+                    let [d, e] = victory_gpu::physical_shown_delta(before, addresses.len());
+                    twice = [twice[0] + d, twice[1] + e];
+                }
                 if addresses.is_empty() {
                     physical.shown.remove(&key);
                 }
             }
+        }
+        if counting {
+            victory_gpu::physical_shown_changed(twice);
         }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
@@ -1527,6 +1619,52 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// mac: stage 2's counts read what each address shows in xmem's own
+    /// views, across views and holes, before a call changes them.
+    #[test]
+    fn stage2_counts_read_what_each_address_shows() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            5 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let k: Vec<_> = pages.iter().map(|p| physical().pages[p].key(0)).collect();
+        assert_eq!(XMemMapPhysicalPages(at(1), 2, pages.as_ptr()), at(1));
+        assert_eq!(XMemMapPhysicalPages(at(4), 1, pages[2..].as_ptr()), at(4));
+        // Page 2 at the first address, page 1 over page 0, page 0 over
+        // page 1; then an unmap of all five.
+        let to = [k[2], k[1], k[0]];
+        let tally = |from: usize, n: usize, to: &[(usize, usize)]| {
+            let physical = physical();
+            victory_gpu::physical_tally_call(&physical.views, Slice::key, from, n, |i| {
+                to.get(i).copied()
+            })
+        };
+        assert_eq!(tally(a as usize, 3, &to), [1, 2, 0, 0]);
+        assert_eq!(
+            tally(at(2) as usize, 1, &[k[1]]),
+            [0, 0, 0, 1],
+            "inside a view"
+        );
+        assert_eq!(tally(a as usize, 5, &[]), [0, 0, 3, 0]);
+        let mapped =
+            |from: usize, n: usize| victory_gpu::physical_mapped_in(&physical().views, from, n);
+        assert_eq!(mapped(a as usize, 5), 3);
+        assert_eq!(mapped(at(3) as usize, 1), 0, "the hole");
+        assert_eq!(mapped(a as usize, 0), 0);
+        let swapped = [pages[2], pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(a, 3, swapped.as_ptr()), a);
+        assert_eq!(mapped(a as usize, 5), 4);
+        assert_eq!(XMemMapPhysicalPages(a, 5, std::ptr::null()), a);
+        assert_eq!(mapped(a as usize, 5), 0);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]

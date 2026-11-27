@@ -1118,6 +1118,46 @@ pub(crate) fn heap_sync_threads(value: Option<&str>, split: bool, most: usize) -
     if split { asked.clamp(1, most.max(1)) } else { 1 }
 }
 
+/// mac: what `VICTORY_ALIAS_PHYSICAL` asks of the title's physical pages
+/// (stage 2, `notes/alias-physical-design.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AliasPhysical {
+    /// Unset, empty or `0`: nothing, not even the counts (`crate::physical_runs`).
+    Off,
+    /// `count`, or a value that names nothing built: stage 2's counts alone.
+    Count,
+}
+
+/// [`AliasPhysical`], read once (at the title's first `xmem` call that asks).
+pub(crate) fn alias_physical() -> AliasPhysical {
+    static RULE: OnceLock<AliasPhysical> = OnceLock::new();
+    *RULE.get_or_init(|| {
+        let value = std::env::var("VICTORY_ALIAS_PHYSICAL").ok();
+        let (rule, known) = alias_physical_rule(value.as_deref());
+        if !known {
+            tracing::warn!(
+                "VICTORY_ALIAS_PHYSICAL={}: only =count is built so far; stage 2's counts alone",
+                value.as_deref().unwrap_or_default()
+            );
+        }
+        if rule != AliasPhysical::Off {
+            tracing::info!(
+                "VICTORY_ALIAS_PHYSICAL: stage 2's counts of the title's physical pages, in the physical pages line"
+            );
+        }
+        rule
+    })
+}
+
+/// [`alias_physical`]'s rule, and whether the value names something built.
+fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
+    match value.map(str::trim) {
+        None | Some("" | "0") => (AliasPhysical::Off, true),
+        Some("count") => (AliasPhysical::Count, true),
+        Some(_) => (AliasPhysical::Count, false),
+    }
+}
+
 /// A switch's state: `0` off, `1` on, anything else (and unset) `default`.
 fn setting(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -1203,9 +1243,37 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, overlapping_rule, quick, setting,
-        spans_rule, texture_workers, uav_size, whole_wave_lds, writers,
+        AliasPhysical, alias_physical_rule, copy_order, epoch, heap_locks, heap_sync_pause,
+        heap_sync_threads, key, overlapping_rule, quick, setting, spans_rule, texture_workers,
+        uav_size, whole_wave_lds, writers,
     };
+
+    #[test]
+    fn alias_physical_counts_only_when_set() {
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(
+                alias_physical_rule(off),
+                (AliasPhysical::Off, true),
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            alias_physical_rule(Some("count")),
+            (AliasPhysical::Count, true)
+        );
+        assert_eq!(
+            alias_physical_rule(Some(" count ")),
+            (AliasPhysical::Count, true)
+        );
+        // Any other value: the counts, with a warning.
+        for other in [Some("1"), Some("cpu"), Some("yes")] {
+            assert_eq!(
+                alias_physical_rule(other),
+                (AliasPhysical::Count, false),
+                "{other:?}"
+            );
+        }
+    }
 
     thread_local! {
         /// `snapshot_spans` is on for this thread's snapshots ([`SpansHere`]).
