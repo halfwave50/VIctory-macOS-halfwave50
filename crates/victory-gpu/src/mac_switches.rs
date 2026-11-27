@@ -496,6 +496,22 @@ pub(crate) fn code_table_loads() -> bool {
     })
 }
 
+/// Whether a read of title memory that crosses onto the next 64 KiB page
+/// reads that page's copy (`victory_shader::emit::Options::cross_page_reads`):
+/// `VICTORY_CROSS_PAGE_READS=1`, from VIctory-macOS PR #595 (5311f00c, open
+/// when taken). Off by default: the dwords past the first page then read
+/// through its copy, 0 where another copy follows, as before.
+pub(crate) fn cross_page_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_CROSS_PAGE_READS").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("VICTORY_CROSS_PAGE_READS=1: a title-memory read that crosses onto the next page reads that page's copy");
+        }
+        on
+    })
+}
+
 /// Whether the dwords of one console load are read four a call
 /// (`victory_shader::emit::Options::wide_loads`): bit 64 of
 /// `VICTORY_SHADER_OPT`, as in 64bitMango 759c4d6b and

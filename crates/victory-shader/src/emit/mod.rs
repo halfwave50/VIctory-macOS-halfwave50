@@ -144,7 +144,12 @@
 //!   access's first and last byte: what the host copies back) and for each
 //!   page with no copy an access reached, or for an address whose 256 MiB
 //!   region has no block, bit `level-1 index` (block 0's bits). Reads there
-//!   give 0, writes are dropped. In such a program (and one with root
+//!   give 0, writes are dropped. With [`Options::cross_page_reads`] (Mac,
+//!   from VIctory-macOS #595) a read of more than a dword whose bytes
+//!   reach the next 64 KiB page looks that page up too and reads its
+//!   dwords there through that page's memory, which need not be the first
+//!   page's (without it they lie past the first page's copy and read 0
+//!   where another copy follows). In such a program (and one with root
 //!   parameters past its user SGPRs) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
@@ -644,6 +649,15 @@ pub struct Options {
     /// table (their display LUT of one value). The shader cache keys on
     /// it. Mac.
     pub code_table_loads: bool,
+    /// A read of title memory of more than a dword (scalar and global
+    /// loads, root views read as title memory) whose bytes reach the next
+    /// 64 KiB page looks that page up as well, in the lanes whose read
+    /// crosses, and takes each dword that lies there through that page's
+    /// copy (`lower::pages`; from VIctory-macOS PR #595, 5311f00c). Off,
+    /// those dwords are read through the first page's copy, past its end
+    /// where the next page is another copy's: 0. The shader cache keys on
+    /// it. Mac.
+    pub cross_page_reads: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1142,6 +1156,7 @@ fn emit_form(
             bvh_miss: options.bvh_miss,
             descriptor_as_data: options.descriptor_as_data,
             code_table_loads: options.code_table_loads,
+            cross_page_reads: options.cross_page_reads,
             lds_rounds: options.lds_rounds,
             whole_wave: options.halves_whole_wave,
             whole_wave_no_lds: options.halves_whole_wave_no_lds,

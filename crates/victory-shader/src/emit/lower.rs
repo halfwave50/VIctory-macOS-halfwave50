@@ -25,6 +25,7 @@ mod atomics;
 mod buffer;
 mod bvh;
 mod code_table;
+mod pages;
 mod exchange;
 mod f64_cvt;
 mod f64_sum;
@@ -450,6 +451,8 @@ struct Lower<'a> {
     code_table: Option<(V, u32, u32)>,
     /// The null pair's view in the page table ([`Lower::memory_null`]).
     memory_null: Option<V>,
+    /// Reads that cross a page (`pages`).
+    pages: pages::Pages,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -1003,6 +1006,7 @@ impl<'a> Lower<'a> {
             section_out: Set::default(),
             code_table: None,
             memory_null: None,
+            pages: Default::default(),
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -2696,19 +2700,6 @@ impl<'a> Lower<'a> {
             self.s.t.f32,
             op,
             &[a, b],
-        )
-    }
-
-    /// `dx.op.rawBufferLoad.f32` of the handle, index, offset, mask and
-    /// alignment in `args`, in `block`.
-    fn raw_buffer_load(&mut self, block: usize, args: &[V]) -> V {
-        self.s.op(
-            block,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            args,
         )
     }
 
@@ -5366,7 +5357,8 @@ impl<'a> Lower<'a> {
     /// per page written and per page or 256 MiB region missed. May end in a
     /// new block: callers take [`Lower::cur`] afresh.
     // shortcut: one lookup per access, so its bytes are taken to lie in one
-    // host copy of title memory (any access within a 64 KiB page does).
+    // host copy of title memory (any access within a 64 KiB page does);
+    // with `Mac::cross_page_reads` a read's next page is looked up (`pages`).
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -5419,6 +5411,9 @@ impl<'a> Lower<'a> {
             let second = self.memory_mark_index(entry2, block2, l1_2);
             self.mark_memory_bit(bitmap, second);
             self.end_guarded(at, &[]);
+        }
+        if !write && bytes > 4 && self.x.mac.cross_page_reads && !self.pages.one_page {
+            self.page_tail(lo, hi, bytes, e.handle, e.offset, active);
         }
         (e.handle, e.offset)
     }

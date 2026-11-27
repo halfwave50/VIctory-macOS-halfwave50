@@ -458,6 +458,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And title-memory reads across a page (`VICTORY_CROSS_PAGE_READS=1`);
+    // off, nothing.
+    let key = if options.cross_page_reads {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"cross page reads");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     // And the form for dispatches counted in threads (the BVH builder's,
     // `VICTORY_BVH_BUILDER=1`); off, it adds nothing.
     let key = if options.thread_counts {
@@ -536,6 +546,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         // Per program (`host_shader_with`, `VICTORY_HALVES_WHOLE_WAVE_LDS`).
         halves_whole_wave_no_lds: false,
         code_table_loads: crate::mac_switches::code_table_loads(),
+        cross_page_reads: crate::mac_switches::cross_page_reads(),
         // Only for the BVH builder's pipelines, which ask for it
         // (`crate::pipeline::builder`).
         thread_counts: false,
@@ -930,6 +941,16 @@ mod tests {
         let on = victory_shader::emit::Options { code_table_loads: true, ..off };
         assert_ne!(translation_build(off), translation_build(on));
         assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { code_table_loads: false, ..off }));
+    }
+
+    /// Title-memory reads across a page (`Options::cross_page_reads`) change
+    /// the translation, so the cache keys on them; off, nothing changes.
+    #[test]
+    fn the_cache_keys_on_cross_page_reads() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { cross_page_reads: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { cross_page_reads: false, ..off }));
     }
 
     fn shader() -> HostShader {

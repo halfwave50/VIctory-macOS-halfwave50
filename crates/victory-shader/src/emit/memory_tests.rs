@@ -1766,3 +1766,197 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A program that reads four dwords at the pointer in its first two user
+/// dwords, with a scalar load and with a global load, and stores them to
+/// dwords 0-3 and 4-7 of the UAV in its table; lowered with `mac`. From
+/// VIctory-macOS #595 (5311f00c), whose wrap test shares it upstream.
+fn four_dwords_at_a_pointer(mac: lower::Mac) -> HostShader {
+    let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.extend(s_load(2, 12, 0, 0)); // s[12:15]: four dwords at the pointer
+    w.push(v_mov_b32(1, ZERO));
+    w.extend(global(14, 2, 1, 0, 0, 0)); // global_load_dwordx4 v[2:5], v1, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    for k in 0..4u8 {
+        w.push(v_mov_b32(6, 12 + u16::from(k)));
+        w.extend(buffer_store_dword(6, 8, 4 * u16::from(k)));
+        w.extend(buffer_store_dword(2 + k, 8, 16 + 4 * u16::from(k)));
+    }
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 7,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
+        halves_local: Default::default(),
+        mac,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// Four dwords from 8 bytes before the end of one host copy's last page,
+/// where another copy's first page follows (VIctory-macOS #595's test, with
+/// the Mac switch): with `Mac::cross_page_reads` the first two are the first
+/// copy's last, the other two the second copy's first, and no page is
+/// marked. Without it, as on main-mac before, the two on the next page lie
+/// past the first copy's end and read 0. Each with and without four-dword
+/// loads (`Mac::wide_loads`, `VICTORY_SHADER_OPT=64` in our runs).
+#[test]
+fn runs_across_two_copies_read_both() {
+    const PAGE: u64 = 0x1_0000;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // The first copy holds exactly its page; the second starts the next.
+    let first: Vec<u32> = (0..PAGE as u32 / 4).map(|k| 0x1000_0000 + k).collect();
+    let second: Vec<u32> = (0..64).map(|k| 0x2000_0000 + k).collect();
+    let mut table = page_table(1, 3);
+    let entry = 4096 + 2 * (4096 + (TITLE as u32 >> 16 & 0xFFF) as usize);
+    table[entry + 2..entry + 4].copy_from_slice(&[5, (TITLE + PAGE) as u32]);
+    let pointer = TITLE + PAGE - 8;
+    let last = first.len();
+    let mut ran = 0;
+    for (cross, wide) in [(false, false), (true, false), (false, true), (true, true)] {
+        let shader = four_dwords_at_a_pointer(lower::Mac {
+            cross_page_reads: cross,
+            wide_loads: wide,
+            ..Default::default()
+        });
+        let want = if cross {
+            [first[last - 2], first[last - 1], second[0], second[1]]
+        } else {
+            [first[last - 2], first[last - 1], 0, 0]
+        };
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let label = format!("{label}, cross {cross}, wide {wide}");
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 device ({label}); skipped");
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants {
+                    ud[u.index as usize] =
+                        [pointer as u32, (pointer >> 32) as u32, 0, 0][u.dword as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                            (2, Root::Uav(2 * 4096 / 32)),
+                        ],
+                        views: &[
+                            View::RawUav(8),
+                            View::Memory(&first),
+                            View::Pair,
+                            View::NullPair,
+                            View::Pair,
+                            View::Memory(&second),
+                            View::Pair,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0][..4], want, "{label}: the scalar load");
+            assert_eq!(out[0][4..], want, "{label}: the global load");
+            // Nothing missed: no page is marked.
+            let marked: Vec<usize> = (0..out[3].len() * 32)
+                .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
+                .collect();
+            assert!(marked.is_empty(), "{label}: pages marked: {marked:?}");
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

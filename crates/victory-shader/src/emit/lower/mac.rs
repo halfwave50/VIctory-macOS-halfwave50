@@ -206,6 +206,11 @@ pub(crate) struct Mac {
     /// its constant table reads the table (`lower::code_table`,
     /// `emit::Options::code_table_loads`), instead of a missing value.
     pub code_table_loads: bool,
+    /// A read of title memory of more than a dword whose bytes reach the
+    /// next 64 KiB page looks that page up too and reads its dwords there
+    /// through that page's copy (`lower::pages`,
+    /// `emit::Options::cross_page_reads`; VIctory-macOS #595).
+    pub cross_page_reads: bool,
 }
 
 thread_local! {
