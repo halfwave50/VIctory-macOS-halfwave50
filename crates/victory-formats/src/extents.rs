@@ -26,9 +26,6 @@ pub struct Extents {
     tail: Level,
     /// Pushed since the last lookup, in no order.
     fresh: Vec<Entry>,
-    /// Where a merge builds the new order, kept so that a merge allocates
-    /// nothing once it has grown.
-    scratch: Vec<Entry>,
 }
 
 /// Entries in start order, and beside each the largest end up to it.
@@ -46,39 +43,45 @@ impl Level {
         self.ends.clear();
     }
 
-    /// Merges `new`, in start order, into the entries. The entries before
-    /// the first new one keep their place and their `ends`; only the rest
-    /// is merged and has its `ends` redone.
-    fn merge(&mut self, new: &[Entry], scratch: &mut Vec<Entry>) {
+    /// Merges `new`, in start order, into the entries in place from the back
+    /// without a scratch copy. Entries before the first new one keep their
+    /// place and their `ends`; only the tail from `keep` onward is updated.
+    fn merge(&mut self, new: &[Entry]) {
         let Some(&(first_new, ..)) = new.first() else {
             return;
         };
+        let old_len = self.entries.len();
         let keep = self
             .entries
             .partition_point(|&(start, ..)| start <= first_new);
-        if keep == self.entries.len() {
+        if keep == old_len {
             self.entries.extend_from_slice(new);
         } else {
-            scratch.clear();
-            scratch.reserve(self.entries.len() - keep + new.len());
-            let (mut i, mut j, old) = (keep, 0, &self.entries);
-            while i < old.len() && j < new.len() {
-                if old[i].0 <= new[j].0 {
-                    scratch.push(old[i]);
-                    i += 1;
+            let add = new.len();
+            self.entries.resize(old_len + add, new[0]);
+            let mut i = old_len;
+            let mut j = add;
+            let mut dst = old_len + add;
+            while j > 0 {
+                dst -= 1;
+                if i > keep && self.entries[i - 1].0 > new[j - 1].0 {
+                    i -= 1;
+                    self.entries[dst] = self.entries[i];
                 } else {
-                    scratch.push(new[j]);
-                    j += 1;
+                    j -= 1;
+                    self.entries[dst] = new[j];
                 }
             }
-            scratch.extend_from_slice(&old[i..]);
-            scratch.extend_from_slice(&new[j..]);
-            self.entries.truncate(keep);
-            self.entries.extend_from_slice(scratch);
         }
-        self.ends.truncate(keep);
+        self.rebuild_ends(keep);
+    }
+
+    /// Recomputes `ends[from..]` from `entries[from..]`.
+    fn rebuild_ends(&mut self, from: usize) {
+        self.ends.truncate(from);
         let mut max = self.ends.last().copied().unwrap_or(0);
-        for &(_, end, _) in &self.entries[keep..] {
+        self.ends.reserve(self.entries.len() - from);
+        for &(_, end, _) in &self.entries[from..] {
             max = max.max(end);
             self.ends.push(max);
         }
@@ -102,7 +105,7 @@ impl Level {
 /// share of it (1/`SHARE`): each entry is then moved into the large level
 /// a few times per submission, and each lookup merges into a level of at
 /// most this share.
-const SHARE: usize = 8;
+const SHARE: usize = 2;
 
 impl Extents {
     /// A copy that flushed, its memory `[start, end)` filed under `key`.
@@ -130,18 +133,29 @@ impl Extents {
         // A chunk past the small level's share (all of a submission's
         // copies filed before its first lookup) goes straight in.
         if self.tail.entries.is_empty() && self.fresh.len() * SHARE > self.main.entries.len() {
-            self.main.merge(&self.fresh, &mut self.scratch);
-            self.fresh.clear();
+            if self.main.entries.is_empty() {
+                std::mem::swap(&mut self.main.entries, &mut self.fresh);
+                self.main.rebuild_ends(0);
+            } else {
+                self.main.merge(&self.fresh);
+                self.fresh.clear();
+            }
             return;
         }
-        self.tail.merge(&self.fresh, &mut self.scratch);
-        self.fresh.clear();
+        if self.tail.entries.is_empty() {
+            std::mem::swap(&mut self.tail.entries, &mut self.fresh);
+            self.tail.rebuild_ends(0);
+        } else {
+            self.tail.merge(&self.fresh);
+            self.fresh.clear();
+        }
         if self.tail.entries.len() * SHARE > self.main.entries.len() {
-            let tail = std::mem::take(&mut self.tail);
-            self.main.merge(&tail.entries, &mut self.scratch);
-            // Keep the small level's buffers for the next chunks.
-            self.tail = tail;
-            self.tail.clear();
+            if self.main.entries.is_empty() {
+                std::mem::swap(&mut self.main, &mut self.tail);
+            } else {
+                self.main.merge(&self.tail.entries);
+                self.tail.clear();
+            }
         }
     }
 
