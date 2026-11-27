@@ -84,9 +84,11 @@ struct Ran {
 
 /// Submissions held off ([`Host::quiet`]).
 pub(crate) struct Quiet<'a> {
-    // Dropped in this order: the mark, then the lock.
+    // Dropped in this order: the mark, the lock, then the test lock.
     _holding: Holding,
     _held: std::sync::MutexGuard<'a, u64>,
+    #[cfg(test)]
+    _shared: unwaited::Shared,
 }
 
 pub(crate) struct Host {
@@ -1876,10 +1878,17 @@ impl Host {
             }
             return None;
         }
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // A submission the host GPU was not waited for has run too.
         self.stand();
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        Some(Quiet {
+            _holding: Holding::enter(),
+            _held: held,
+            #[cfg(test)]
+            _shared,
+        })
     }
 
     /// Runs closed lists and waits for them.
@@ -2290,7 +2299,7 @@ impl Host {
     /// and their bottom-of-pipe writes. `submitted`: the submission lock,
     /// given up before a listed frame's dumps (diagnostics); none for a
     /// submission finished later ([`unwaited`]), whose finisher keeps it.
-    fn finish(&self, submitted: Option<std::sync::MutexGuard<'_, u64>>, runs: &[&HostList], ran: Ran) {
+    fn finish(&self, submitted: Option<unwaited::Submitted<'_>>, runs: &[&HostList], ran: Ran) {
         let Ran { gpu, removed_in, batch, heaps, traced } = ran;
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {

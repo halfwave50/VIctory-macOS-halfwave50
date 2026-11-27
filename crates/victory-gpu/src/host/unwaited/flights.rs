@@ -227,8 +227,10 @@ impl Host {
     pub(in crate::host) fn submissions_beside(
         &self,
         next: &[&HostList],
-    ) -> (std::sync::MutexGuard<'_, u64>, Option<Beside>) {
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    ) -> (Submitted<'_>, Option<Beside>) {
+        #[cfg(test)]
+        let _shared = shared();
+        let mut guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // Not a list it runs too (a list submitted twice): its steps are
         // looked at under the list's lock, which finishing it takes.
         let running = (VALUE.load(Acquire) != 0)
@@ -243,8 +245,15 @@ impl Host {
             .flatten()
             .filter(|_| !next.iter().any(|l| l.deferred().after_copy));
         let Some(value) = running else {
-            self.settle_held(&mut submitted, By::Next, next);
-            return (submitted, None);
+            self.settle_held(&mut guard, By::Next, next);
+            return (
+                Submitted {
+                    guard,
+                    #[cfg(test)]
+                    _shared,
+                },
+                None,
+            );
         };
         BESIDE[0].fetch_add(1, Relaxed);
         let beside = Beside {
@@ -254,7 +263,14 @@ impl Host {
             footprint: None,
             finishing: Duration::ZERO,
         };
-        (submitted, Some(beside))
+        (
+            Submitted {
+                guard,
+                #[cfg(test)]
+                _shared,
+            },
+            Some(beside),
+        )
     }
 
     /// Finishes the submission left, if `beside` still runs it ([`Why`]).
