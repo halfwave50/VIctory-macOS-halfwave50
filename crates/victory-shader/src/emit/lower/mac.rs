@@ -202,6 +202,10 @@ pub(crate) struct Mac {
     /// [`Lower::memory_smem`]; the module notes, "Descriptor dwords read as
     /// data").
     pub descriptor_as_data: bool,
+    /// A vector buffer load through a descriptor the program builds around
+    /// its constant table reads the table (`lower::code_table`,
+    /// `emit::Options::code_table_loads`), instead of a missing value.
+    pub code_table_loads: bool,
 }
 
 thread_local! {

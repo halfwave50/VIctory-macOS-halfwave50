@@ -479,6 +479,23 @@ pub(crate) fn bvh_miss() -> bool {
     })
 }
 
+/// Whether a vector buffer load through a descriptor a program builds
+/// around its own constant table reads the table
+/// (`victory_shader::emit::Options::code_table_loads`):
+/// `VICTORY_CODE_TABLE_LOADS=1`, from LakshanSivakumar/Native-Victory-macOS
+/// 578eb743. Off by default: such a load is a missing value, as before.
+/// There it left the display LUT one value and the world flat grey.
+pub(crate) fn code_table_loads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_CODE_TABLE_LOADS").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("VICTORY_CODE_TABLE_LOADS=1: buffer loads through a descriptor around the code's constant table read the table");
+        }
+        on
+    })
+}
+
 /// Whether the dwords of one console load are read four a call
 /// (`victory_shader::emit::Options::wide_loads`): bit 64 of
 /// `VICTORY_SHADER_OPT`, as in 64bitMango 759c4d6b and

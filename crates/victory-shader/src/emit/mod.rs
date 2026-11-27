@@ -253,6 +253,8 @@ mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(test)]
+mod code_table_tests;
 #[cfg(all(test, windows))]
 mod crosslane_tests;
 #[cfg(all(test, windows))]
@@ -634,6 +636,14 @@ pub struct Options {
     /// before it came (`VICTORY_HALVES_WHOLE_WAVE_LDS` lists the programs
     /// that keep it; mac, `notes/far-ray.md`). The shader cache keys on it.
     pub halves_whole_wave_no_lds: bool,
+    /// A vector buffer load (`buffer_load_dword*`) through a descriptor the
+    /// program builds around its own constant table (`s_getpc_b64`) reads
+    /// the table's dwords, 0 past its byte count (`lower::code_table`; from
+    /// LakshanSivakumar/Native-Victory-macOS 578eb743). Off, such a load is
+    /// a missing value, which can leave a program running without the
+    /// table (their display LUT of one value). The shader cache keys on
+    /// it. Mac.
+    pub code_table_loads: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -978,6 +988,14 @@ pub fn uav_size_queries() -> [u32; 2] {
     lower::take_uav_size_queries()
 }
 
+/// Buffer loads through a descriptor built around the code's constant
+/// table in the translations this thread made since the last call
+/// (`Options::code_table_loads` reads them; mac). A program lowered twice
+/// counts twice: only none or some is meant.
+pub fn code_table_loads() -> u32 {
+    lower::take_code_table_loads()
+}
+
 /// [`emit`] made as `options` say.
 pub fn emit_with(
     c: &Container,
@@ -1123,6 +1141,7 @@ fn emit_form(
             wide_loads: options.wide_loads,
             bvh_miss: options.bvh_miss,
             descriptor_as_data: options.descriptor_as_data,
+            code_table_loads: options.code_table_loads,
             lds_rounds: options.lds_rounds,
             whole_wave: options.halves_whole_wave,
             whole_wave_no_lds: options.halves_whole_wave_no_lds,

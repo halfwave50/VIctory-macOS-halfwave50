@@ -24,6 +24,7 @@ mod barriers;
 mod atomics;
 mod buffer;
 mod bvh;
+mod code_table;
 mod exchange;
 mod f64_cvt;
 mod f64_sum;
@@ -44,6 +45,7 @@ pub(crate) use f64_sum::count_f64_high;
 #[cfg(test)]
 pub(crate) use mac::early_depth as early_depth_rule;
 pub(crate) use mac::take_uav_size_queries;
+pub(crate) use code_table::take_code_table_loads;
 use barriers::{in_step, split_wave_barriers, split_wave_barriers_in};
 use mesh::prune_signature;
 
