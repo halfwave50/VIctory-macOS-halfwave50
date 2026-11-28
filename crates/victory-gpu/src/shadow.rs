@@ -1195,9 +1195,12 @@ impl Shadow {
         start: usize,
         end: usize,
     ) -> (crate::watch::Runs, Vec<usize>) {
+        const BLOCK: usize = 4096;
         let mut writes: crate::watch::Runs = Vec::new();
         let mut taken = Vec::new();
         let mut title = Vec::new();
+        let mut blocks_changed = 0u64;
+        let mut blocks_compared = 0u64;
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -1223,15 +1226,22 @@ impl Shadow {
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
-            let differs = match &saved {
-                // The title's bytes are the copy's from before: what differs
-                // is the shaders'.
-                None => *host != title[..],
-                Some(before) => {
-                    let before = &before[from - page..to - page];
-                    merge_writeback(&mut title, host, before)
-                }
-            };
+            blocks_compared += (to.div_ceil(BLOCK) - from / BLOCK) as u64;
+            let before = saved.as_deref().map(|b| &b[from - page..to - page]);
+            let mut page_blocks_changed = 0u64;
+            for blk in from / BLOCK..to.div_ceil(BLOCK) {
+                let a = (blk * BLOCK).max(from) - from;
+                let b = ((blk + 1) * BLOCK).min(to) - from;
+                let blk_differs = match before {
+                    // The title's bytes are the copy's from before: what differs
+                    // is the shaders'.
+                    None => host[a..b] != title[a..b],
+                    Some(old) => merge_writeback(&mut title[a..b], &mut host[a..b], &old[a..b]),
+                };
+                page_blocks_changed += u64::from(blk_differs);
+            }
+            let differs = page_blocks_changed > 0;
+            blocks_changed += page_blocks_changed;
             if differs {
                 match writes.last_mut() {
                     Some((_, end)) if *end == from => *end = to,
@@ -1246,6 +1256,7 @@ impl Shadow {
                 taken.push(page / PAGE);
             }
         }
+        record_marked_blocks(blocks_changed, blocks_compared);
         (writes, taken)
     }
 
@@ -1959,13 +1970,32 @@ thread_local! {
     /// A test's choice, whatever the environment says.
     static SPLIT_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static MARKED_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread `(blocks_changed, blocks_compared)` tally from the last
+    /// `copy_back_marked` call, isolated from concurrent tests.
+    static LAST_MARKED_BLOCKS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// mac: of [`copy_back_marks`] since the last frame line: marked pages of
 /// host copies compared with title memory, marked pages of aliased copies
 /// (told to the other trackers, nothing to compare), bytes written back
-/// from the compared pages, and the calls' microseconds.
-static MARKED_BACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// from the compared pages, the calls' microseconds, 4 KiB blocks changed,
+/// and 4 KiB blocks compared.
+static MARKED_BACK: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(super) fn record_marked_blocks(blocks_changed: u64, blocks_compared: u64) {
+    MARKED_BACK[4].fetch_add(blocks_changed, Ordering::Relaxed);
+    MARKED_BACK[5].fetch_add(blocks_compared, Ordering::Relaxed);
+    #[cfg(test)]
+    LAST_MARKED_BLOCKS.with(|c| {
+        let (prev_c, prev_n) = c.get();
+        c.set((prev_c + blocks_changed, prev_n + blocks_compared));
+    });
+}
+
+#[cfg(test)]
+pub(super) fn take_last_marked_blocks() -> (u64, u64) {
+    LAST_MARKED_BLOCKS.with(|c| c.replace((0, 0)))
+}
 
 /// Adds the time it lived to [`MARKED_BACK`]'s microseconds.
 struct MarkedClock(std::time::Instant);
@@ -1976,19 +2006,26 @@ impl Drop for MarkedClock {
     }
 }
 
+pub(super) fn format_marked_back_line(
+    [compared, aliased, bytes, us, blocks_changed, blocks_compared]: [f64; 6],
+    spans: bool,
+) -> String {
+    format!(
+        "; marked pages copied back: {compared:.0} compared ({blocks_changed:.0} 4 KiB blocks changed of {blocks_compared:.0} blocks compared), \
+         {:.1} MB written back from them, {aliased:.0} more in aliased memory told only, in {:.1} ms{}",
+        bytes / 1e6,
+        us / 1e3,
+        if spans { " (VICTORY_COPY_BACK_SPANS)" } else { "" }
+    )
+}
+
 /// The frame line's part for [`MARKED_BACK`] (`frames` since the last
 /// one), always, at the end of the line: the line's "copying back ... MB"
 /// counts the declared ranges only (`crate::host`), not these.
 pub(crate) fn marked_back_line(frames: f64) -> String {
-    let [compared, aliased, bytes, us] =
+    let vals =
         MARKED_BACK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
-    format!(
-        "; marked pages copied back: {compared:.0} compared, {:.1} MB written back from them, {aliased:.0} more in \
-         aliased memory told only, in {:.1} ms{}",
-        bytes / 1e6,
-        us / 1e3,
-        if crate::mac_switches::copy_back_spans() { " (VICTORY_COPY_BACK_SPANS)" } else { "" }
-    )
+    format_marked_back_line(vals, crate::mac_switches::copy_back_spans())
 }
 
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {

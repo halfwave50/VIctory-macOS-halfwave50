@@ -250,6 +250,25 @@ pub(crate) fn page_runs(spans: &[(usize, usize)], page_size: usize) -> Vec<(usiz
     runs
 }
 
+/// Counts distinct `block_size`-aligned blocks overlapped by sorted,
+/// non-overlapping byte spans `[from, to)` without allocating.
+pub(crate) fn block_count(spans: &[(usize, usize)], block_size: usize) -> u64 {
+    let mut total = 0u64;
+    let mut covered_end = 0usize;
+    for &(from, to) in spans {
+        if from >= to {
+            continue;
+        }
+        let b0 = (from / block_size).max(covered_end);
+        let b1 = to.div_ceil(block_size);
+        if b1 > b0 {
+            total += (b1 - b0) as u64;
+            covered_end = b1;
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +419,23 @@ mod tests {
                     let differs = diff_spans(&host, &title, 0x20_0000, coalesce, &mut actual);
                     assert_eq!(differs, !expected.is_empty());
                     assert_eq!(actual, expected, "len={len} coalesce={coalesce} mode={mode}");
+                    if coalesce < BLOCK {
+                        let base = 0x20_0000;
+                        let end = base + len;
+                        let mut oracle_blocks = 0u64;
+                        for blk in base / BLOCK..end.div_ceil(BLOCK) {
+                            let a = (blk * BLOCK).max(base) - base;
+                            let b = ((blk + 1) * BLOCK).min(end) - base;
+                            if a < b && host[a..b] != title[a..b] {
+                                oracle_blocks += 1;
+                            }
+                        }
+                        assert_eq!(
+                            block_count(&actual, BLOCK),
+                            oracle_blocks,
+                            "4 KiB block count mismatch at len={len} coalesce={coalesce} mode={mode}"
+                        );
+                    }
                 }
             }
         }

@@ -746,10 +746,11 @@ fn spans_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
-/// Whether marked and snapshot copy-backs scan 8 bytes at a time, batch kernel
-/// reads and guard locks, partition unaliased pages onto parallel workers, and
-/// write back only coalesced changed byte spans (`crate::copy_back_spans`,
-/// `crate::shadow::copy_back_fast`). Off unless `VICTORY_COPY_BACK_SPANS=1`.
+/// Whether marked and snapshot copy-backs scan 8 bytes at a time, batch
+/// marked-page tracker and guard locks, and write back only coalesced changed
+/// byte spans (`crate::copy_back_spans`, `crate::shadow::copy_back_fast`).
+/// Worker splitting stays under `VICTORY_COPY_BACK_SPLIT`. Off unless
+/// `VICTORY_COPY_BACK_SPANS=1`.
 ///
 /// mac: `VICTORY_AB=VICTORY_COPY_BACK_SPANS` (`crate::ab`): read per copy-back
 /// call, and both sides leave `Shadow` and page guards in the same state.
@@ -763,7 +764,7 @@ pub(crate) fn copy_back_spans() -> bool {
         let on = copy_back_spans_rule(std::env::var("VICTORY_COPY_BACK_SPANS").ok().as_deref());
         if on {
             tracing::info!(
-                "VICTORY_COPY_BACK_SPANS=1: marked and snapshot copy-backs batch reads and guard locks, split unaliased pages, and write back only changed byte spans"
+                "VICTORY_COPY_BACK_SPANS=1: marked and snapshot copy-backs word-scan pages, batch marked-page guard locks, and write back only changed byte spans"
             );
         }
         on

@@ -5,20 +5,22 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+use super::MARKED_SPLIT;
 use super::{
     SPLIT_MIN_PAGES, SPLIT_PARTS, SNAPSHOTS, Shadow, Snapshot, copy_back_split, give_back,
-    parallel_copies_enabled,
+    record_marked_blocks, split_said,
 };
-#[cfg(test)]
-use super::{MARKED_SPLIT, SPLIT_FORCED};
-use crate::copy_back_spans::{COALESCE_GAP, diff_spans, merge_spans, page_runs};
+use crate::copy_back_spans::{COALESCE_GAP, block_count, diff_spans, merge_spans, page_runs};
 use crate::watch::{MarkedPage, PAGE};
 
-type ScanOut = (crate::watch::Runs, Vec<usize>);
+type ScanOut = (crate::watch::Runs, Vec<usize>, u64);
 
 /// Chunk size when splitting large contiguous writeback spans across workers
-/// (256 KiB = 4 × 64 KiB pages).
+/// under `VICTORY_COPY_BACK_SPLIT=1` (256 KiB = 4 × 64 KiB pages).
 const WRITE_CHUNK_BYTES: usize = 4 * PAGE;
+
+const BLOCK: usize = 4096;
 
 thread_local! {
     /// Warm 64 KiB page buffer per thread, avoiding repeated heap allocations
@@ -37,8 +39,10 @@ fn with_scan_buf<R>(need: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
 }
 
 impl Shadow {
-    /// `Shadow::copy_back_or_not` with word-scanned three-way merge, coalesced
-    /// span writes, and a single guard open/close+re-guard pair.
+    /// `Shadow::copy_back_or_not` with word-scanned three-way merge and
+    /// coalesced span writes, reading, writing, and re-guarding one 64 KiB
+    /// piece at a time so concurrent title writes outside the GPU spans are
+    /// never cleared from the changed set without reaching the shadow.
     pub(super) fn copy_back_or_not_spans(&self, address: usize, len: usize, back: bool) -> usize {
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -62,9 +66,9 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(started, crate::copystat::C::CompareUs);
             const PIECE: usize = 64 << 10;
+            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             let mut scratch = Vec::new();
-            let mut synced = Vec::new();
-            let mut writes: Vec<(usize, usize)> = Vec::new();
+            let mut piece_writes: Vec<(usize, usize)> = Vec::new();
             with_scan_buf(PIECE, |title_buf| {
                 let mut at = from;
                 while at < to {
@@ -89,8 +93,26 @@ impl Shadow {
                     if let Some(old) = old
                         && crate::host::read_into((start + at) as *const u8, title)
                     {
-                        merge_spans(title, host, old, start + at, COALESCE_GAP, &mut writes);
-                        synced.push((start + at) / PAGE);
+                        piece_writes.clear();
+                        if merge_spans(title, host, old, start + at, COALESCE_GAP, &mut piece_writes)
+                        {
+                            let _writing = crate::watch::writing(start + at, n);
+                            for &(w_from, w_to) in &piece_writes {
+                                let w_len = w_to - w_from;
+                                // SAFETY: `w_from..w_to` lies inside `[start + at, start + at + n)`
+                                // and `merge_spans` stored the merged bytes in `self.data`.
+                                let src = unsafe { self.data.add(w_from - start) };
+                                crate::host::write_mapped(w_from as *mut u8, src, w_len);
+                                crate::alias_verify::gpu_wrote(self, w_from, w_len);
+                                written += w_len;
+                            }
+                        }
+                        let page = (start + at) / PAGE;
+                        if let Some(t) = &self.tracked
+                            && (first..last).contains(&page)
+                        {
+                            t.taken(&[page]);
+                        }
                     }
                     if self.has_widened.load(Ordering::Acquire) {
                         self.refresh_widened(start + at, start + at + n);
@@ -98,25 +120,6 @@ impl Shadow {
                     at += n;
                 }
             });
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-            let dirty_pages = page_runs(&writes, PAGE);
-            let writing = crate::watch::writing_runs(&dirty_pages, self.tracked.as_ref());
-            for &(w_from, w_to) in &writes {
-                let w_len = w_to - w_from;
-                // SAFETY: `w_from..w_to` lies inside `[start + from, start + to)` and
-                // `merge_spans` stored the merged bytes in `self.data`.
-                let src = unsafe { self.data.add(w_from - start) };
-                crate::host::write_mapped(w_from as *mut u8, src, w_len);
-                written += w_len;
-            }
-            for &(p0, p1) in &dirty_pages {
-                crate::alias_verify::gpu_wrote(self, p0 * PAGE, (p1 - p0) * PAGE);
-            }
-            match &self.tracked {
-                Some(t) => writing.finish_and_take(t, &whole),
-                None => drop(writing),
-            }
             SNAPSHOTS[5].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if !back && from < to && self.has_widened.load(Ordering::Acquire) {
@@ -138,8 +141,10 @@ impl Shadow {
     }
 
     /// `Shadow::copy_back_marked` with batched tracker pre-pass, warm L2-sized
-    /// scan buffers, per-page alias partitioning for parallel workers,
-    /// jump-ahead span diffing, chunked parallel writes, and vetted re-guarding.
+    /// scan buffers, jump-ahead span diffing, coalesced changed-span writes,
+    /// and a single batched guard open/re-guard round trip. Worker splitting
+    /// runs only when `VICTORY_COPY_BACK_SPLIT` asks for it and no page of the
+    /// copy is shown at two addresses (matching `Shadow::copy_back_marked`).
     pub(super) fn copy_back_marked_spans(&self, pages: &[usize]) -> usize {
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = &self.tracked else {
@@ -147,45 +152,35 @@ impl Shadow {
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let has_widened = self.has_widened.load(Ordering::Acquire);
-        let want_parallel = {
-            #[cfg(test)]
-            {
-                SPLIT_FORCED
-                    .with(std::cell::Cell::get)
-                    .unwrap_or_else(|| parallel_copies_enabled() || copy_back_split())
-            }
-            #[cfg(not(test))]
-            {
-                parallel_copies_enabled() || copy_back_split()
-            }
-        };
-        let (unaliased, aliased) = if want_parallel && pages.len() >= SPLIT_MIN_PAGES && !has_widened {
-            crate::watch::partition_unaliased(pages)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let split = want_parallel && unaliased.len() >= SPLIT_MIN_PAGES && !has_widened;
+        let long = copy_back_split() && pages.len() >= SPLIT_MIN_PAGES && !has_widened;
+        let split = long && !crate::watch::aliased(start, end - start);
+        if long {
+            split_said(split, pages.len());
+        }
         #[cfg(test)]
         MARKED_SPLIT.with(|taken| taken.set(Some(split)));
+        let planned = self.plan_marked(t, pages, start, end);
         if !split {
-            let planned = self.plan_marked(t, pages, start, end);
-            let (writes, taken) = self.scan_marked(&planned, start, has_widened);
+            let (writes, mut taken, blocks_compared) =
+                self.scan_marked(t, &planned, start, has_widened);
+            t.unarm_marked(&planned, &mut taken);
+            record_marked_blocks(block_count(&writes, BLOCK), blocks_compared);
             return self.write_marked_spans(t, &writes, &taken, start, false);
         }
-        let planned = self.plan_marked(t, &unaliased, start, end);
         let parts = planned.len().div_ceil(SPLIT_MIN_PAGES / 2).clamp(1, SPLIT_PARTS);
-        let (writes, taken) = if parts >= 2 {
+        let (writes, mut taken, blocks_compared) = if parts >= 2 {
             let each = planned.len().div_ceil(parts);
             let done: Vec<Mutex<ScanOut>> = (0..parts).map(|_| Mutex::default()).collect();
             crate::texture::in_parallel(parts, |k| {
                 let lo = (k * each).min(planned.len());
                 let hi = ((k + 1) * each).min(planned.len());
                 *done[k].lock().unwrap_or_else(|e| e.into_inner()) =
-                    self.scan_marked(&planned[lo..hi], start, false);
+                    self.scan_marked(t, &planned[lo..hi], start, false);
             });
-            let (mut writes, mut taken) = (Vec::new(), Vec::new());
+            let (mut writes, mut taken, mut blocks_compared) = (Vec::new(), Vec::new(), 0u64);
             for part in done {
-                let (w, p) = part.into_inner().unwrap_or_else(|e| e.into_inner());
+                let (w, p, bc) = part.into_inner().unwrap_or_else(|e| e.into_inner());
+                blocks_compared += bc;
                 for (w_from, w_to) in w {
                     if let Some(&mut (_, ref mut prev_to)) = writes.last_mut()
                         && *prev_to == w_from
@@ -197,17 +192,13 @@ impl Shadow {
                 }
                 taken.extend(p);
             }
-            (writes, taken)
+            (writes, taken, blocks_compared)
         } else {
-            self.scan_marked(&planned, start, false)
+            self.scan_marked(t, &planned, start, false)
         };
-        let mut total = self.write_marked_spans(t, &writes, &taken, start, true);
-        if !aliased.is_empty() {
-            let aliased_planned = self.plan_marked(t, &aliased, start, end);
-            let (a_writes, a_taken) = self.scan_marked(&aliased_planned, start, has_widened);
-            total += self.write_marked_spans(t, &a_writes, &a_taken, start, false);
-        }
-        total
+        t.unarm_marked(&planned, &mut taken);
+        record_marked_blocks(block_count(&writes, BLOCK), blocks_compared);
+        self.write_marked_spans(t, &writes, &taken, start, true)
     }
 
     fn plan_marked(
@@ -230,27 +221,44 @@ impl Shadow {
 
     fn scan_marked(
         &self,
+        t: &crate::watch::Tracked,
         planned: &[MarkedPage],
         start: usize,
         has_widened: bool,
     ) -> ScanOut {
         let mut writes = Vec::new();
         let mut taken = Vec::new();
+        let mut blocks_compared = 0u64;
         with_scan_buf(PAGE, |buf| {
             for item in planned {
                 let n = item.to - item.from;
                 if crate::host::read_into(item.from as *const u8, &mut buf[..n]) {
-                    self.scan_one_marked(item, &mut buf[..n], start, has_widened, &mut writes, &mut taken);
+                    blocks_compared += (item.to.div_ceil(BLOCK) - item.from / BLOCK) as u64;
+                    let late_saved = if item.saved.is_none() && !t.clean() {
+                        t.saved(item.page / PAGE)
+                    } else {
+                        None
+                    };
+                    self.scan_one_marked(
+                        item,
+                        late_saved.as_deref(),
+                        &mut buf[..n],
+                        start,
+                        has_widened,
+                        &mut writes,
+                        &mut taken,
+                    );
                 }
             }
         });
-        (writes, taken)
+        (writes, taken, blocks_compared)
     }
 
     #[inline]
     fn scan_one_marked(
         &self,
         item: &MarkedPage,
+        late_saved: Option<&[u8]>,
         title: &mut [u8],
         start: usize,
         has_widened: bool,
@@ -260,17 +268,19 @@ impl Shadow {
         let n = item.to - item.from;
         // SAFETY: `item.from..item.to` is inside this shadow and disjoint across workers.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(item.from - start), n) };
-        let differs = match &item.saved {
-            None => diff_spans(host, title, item.from, COALESCE_GAP, writes),
+        match item.saved.as_deref().or(late_saved) {
+            None => {
+                diff_spans(host, title, item.from, COALESCE_GAP, writes);
+            }
             Some(before) => {
                 let before = &before[item.from - item.page..item.to - item.page];
-                merge_spans(title, host, before, item.from, COALESCE_GAP, writes)
+                merge_spans(title, host, before, item.from, COALESCE_GAP, writes);
             }
-        };
+        }
         if has_widened {
             self.refresh_widened(item.from, item.to);
         }
-        if item.from == item.page && item.to == item.page + PAGE && (differs || item.was_changed) {
+        if item.from == item.page && item.to == item.page + PAGE {
             taken.push(item.page / PAGE);
         }
     }
@@ -287,7 +297,7 @@ impl Shadow {
             return 0;
         }
         let dirty_pages = page_runs(writes, PAGE);
-        let writing = crate::watch::writing_runs(&dirty_pages, Some(t));
+        let writing = crate::watch::writing_runs(&dirty_pages);
         let write_one = |&(from, to): &(usize, usize)| {
             let len = to - from;
             // SAFETY: `from..to` is inside `self.data`, which holds the merged bytes.
@@ -297,9 +307,6 @@ impl Shadow {
         };
         let total_bytes: usize = writes.iter().map(|&(a, b)| b - a).sum();
         let written = if parallel && total_bytes >= WRITE_CHUNK_BYTES {
-            // Chunk multi-megabyte merged spans into 256 KiB slices so multiple
-            // cores saturate memory bandwidth even when dense pages merge into
-            // a single contiguous run.
             let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(writes.len().max(SPLIT_PARTS));
             for &(from, to) in writes {
                 if to - from <= WRITE_CHUNK_BYTES {
