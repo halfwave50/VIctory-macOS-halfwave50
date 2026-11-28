@@ -189,6 +189,7 @@ fn decided_per_lane(x: &Parts, same: &Set<Value>, b: usize) -> bool {
 }
 
 /// What a thread group runs together.
+#[derive(Clone)]
 pub(super) struct Together {
     /// Per block: every thread of the group runs it as often as every
     /// other, in step, or none does.

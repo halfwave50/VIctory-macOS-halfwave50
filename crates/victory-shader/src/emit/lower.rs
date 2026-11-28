@@ -224,8 +224,10 @@ pub(crate) fn lower_pruned(
     keep: Option<&KeptOutputs>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // What every retry would work out again from the program alone.
+    let kept = exchange::Kept::default();
     loop {
-        match Lower::new(parts, &bad, keep).run() {
+        match Lower::new(parts, &bad, keep, &kept).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -322,6 +324,8 @@ struct Lower<'a> {
     keep: Option<&'a KeptOutputs>,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// What the exchanges ask of `x` alone, kept across retries.
+    kept: &'a exchange::Kept,
     lane_fail: Map<Value, Why>,
     vals: Map<Value, Val>,
     floats: Map<Value, V>,
@@ -740,7 +744,12 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&'a KeptOutputs>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        keep: Option<&'a KeptOutputs>,
+        kept: &'a exchange::Kept,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -918,6 +927,7 @@ impl<'a> Lower<'a> {
             keep,
             x,
             bad,
+            kept,
             lane_fail: Map::default(),
             vals: Map::default(),
             floats: Map::default(),
