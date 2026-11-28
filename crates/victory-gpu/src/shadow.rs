@@ -3094,6 +3094,16 @@ mod widened_bench;
 pub(crate) mod tests {
     use super::*;
 
+    /// Lets go of the copies this thread's lookups keep ([`find`]'s cache),
+    /// as a thread that ends does. A copy the title gave up stays alive in
+    /// that cache, and its tracker with it, until the thread looks something
+    /// up again: a test that frees the memory under it first leaves the
+    /// guards naming pages another test may be given next.
+    pub(crate) fn forget_lookups() {
+        let kept = LOOKUP_CACHE.with(|cell| cell.borrow_mut().take());
+        drop(kept);
+    }
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {

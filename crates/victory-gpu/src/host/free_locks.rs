@@ -161,6 +161,9 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        // (The test lock first, as a submission takes them: not while a
+        // test of `unwaited` has the submissions to itself.)
+        let _shared = super::unwaited::shared();
         let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         use crate::shadow::tests::{add_gave_up, lock_word, set_lock_word};
         // Any count and locks a test before left.

@@ -702,6 +702,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// Releases `ADOPTED` on scope exit (including panic) so a failing test
+    /// cannot poison subsequent `reports` tests.
+    struct AdoptedGuard(u64);
+
+    impl Drop for AdoptedGuard {
+        fn drop(&mut self) {
+            let_go_now(self.0);
+        }
+    }
+
     /// Slots marked as the stores mark them come out once each, as runs in
     /// order; outside the heap nothing is marked; slots put back come out
     /// again; a heap that went is marked no more, and its maps serve the
@@ -711,6 +721,7 @@ pub(crate) mod tests {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x1000_0000u64;
         assert!(adopt_as(start, 1000, Mode::Use, true));
+        let guard = AdoptedGuard(start);
         assert_eq!((told(start, 1000), told(start + 32, 1000), told(start, 999)), (Told::Use, Told::No, Told::No));
         for slot in [5u64, 6, 300, 999] {
             store_marks(start + slot * 32 + if slot == 6 { 7 } else { 0 });
@@ -730,15 +741,15 @@ pub(crate) mod tests {
         assert!(!adopt_as(start + 0x10_0000, 64, Mode::Use, true));
         store_marks(start + 5 * 32);
         let maps = MARKS.slots.load(Relaxed);
-        let_go_now(start);
+        drop(guard);
         store_marks(start + 5 * 32);
         assert_eq!(MARKS.len.load(Relaxed), 0);
         assert_eq!(take(start), []);
         // The next heap of that size gets the same maps, cleared.
         assert!(adopt_as(start + 0x20_0000, 1000, Mode::Check, false));
+        let _guard2 = AdoptedGuard(start + 0x20_0000);
         assert_eq!(MARKS.slots.load(Relaxed), maps);
         assert_eq!(take(start + 0x20_0000), [], "the mark of slot 5 went with the heap");
-        let_go_now(start + 0x20_0000);
     }
 
     use super::let_go as let_go_now;
@@ -815,6 +826,7 @@ pub(crate) mod tests {
         let mut told_made = vec![0u64; SLOTS];
         let start = scan.start();
         assert!(adopt_as(start, SLOTS as u32, Mode::Use, true));
+        let _guard = AdoptedGuard(start);
         let mut x = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
             x ^= x << 13;
@@ -916,7 +928,6 @@ pub(crate) mod tests {
             }
         }
         assert!(views_found > 2000 && others_found > 100, "the test met both kinds: {views_found}, {others_found}");
-        let_go_now(start);
     }
 
     /// The `check` form's counts: a look at a written page sorts the slots
@@ -926,6 +937,7 @@ pub(crate) mod tests {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x7000_0000u64;
         assert!(adopt_as(start, 4096, Mode::Check, true));
+        let _guard = AdoptedGuard(start);
         for count in &COUNTS {
             count.store(0, Relaxed);
         }
@@ -954,7 +966,6 @@ pub(crate) mod tests {
         assert_eq!(take(start), []);
         hooked(0, 0, 0, 0);
         WRITERS.lock().unwrap().clear();
-        let_go_now(start);
     }
 
     /// The real sync with the reports deciding, on a placed view heap of
@@ -966,7 +977,10 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn a_sync_makes_the_told_slots_and_the_fallback_the_rest() {
-        use crate::descriptor::{HEAP_IIDS, HeapDesc, Placement, SHADER_VISIBLE, VIEWS_KIND, create_cbv, create_heap, heap, sync_heaps};
+        use crate::descriptor::{
+            HEAP_IIDS, HeapDesc, Placement, SHADER_VISIBLE, VIEWS_KIND, create_cbv, create_heap,
+            exclusive_sync, heap, sync_heaps,
+        };
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         if crate::host::host().is_none() {
             return; // no host GPU here
@@ -987,6 +1001,10 @@ pub(crate) mod tests {
             crate::watch::tests::free(memory);
             return;
         };
+        // The syncs to ourselves from here on, and only now: making the
+        // host heap above waits for the submission lock (`Host::quiet`),
+        // which a submission holds while its own sync waits for this.
+        let _sync = exclusive_sync();
         // A record of ours, written where no heap sees it, copied in as
         // bytes the way the title copies records (the heap's page is
         // guarded: our handler opens it).
@@ -998,6 +1016,7 @@ pub(crate) mod tests {
         };
         let ask_again = || ASKED.store(0, Relaxed);
         assert!(adopt_as(start, SLOTS, Mode::Use, true));
+        let _adopted = AdoptedGuard(start);
         assert_eq!(told(start, SLOTS), Told::Use);
         // The first sync of a run asks the watch: done with here.
         ask_again();
@@ -1044,7 +1063,7 @@ pub(crate) mod tests {
         sync_heaps();
         assert!(host.made(9) && host.made(10), "made at the next sync, told or not");
         assert_eq!((c(FOUND_UNTOLD), c(FOUND_BY_STORE)), (2, 1));
-        let_go_now(start);
+        drop(_adopted);
         ask_again();
         release(h);
         crate::watch::tests::free(memory);

@@ -88,9 +88,11 @@ struct Ran {
 
 /// Submissions held off ([`Host::quiet`]).
 pub(crate) struct Quiet<'a> {
-    // Dropped in this order: the mark, then the lock.
+    // Dropped in this order: the mark, the lock, then the test lock.
     _holding: Holding,
     _held: std::sync::MutexGuard<'a, u64>,
+    #[cfg(test)]
+    _shared: unwaited::Shared,
 }
 
 pub(crate) struct Host {
@@ -726,6 +728,7 @@ pub(crate) mod tests {
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
@@ -766,6 +769,7 @@ pub(crate) mod tests {
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
         // No submission takes the marks meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
@@ -813,6 +817,7 @@ pub(crate) mod tests {
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
             // No submission takes the marks meanwhile.
+            let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
@@ -858,6 +863,7 @@ pub(crate) mod tests {
         let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
         viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
         // No submission uploads meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
@@ -894,6 +900,7 @@ pub(crate) mod tests {
             })
             .collect();
         // No submission uploads meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
         for &object in &objects {
@@ -1904,10 +1911,17 @@ impl Host {
             }
             return None;
         }
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // A submission the host GPU was not waited for has run too.
         self.stand();
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        Some(Quiet {
+            _holding: Holding::enter(),
+            _held: held,
+            #[cfg(test)]
+            _shared,
+        })
     }
 
     /// Runs closed lists and waits for them.
@@ -1932,6 +1946,9 @@ impl Host {
         // and it is finished at the first step that could see what it owes
         // (`beside`, `unwaited::flights`), at the latest before they go to
         // the GPU.
+        // (Tests: not while a test of `unwaited` has the submissions to itself.)
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         let (mut submitted, mut beside) = if title.is_some() && unwaited::flights::on() {
             self.submissions_beside(runs)
         } else {
@@ -7074,6 +7091,9 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // (Not while a test of `unwaited` has one left on the GPU: the
+        // lock below is taken as a submission takes it.)
+        let _shared = super::unwaited::shared();
         let mark = host.mark().expect("the mark list");
         let list = host.new_list().unwrap();
         list.close();
@@ -7095,6 +7115,8 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // (As above: the mark armed below would run over one left.)
+        let _shared = super::unwaited::shared();
         let mark = host.mark().expect("the mark list");
         let old = host.queue();
         {
