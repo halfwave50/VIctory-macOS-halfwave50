@@ -1210,6 +1210,55 @@ impl AliasPhysical {
     }
 }
 
+/// mac: `VICTORY_WITHHELD_COPIES` (`notes/alias-physical-debug.md`, "Withheld
+/// writes"): which ranges written by programs using title memory stop being
+/// written through an alias (`VICTORY_ALIAS_BUFFERS`) or a view
+/// (`VICTORY_ALIAS_PHYSICAL=gpu`) and get a host copy instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WithheldCopies {
+    /// Unset, empty or `0`: none, as before (withheld writes through an
+    /// alias or a view are in title memory and stay).
+    Off,
+    /// `1`: a range in which a withheld write landed in title memory, from
+    /// then on (carved at the submission's finish).
+    Evidence,
+    /// `all`: every range such a program binds for unordered access through
+    /// a root view, before it is bound, whether its writes are withheld or
+    /// not (for comparison).
+    All,
+}
+
+/// [`WithheldCopies`], read once.
+pub(crate) fn withheld_copies() -> WithheldCopies {
+    static RULE: OnceLock<WithheldCopies> = OnceLock::new();
+    *RULE.get_or_init(|| {
+        let value = std::env::var("VICTORY_WITHHELD_COPIES").ok();
+        let rule = withheld_copies_rule(value.as_deref());
+        if rule != WithheldCopies::Off {
+            tracing::info!(
+                "VICTORY_WITHHELD_COPIES={}: {} gets a host copy, never an alias or a view, so that what \
+                 programs using title memory write while it is withheld stays out of title memory; frame line \
+                 'withheld writes'",
+                value.as_deref().unwrap_or_default().trim(),
+                if rule == WithheldCopies::All {
+                    "every range such a program binds for unordered access through a root view"
+                } else {
+                    "a range in which a withheld write landed in title memory, from then on,"
+                }
+            );
+        }
+        rule
+    })
+}
+
+fn withheld_copies_rule(value: Option<&str>) -> WithheldCopies {
+    match value.map(str::trim) {
+        Some("1") => WithheldCopies::Evidence,
+        Some("all") => WithheldCopies::All,
+        _ => WithheldCopies::Off,
+    }
+}
+
 /// [`AliasPhysical`], read once (at the title's first `xmem` call that asks).
 /// Any other value gives the counts alone, with a warning.
 pub(crate) fn alias_physical() -> AliasPhysical {
@@ -1332,7 +1381,7 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        AliasPhysical, alias_physical_rule, copy_order, epoch, heap_locks, heap_sync_pause,
+        AliasPhysical, WithheldCopies, alias_physical_rule, withheld_copies_rule, copy_order, epoch, heap_locks, heap_sync_pause,
         heap_sync_threads, key, overlapping_rule, quick, setting, spans_rule, texture_workers,
         uav_size, whole_wave_lds, writers,
     };
@@ -1380,6 +1429,16 @@ pub(crate) mod tests {
                 "{other:?}"
             );
         }
+    }
+
+    #[test]
+    fn withheld_copies_by_evidence_or_for_all() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("ALL")] {
+            assert_eq!(withheld_copies_rule(off), WithheldCopies::Off, "{off:?}");
+        }
+        assert_eq!(withheld_copies_rule(Some("1")), WithheldCopies::Evidence);
+        assert_eq!(withheld_copies_rule(Some(" 1 ")), WithheldCopies::Evidence);
+        assert_eq!(withheld_copies_rule(Some("all")), WithheldCopies::All);
     }
 
     thread_local! {

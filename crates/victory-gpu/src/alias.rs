@@ -401,6 +401,19 @@ pub(crate) fn title_copy(dst: usize, len: usize, cut: bool) {
     }
 }
 
+/// mac: since the last frame line, withheld writes (`crate::memory::
+/// withholding`) kept out of title memory (in copies) and in it anyway
+/// (through an alias or a view), their bytes, and the ranges of the latter.
+static WITHHELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// mac: a submission's withheld writes: `kept` bytes in copies, `landed`
+/// bytes in `ranges` ranges through aliases or views.
+pub(crate) fn withheld_noted(kept: u64, landed: u64, ranges: u64) {
+    for (i, n) in [kept, landed, ranges].into_iter().enumerate() {
+        WITHHELD[i].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 /// The end of the frame line (`frames` since the last one), empty with the
 /// switch off: per frame, what took the zero-copy path against the copy path.
 pub(crate) fn frame_line(frames: f64) -> String {
@@ -411,18 +424,31 @@ pub(crate) fn frame_line(frames: f64) -> String {
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|i| COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     let [made, failed, stale, again] = [0, 1, 2, 3].map(|i| TOTALS[i].load(Ordering::Relaxed));
     let (now, bytes) = crate::shadow::aliased_totals();
+    let [kept, landed, landed_ranges] =
+        WITHHELD.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let (carved, carved_bytes) = crate::shadow::carved_totals();
     format!(
         "; zero-copy: {:.1} MB in {ranges:.0} ranges of {regions:.0} aliased regions asked, none copied, against \
          {copies:.0} host copies refreshed with {:.1} MB copied; shaders wrote {:.1} MB in place, marking {marked:.0} \
          tracked pages, {:.1} MB of it withheld writes; {copies_in:.0} title copies ({:.1} KB) into aliased memory, \
          {copies_cut:.0} of them after a copy-order cut; {mended:.1} commits mended; aliased now {now} regions \
-         {:.0} MB ({made} made, {failed} refused, {stale} stale dropped, {again} runs pointed back)",
+         {:.0} MB ({made} made, {failed} refused, {stale} stale dropped, {again} runs pointed back); withheld \
+         writes: {:.1} MB kept out of title memory, {:.1} MB landed anyway ({landed_ranges:.1} ranges); carved {carved} \
+         ranges ({:.1} MB, VICTORY_WITHHELD_COPIES {})",
         asked / 1e6,
         copied / 1e6,
         written / 1e6,
         withheld / 1e6,
         copied_in / 1e3,
         bytes as f64 / 1e6,
+        kept / 1e6,
+        landed / 1e6,
+        carved_bytes as f64 / 1e6,
+        match crate::mac_switches::withheld_copies() {
+            crate::mac_switches::WithheldCopies::Off => "off",
+            crate::mac_switches::WithheldCopies::Evidence => "=1",
+            crate::mac_switches::WithheldCopies::All => "=all",
+        },
     )
 }
 

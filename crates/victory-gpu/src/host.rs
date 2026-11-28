@@ -2408,6 +2408,9 @@ impl Host {
         // mac: the programs of withheld writes into aliased memory, by range.
         let mut withheld_by: std::collections::HashMap<(usize, usize, usize), Vec<String>> =
             std::collections::HashMap::new();
+        let carving = crate::mac_switches::withheld_copies();
+        let report_withheld = crate::alias_physical::verifying()
+            || carving != crate::mac_switches::WithheldCopies::Off;
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
         // title's own data (runs c1, c4), and so does what every program
@@ -2446,7 +2449,7 @@ impl Host {
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
                     // mac: who writes what is withheld (`crate::alias_verify`).
-                    if !goes_back && shadow.is_aliased() && crate::alias_physical::verifying() {
+                    if !goes_back && shadow.is_aliased() && report_withheld {
                         withheld_by.entry(key).or_insert_with(|| list.memory_programs());
                     }
                     let i = match index.get(&key) {
@@ -2479,15 +2482,43 @@ impl Host {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
         }
-        // mac: `VICTORY_ALIAS_PHYSICAL=verify`: withheld writes that are in
-        // title memory already (aliased regions, and what views would be).
-        if crate::alias_physical::verifying() {
+        // mac: withheld writes kept out of title memory (copies) and in it
+        // anyway (aliased regions, views): counted for the frame line; with
+        // `VICTORY_WITHHELD_COPIES` each landed range is carved out of
+        // aliasing, so that the next ones stay out (`crate::shadow::carve`);
+        // with `VICTORY_ALIAS_PHYSICAL=verify` reported by region.
+        if crate::alias::enabled() {
+            let (mut kept, mut landed, mut ranges) = (0u64, 0u64, 0u64);
             for (shadow, address, len, goes_back) in &back {
-                if !goes_back && shadow.is_aliased() {
-                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                if *goes_back {
+                    continue;
+                }
+                if !shadow.is_aliased() {
+                    kept += *len as u64;
+                    continue;
+                }
+                landed += *len as u64;
+                ranges += 1;
+                let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                if crate::alias_physical::verifying() {
                     crate::alias_verify::landed(shadow, *address, *len, withheld_by.get(&key));
                 }
+                if carving != crate::mac_switches::WithheldCopies::Off {
+                    let new = crate::shadow::carve(*address as u64, *len as u64);
+                    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if new && LOGGED.fetch_add(1, Ordering::Relaxed) < 10 {
+                        let (start, n) = shadow.range();
+                        tracing::warn!(
+                            "VICTORY_WITHHELD_COPIES: a withheld write landed in title memory through {} \
+                             {start:#x}+{n:#x} at {address:#x}+{len:#x}; its range is carved out of aliasing \
+                             from now on (programs {:?})",
+                            if shadow.is_view() { "a view" } else { "the aliased region" },
+                            withheld_by.get(&key).map_or(&[][..], |p| &p[..]),
+                        );
+                    }
+                }
             }
+            crate::alias::withheld_noted(kept, landed, ranges);
         }
         if !spared_at.is_empty() {
             spared_at.sort_unstable();
@@ -3238,6 +3269,12 @@ impl HostList {
         if !names.contains(name) {
             names.insert(name.to_owned());
         }
+    }
+
+    /// mac: whether the draw or dispatch being recorded runs a program using
+    /// title memory ([`HostList::writer_uses_memory`]).
+    pub(crate) fn writes_memory(&self) -> bool {
+        self.memory_writer.load(Ordering::Relaxed)
     }
 
     /// mac: the programs using title memory the list binds.
@@ -6797,6 +6834,102 @@ mod batch {
 
 #[cfg(test)]
 mod withholding {
+    /// mac: `VICTORY_WITHHELD_COPIES=1` with `VICTORY_ALIAS_BUFFERS=1` (under
+    /// Wine on Rosetta; else skipped): a dispatch's write by a program using
+    /// title memory whose list missed, through a root UAV into a title buffer
+    /// in an aliased region, lands once (the alias is title memory) and
+    /// carves the buffer out of aliasing; the next such write goes to the
+    /// buffer's host copy and stays out of title memory. An ordinary list's
+    /// write lands in the region's other buffer through the alias, and goes
+    /// back into the carved one through its copy.
+    #[test]
+    fn a_withheld_write_lands_once_then_stays_out_of_aliased_memory() {
+        use crate::compute::Param;
+        use crate::watch::PAGE;
+        use windows::core::s;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if crate::mac_switches::withheld_copies() != crate::mac_switches::WithheldCopies::Evidence
+            || !crate::alias::enabled()
+        {
+            eprintln!("skipped: needs VICTORY_WITHHELD_COPIES=1 and VICTORY_ALIAS_BUFFERS=1 under Wine");
+            return;
+        }
+        let Some(host) = super::host() else {
+            return;
+        };
+        const SHADER: &str = r"
+RWByteAddressBuffer dst : register(u0);
+cbuffer Params : register(b0) { uint value; };
+[numthreads(1, 1, 1)]
+void main() { dst.Store(0, value); }
+";
+        let (root, pso) = crate::compute::pipeline(
+            SHADER,
+            s!("withheld store"),
+            0,
+            &[Param::Uav { register: 0 }, Param::Constants { register: 0, count: 1 }],
+        )
+        .expect("a pipeline");
+        let len = 2 * PAGE;
+        // SAFETY: a fresh allocation for the test.
+        let ptr = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(ptr, 0);
+        assert!(crate::alias::alias_region(ptr, len, false), "an aliased region");
+        let (a, b) = (ptr, ptr + PAGE);
+        crate::shadow::register(0xc0_0001, a as u64, PAGE as u64);
+        crate::shadow::register(0xc0_0002, b as u64, PAGE as u64);
+        // SAFETY: our own title memory.
+        let title = |at: usize| unsafe { (at as *const u32).read_volatile() };
+        // SAFETY: our own title memory.
+        let set = |at: usize, v: u32| unsafe { (at as *mut u32).write_volatile(v) };
+        set(a, 0x1111);
+        set(b, 0x2222);
+        // One dispatch storing `value` at `at` through the root UAV its
+        // lookup gives, by a program using title memory (whose list then
+        // misses) or an ordinary one.
+        let write = |at: usize, value: u32, memory: bool| {
+            let list = host.new_list().expect("a list");
+            let shadow = crate::shadow::find(at as u64, 4).expect("a lookup");
+            {
+                let _writer = list.writer_uses_memory(memory);
+                shadow.refresh(&list, at as u64, 16);
+                shadow.gpu_writes(&list, at as u64, 16, false);
+            }
+            // SAFETY: an open list, our pipeline, a live buffer.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootUnorderedAccessView(0, shadow.gpu(at as u64));
+                list.list.SetComputeRoot32BitConstant(1, value, 0);
+                list.list.Dispatch(1, 1, 1);
+            }
+            if memory {
+                list.defer_missed(|| true);
+            }
+            list.close();
+            host.execute(&[&list]);
+            shadow.is_aliased()
+        };
+        assert!(write(a, 0xa1, true), "the first goes through the alias");
+        assert_eq!(title(a), 0xa1, "and lands: nothing stops the first");
+        assert!(crate::shadow::carved(a as u64, a as u64 + 4), "its buffer is carved");
+        assert!(!crate::shadow::carved(b as u64, b as u64 + 4), "the other is not");
+        set(a, 0x1111);
+        assert!(!write(a, 0xa2, true), "the next goes through a host copy");
+        assert_eq!(title(a), 0x1111, "withheld, and kept out of title memory");
+        assert!(write(b, 0xb1, false), "an ordinary write elsewhere: the alias");
+        assert_eq!(title(b), 0xb1, "lands");
+        assert!(!write(a, 0xa3, false), "an ordinary write into the carved buffer: its copy");
+        assert_eq!(title(a), 0xa3, "goes back");
+        crate::shadow::unregister(0xc0_0001, a as u64);
+        crate::shadow::unregister(0xc0_0002, b as u64);
+        crate::alias::unalias_region(ptr);
+        // SAFETY: our allocation, no longer aliased.
+        unsafe { VirtualFree(ptr as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// A list in which a program using title memory missed memory: what
     /// that program wrote is withheld from title memory and leaves the
     /// copies at once; what an ordinary program wrote in the same list goes

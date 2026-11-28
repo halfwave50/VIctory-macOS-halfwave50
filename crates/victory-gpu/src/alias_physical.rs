@@ -817,6 +817,10 @@ pub(crate) fn view(from: usize, to: usize) -> Option<View> {
     if !on() || to <= from {
         return None;
     }
+    // Carved out of aliasing for withheld writes (`VICTORY_WITHHELD_COPIES`).
+    if crate::shadow::carved(from as u64, to as u64) {
+        return None;
+    }
     let mut st = state();
     // A range that starts in no piece is not ours to count.
     st.plan.locate(from, from + 1)?;
@@ -837,7 +841,7 @@ pub(crate) fn view(from: usize, to: usize) -> Option<View> {
 /// pages. With `=gpu-tiles` and `=gpu-single`, a view of its piece over the
 /// 256 MiB block holding it, cut to the piece.
 pub(crate) fn window(address: usize, end: usize, block: usize) -> Option<View> {
-    if !on() || end <= address {
+    if !on() || end <= address || crate::shadow::carved(address as u64, end as u64) {
         return None;
     }
     let mut st = state();
