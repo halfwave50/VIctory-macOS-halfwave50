@@ -964,6 +964,9 @@ impl Shadow {
             }
             return 0;
         }
+        if crate::mac_switches::copy_back_spans() {
+            return self.copy_back_or_not_spans(address, len, back);
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Snapshot(segments, compared, spans) = &mut *snapshot;
@@ -1109,6 +1112,9 @@ impl Shadow {
                 flush(from, to);
             }
             return 0;
+        }
+        if crate::mac_switches::copy_back_spans() {
+            return self.copy_back_marked_spans(pages);
         }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = &self.tracked else {
@@ -1978,9 +1984,10 @@ pub(crate) fn marked_back_line(frames: f64) -> String {
         MARKED_BACK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     format!(
         "; marked pages copied back: {compared:.0} compared, {:.1} MB written back from them, {aliased:.0} more in \
-         aliased memory told only, in {:.1} ms",
+         aliased memory told only, in {:.1} ms{}",
         bytes / 1e6,
-        us / 1e3
+        us / 1e3,
+        if crate::mac_switches::copy_back_spans() { " (VICTORY_COPY_BACK_SPANS)" } else { "" }
     )
 }
 
@@ -3157,6 +3164,10 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
+mod copy_back_fast;
+
+#[cfg(test)]
+mod copy_back_bench;
 #[cfg(test)]
 mod parallel_copy_tests;
 #[cfg(test)]

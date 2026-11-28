@@ -122,6 +122,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 #[cfg(any(windows, test))]
+mod copy_back_spans;
+#[cfg(any(windows, test))]
 mod snapshot_spans;
 pub mod signature;
 mod mac_switches;
