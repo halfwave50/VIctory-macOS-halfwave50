@@ -706,6 +706,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            crate::alias_verify::check(crate::alias_verify::Bind::Vertex, &shadow, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -725,6 +726,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            crate::alias_verify::check(crate::alias_verify::Bind::Index, &shadow, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -760,7 +762,11 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
-        let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        let uses_memory = p.stages.iter().any(|s| s.memory.is_some());
+        let _writer = list.writer_uses_memory(uses_memory);
+        if uses_memory {
+            list.note_memory_program(&p.name);
+        }
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1123,7 +1129,8 @@ impl State {
         };
         // mac: from where the copy starts in its buffer (a view of a piece
         // of a reservation starts at its `base` there, `crate::alias_physical`).
-        let Some(offset) = u32::try_from(shadow.offset(address) - shadow.base()).ok() else {
+        let (first, offset) = shadow.root_place(address);
+        let Some(offset) = u32::try_from(offset).ok() else {
             not_run("a root view 4 GiB or more into its copy");
             return None;
         };
@@ -1139,6 +1146,13 @@ impl State {
             (address, len)
         };
         shadow.refresh(list, refresh_at, refresh_len);
+        // mac: `VICTORY_ALIAS_PHYSICAL=verify`: the view `=gpu` would bind.
+        crate::alias_verify::check(
+            if uav { crate::alias_verify::Bind::RootUav } else { crate::alias_verify::Bind::Root },
+            &shadow,
+            address,
+            len,
+        );
         if uav {
             // Writes through the view are marked wherever they land in the
             // copy; else declared for 1 MiB.
@@ -1162,13 +1176,7 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(
-            index,
-            Some(&shadow.buffer),
-            shadow.base(),
-            shadow.range().1 & !3,
-            uav,
-        );
+        host.raw_view_at(index, Some(&shadow.buffer), first, shadow.range().1 & !3, uav);
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
@@ -2268,6 +2276,16 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // mac: `VICTORY_ALIAS_PHYSICAL=verify`: the views `=gpu` would bind.
+        crate::alias_verify::check(
+            crate::alias_verify::Bind::Arguments,
+            &args,
+            arguments,
+            len.min(args.left(arguments)),
+        );
+        if let Some((s, at)) = &counter {
+            crate::alias_verify::check(crate::alias_verify::Bind::Count, s, *at, 4);
+        }
         let (clamped, clamped_at) = match hoisted {
             Some(h) => {
                 // The dispatch may write arguments a later draw reads.
@@ -2430,6 +2448,22 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         }),
         _ => crate::descriptor::host::view_copy(view),
     };
+    // mac: `VICTORY_ALIAS_PHYSICAL=verify`: the view `=gpu` would bind.
+    if crate::alias_physical::verifying() {
+        let uav = u.kind == ResourceType::Uav;
+        let layout = match *view {
+            View::Constant(address, size) => Some((address, u64::from(size), 4)),
+            _ => crate::descriptor::host::view_layout(view),
+        };
+        if let Some((address, len, element)) = layout {
+            let bind = match (view, uav) {
+                (View::Constant(..), _) => crate::alias_verify::Bind::Constant,
+                (_, true) => crate::alias_verify::Bind::TableUav,
+                (_, false) => crate::alias_verify::Bind::Table,
+            };
+            crate::alias_verify::table(bind, address, len, element);
+        }
+    }
     if let Some((shadow, address, len)) = range
         && len > 0
     {

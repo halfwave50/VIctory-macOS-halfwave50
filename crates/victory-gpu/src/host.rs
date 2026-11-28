@@ -1262,6 +1262,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// mac: those of them using title memory (their writes can be withheld,
+    /// `crate::memory::withholding`), for reports of withheld writes.
+    memory_programs: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -1722,6 +1725,7 @@ impl Host {
                 memory_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                memory_programs: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
                 budget_from: Mutex::new(None),
@@ -2382,6 +2386,9 @@ impl Host {
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        // mac: the programs of withheld writes into aliased memory, by range.
+        let mut withheld_by: std::collections::HashMap<(usize, usize, usize), Vec<String>> =
+            std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
         // title's own data (runs c1, c4), and so does what every program
@@ -2419,6 +2426,10 @@ impl Host {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
+                    // mac: who writes what is withheld (`crate::alias_verify`).
+                    if !goes_back && shadow.is_aliased() && crate::alias_physical::verifying() {
+                        withheld_by.entry(key).or_insert_with(|| list.memory_programs());
+                    }
                     let i = match index.get(&key) {
                         Some(&i) => {
                             back[i].3 &= goes_back;
@@ -2448,6 +2459,16 @@ impl Host {
         for b in back.iter_mut().filter(|b| b.3) {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+        }
+        // mac: `VICTORY_ALIAS_PHYSICAL=verify`: withheld writes that are in
+        // title memory already (aliased regions, and what views would be).
+        if crate::alias_physical::verifying() {
+            for (shadow, address, len, goes_back) in &back {
+                if !goes_back && shadow.is_aliased() {
+                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    crate::alias_verify::landed(shadow, *address, *len, withheld_by.get(&key));
+                }
+            }
         }
         if !spared_at.is_empty() {
             spared_at.sort_unstable();
@@ -3005,6 +3026,7 @@ impl HostList {
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.memory_programs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -3189,6 +3211,19 @@ impl HostList {
     /// title's.
     pub(crate) fn set_ours(&self) {
         self.ours.store(true, Ordering::Relaxed);
+    }
+
+    /// mac: the list binds `name`, a program using title memory.
+    pub(crate) fn note_memory_program(&self, name: &str) {
+        let mut names = self.memory_programs.lock().unwrap_or_else(|e| e.into_inner());
+        if !names.contains(name) {
+            names.insert(name.to_owned());
+        }
+    }
+
+    /// mac: the programs using title memory the list binds.
+    pub(crate) fn memory_programs(&self) -> Vec<String> {
+        self.memory_programs.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
     }
 
     /// What the list's shaders write from now until the guard goes is
@@ -4142,6 +4177,8 @@ impl HostList {
                     batch.in_title_copy = true;
                     batch.title_copied(dst, len);
                     batch.in_title_copy = false;
+                    // mac: `VICTORY_ALIAS_PHYSICAL=verify`: into view memory?
+                    crate::alias_verify::title_copy(dst, len);
                     crate::alias::title_copy(dst, len, std::mem::take(&mut batch.cut));
                     if matches!(step, Step::Move(..)) {
                         move_mapped(dst as *mut u8, src as *const u8, len);

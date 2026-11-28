@@ -508,6 +508,10 @@ impl Shared {
                     slot
                 }
             };
+            // mac: `VICTORY_ALIAS_PHYSICAL=verify`: the pair `=gpu` would
+            // make of the view in the copy's place.
+            let (start, len) = c.range();
+            crate::alias_verify::check(crate::alias_verify::Bind::PageTable, &c, start, len);
             named.push(c);
             slots.push(slot);
         }

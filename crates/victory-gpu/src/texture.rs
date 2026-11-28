@@ -959,6 +959,9 @@ impl Staging {
             .force_refresh
             .swap(false, std::sync::atomic::Ordering::AcqRel);
         if let Some(t) = &self.tracked {
+            // mac: `VICTORY_ALIAS_PHYSICAL=verify`: would `=gpu`'s writes have
+            // reached this tracker?
+            crate::alias_verify::texture_asked(start, size);
             let last = &mut *guard;
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
@@ -1024,6 +1027,10 @@ impl Staging {
                             && all_pages_unmapped(&last.unmapped, start + a, start + b))
                 })
                 .collect();
+            // mac: `VICTORY_ALIAS_PHYSICAL=verify`: textures over view memory.
+            if !touched.is_empty() {
+                crate::alias_verify::texture(start, size, &copy);
+            }
             if touched.is_empty() {
                 #[cfg(feature = "diagnostics")]
                 {

@@ -501,6 +501,11 @@ fn stage2_log(frames: f64) {
         "{}",
         stage2_line(window, total, now, &r, backing, gpu, frames)
     );
+    // mac: `VICTORY_ALIAS_PHYSICAL=verify`'s own line.
+    #[cfg(windows)]
+    if let Some(line) = crate::alias_verify::line(frames) {
+        tracing::info!("{line}");
+    }
 }
 
 #[cfg(test)]

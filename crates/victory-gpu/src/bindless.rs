@@ -475,6 +475,18 @@ fn seen(view: &View) -> Option<Seen> {
         return None;
     }
     let len = len.min(shadow.left(address));
+    // mac: `VICTORY_ALIAS_PHYSICAL=verify`: the view `=gpu` would put in
+    // the slot when it is made.
+    if crate::alias_physical::verifying() {
+        let layout = match *view {
+            View::Constant(address, size) => Some((address, u64::from(size), 4)),
+            _ => crate::descriptor::host::view_layout(view),
+        };
+        if let Some((address, len, element)) = layout {
+            let bind = if uav { crate::alias_verify::Bind::SlotUav } else { crate::alias_verify::Bind::Slot };
+            crate::alias_verify::table(bind, address, len, element);
+        }
+    }
     Some(Seen::Buffer(shadow, address, len, uav))
 }
 
