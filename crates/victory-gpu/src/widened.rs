@@ -219,6 +219,28 @@ fn line(views: usize, in_place: bool, [copies, copied_mb, kept, saved_mb]: [f64;
     )
 }
 
+/// mac: whether a widened patch moves its sources to the copy-source state
+/// around its copies and back (VIctory-macOS #586, f89b086e): only with
+/// `VICTORY_WIDENED_COPY_SOURCE=1`. It changes what the copies read (the
+/// shader's writes before them in the list rather than older bytes under
+/// D3DMetal) and adds two barriers a patch.
+fn copy_source() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::COPY_SOURCE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_WIDENED_COPY_SOURCE");
+        if on {
+            tracing::info!(
+                "VICTORY_WIDENED_COPY_SOURCE=1: widened patches move their sources to the copy-source state after shaders write them"
+            );
+        }
+        on
+    })
+}
+
 struct Group {
     view: Arc<Widened>,
     kind: GroupKind,
@@ -519,6 +541,37 @@ fn patch(list: &HostList, copier: &Copier, view: &Widened, prepared: Prepared) {
     list.keep(&view.buffer);
     list.keep(&copier.root);
     list.keep(&copier.patch);
+    // From VIctory-macOS #586 (f89b086e), mac: behind
+    // `VICTORY_WIDENED_COPY_SOURCE=1` ([`copy_source`]). The copies read what
+    // shaders earlier in the list wrote through unordered views, and a UAV
+    // barrier orders unordered accesses only: each source goes to the
+    // copy-source state for them and back (D3DMetal ran the copies before
+    // such writes landed). One barrier per buffer: copies of a shared buffer
+    // share it.
+    let mut sources: Vec<&ID3D12Resource> = Vec::new();
+    if copy_source() {
+        for segment in &prepared.segments {
+            let buffer = &segment.shadow.buffer;
+            if !sources.iter().any(|b| b.as_raw() == buffer.as_raw()) {
+                sources.push(buffer);
+            }
+        }
+    }
+    let moved = |before, after| -> Vec<D3D12_RESOURCE_BARRIER> {
+        sources
+            .iter()
+            .map(|b| transition(b, before, after))
+            .collect()
+    };
+    if !sources.is_empty() {
+        // SAFETY: an open list and live buffers, in the state shaders wrote them.
+        unsafe {
+            list.list.ResourceBarrier(&moved(
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ));
+        }
+    }
     for segment in &prepared.segments {
         list.keep_shadow(&segment.shadow);
         // SAFETY: an open list and live buffers; the source range is inside
@@ -533,13 +586,20 @@ fn patch(list: &HostList, copier: &Copier, view: &Widened, prepared: Prepared) {
             );
         }
     }
-    // SAFETY: an open list and the staging buffer the copies just wrote.
+    // SAFETY: an open list, the staging buffer the copies just wrote, and
+    // the sources (with the switch) back for later shaders' unordered
+    // accesses.
     unsafe {
-        list.list.ResourceBarrier(&[transition(
+        let mut barriers = moved(
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        barriers.push(transition(
             &prepared.patches,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
-        )]);
+        ));
+        list.list.ResourceBarrier(&barriers);
     }
     // SAFETY: live buffers.
     let (destination, patches, metadata) = unsafe {
@@ -586,5 +646,15 @@ mod line_tests {
             "widened RGB32 views: 3 live; barrier history copies 0.0/frame (0.00 MB), \
              skipped 55.0/frame (99.50 MB saved) (VICTORY_WIDENED_IN_PLACE=1)"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    thread_local! {
+        /// A test's choice of [`super::copy_source`] on its own thread
+        /// (`None`: the environment's).
+        pub(crate) static COPY_SOURCE: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
     }
 }
