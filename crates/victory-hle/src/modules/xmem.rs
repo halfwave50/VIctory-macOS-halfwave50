@@ -1510,7 +1510,7 @@ mod tests {
             matches!(
                 v.trim(),
                 "cpu" | "gpu" | "gpu-tiles" | "gpu-single" | "verify" | "verify-tiles"
-                    | "gpu-sections" | "verify-sections"
+                    | "gpu-sections" | "verify-sections" | "gpu-ranges-old" | "verify-ranges-old"
             )
         })
             || cfg!(feature = "diagnostics")

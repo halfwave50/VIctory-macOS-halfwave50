@@ -148,6 +148,10 @@ mod verify_plan;
 // (`VICTORY_WITHHELD_COPIES`); plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod carve_set;
+// mac: stage 2's one-range rule (one GPU range per physical page while views
+// reach it); plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod one_range;
 #[cfg(windows)]
 mod alias_verify;
 #[cfg(windows)]

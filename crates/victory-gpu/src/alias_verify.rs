@@ -29,6 +29,12 @@
 //!
 //! Lines: `alias verify: ...` every 5 s beside the physical pages line, and
 //! the first 20 differences and 10 hazards in full.
+//!
+//! The one-range rule (`crate::one_range`) sees `=gpu`'s copies: a title
+//! buffer's copy `=gpu` would make too holds its pages, and so do the window
+//! copies and views' own copies `=gpu` would make, kept here (window copies
+//! in [`WINDOWS`] as `=gpu`'s window registry holds them, views' own copies
+//! while asked for).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -368,10 +374,17 @@ fn first_this_frame(bind: Bind, copy: &Shadow, address: u64, len: u64) -> bool {
     true
 }
 
+/// What `=gpu`'s windows registry would hold: a view, or (one-range rule) a
+/// window copy, which holds its pages as `=gpu`'s would.
+enum Win {
+    View(Arc<Shadow>),
+    Copy(#[allow(dead_code)] Option<crate::alias_physical::CopyHold>),
+}
+
 /// The views of windows (ranges outside title buffers) `=gpu` would have
-/// made, by (start, length), as `crate::shadow`'s windows registry holds
-/// them with `=gpu`.
-static WINDOWS: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// made, and its window copies, by (start, length), as `crate::shadow`'s
+/// windows registry holds them with `=gpu`.
+static WINDOWS: Mutex<BTreeMap<(u64, u64), Win>> = Mutex::new(BTreeMap::new());
 
 /// The view `=gpu` would bind for `[address, address + len)` of `copy`, if
 /// any.
@@ -390,36 +403,62 @@ fn view_for(copy: &Shadow, address: u64, len: u64) -> Option<Arc<Shadow>> {
             let (start, n) = copy.range();
             let view = crate::alias_physical::view(start as usize, (start + n) as usize)
                 .map(Shadow::new_view_checked);
-            let mut h = copy.verify.held();
-            if h.ask {
-                h.ask = false;
-                h.paired = false;
-                h.view = view;
+            let none = view.is_none();
+            let found = {
+                let mut h = copy.verify.held();
+                if h.ask {
+                    h.ask = false;
+                    h.paired = false;
+                    h.view = view;
+                }
+                h.view.clone()
+            };
+            // `=gpu` makes a copy now: it holds its pages (one-range rule).
+            if none && found.is_none() && !copy.holds_copy() {
+                copy.hold_copy(crate::alias_physical::copy_made(start as usize, (start + n) as usize));
             }
-            h.view.clone()
+            found
         }
         What::Window => window_view(address, address.saturating_add(len.max(1))),
     }
 }
 
-/// The window view `=gpu` would hold `[address, end)` in, made if need be.
+/// The window view `=gpu` would hold `[address, end)` in, made if need be
+/// (`None`: `=gpu` reads it from a window copy, made here as `=gpu` would).
 fn window_view(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let mut map = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    // `crate::shadow::loose`'s search: the one starting closest below.
     let found = map
         .range(..=(address, u64::MAX))
         .rev()
         .take(64)
         .find(|&(&(s, n), _)| s <= address && end <= s + n)
-        .map(|(_, v)| v.clone());
-    if found.is_some() {
+        .map(|(_, w)| match w {
+            Win::View(v) => Some(v.clone()),
+            Win::Copy(_) => None,
+        });
+    if let Some(found) = found {
         return found;
     }
-    let block = crate::shadow::loose_window_bytes() as usize;
-    let view = crate::alias_physical::window(address as usize, end as usize, block)?;
-    let (from, n) = (view.range.start as u64, view.range.len() as u64);
-    let view = Shadow::new_view_checked(view);
-    map.insert((from, n), view.clone());
-    Some(view)
+    let block = crate::shadow::loose_window_bytes();
+    if let Some(view) = crate::alias_physical::window(address as usize, end as usize, block as usize) {
+        let (from, n) = (view.range.start as u64, view.range.len() as u64);
+        let view = Shadow::new_view_checked(view);
+        map.insert((from, n), Win::View(view.clone()));
+        return Some(view);
+    }
+    // `=gpu` makes the window's copy: with the one-range rule it holds its
+    // pages, and the views over them leave (outside this lock).
+    let start = address & !(block - 1);
+    let len = end.checked_next_multiple_of(block)? - start;
+    let made = crate::alias_physical::copy_made(start as usize, (start + len) as usize);
+    let (hold, leave) = made.map_or((None, None), |(h, l)| (Some(h), Some(l)));
+    map.insert((start, len), Win::Copy(hold));
+    drop(map);
+    if let Some(leave) = leave {
+        leave.now();
+    }
+    None
 }
 
 /// The window views over `[from, to)` (of `kind`) leave, as with `=gpu`.
@@ -431,10 +470,67 @@ pub(crate) fn drop_windows(
     let mut map = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     let keys: Vec<(u64, u64)> = map
         .iter()
-        .filter(|&(&(s, n), v)| s < to && from < s + n && (kind.is_none() || v.view_kind() == kind))
+        .filter(|&(&(s, n), w)| {
+            s < to && from < s + n && matches!(w, Win::View(v) if kind.is_none() || v.view_kind() == kind)
+        })
         .map(|(&k, _)| k)
         .collect();
-    keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    keys.into_iter()
+        .filter_map(|k| match map.remove(&k) {
+            Some(Win::View(v)) => Some(v),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Tests: the windows (views and copies) over `[from, to)` go.
+#[cfg(test)]
+pub(crate) fn forget_windows(from: u64, to: u64) {
+    let gone: Vec<Win> = {
+        let mut map = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map.keys().filter(|&&(s, n)| s < to && from < s + n).copied().collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    drop(gone);
+}
+
+/// The copies of views' own bytes `=gpu` would make (`crate::shadow::for_view`
+/// off the view's elements), by (address, length, element), each holding its
+/// pages for the one-range rule, with the frame it was last asked for in:
+/// `=gpu` keeps one while heap slots and lists hold it, here while asked for
+/// within [`OWN_FRAMES`] frames.
+#[allow(clippy::type_complexity)]
+static OWN: LazyLock<Mutex<HashMap<(u64, u64, u64), (Option<crate::alias_physical::CopyHold>, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const OWN_FRAMES: u64 = 60;
+
+/// `=gpu` would give the view of `[address, address + len)` of `element`-byte
+/// elements a copy of its own: hold its pages as that copy would.
+fn own_copy(address: u64, len: u64, element: u64) {
+    let frame = crate::queue::presented();
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = own.get_mut(&(address, len, element)) {
+        entry.1 = frame;
+        return;
+    }
+    let mut gone = Vec::new();
+    if own.len() >= 4096 {
+        let old: Vec<(u64, u64, u64)> = own
+            .iter()
+            .filter(|(_, (_, at))| frame.saturating_sub(*at) >= OWN_FRAMES)
+            .map(|(&k, _)| k)
+            .collect();
+        gone.extend(old.into_iter().filter_map(|k| own.remove(&k)));
+    }
+    let made = crate::alias_physical::copy_made(address as usize, address.saturating_add(len) as usize);
+    let (hold, leave) = made.map_or((None, None), |(h, l)| (Some(h), Some(l)));
+    own.insert((address, len, element), (hold, frame));
+    drop(own);
+    // Their holds go outside the lock (`crate::alias_physical`'s).
+    drop(gone);
+    if let Some(leave) = leave {
+        leave.now();
+    }
 }
 
 /// A binding of `[address, address + len)` of `copy`, of kind `bind` (root
@@ -511,6 +607,8 @@ pub(crate) fn table(bind: Bind, address: u64, len: u64, element: u64) {
         // `=gpu` would give the view an exact copy of its own, beside the
         // view over the same pages: two GPU ranges.
         count(bind, N::Exact, 1);
+        // With the one-range rule `=gpu`'s copy holds its pages, as here.
+        own_copy(address, len, element);
         note_copy(bind, &copy, address, len, Some(address));
         return;
     }

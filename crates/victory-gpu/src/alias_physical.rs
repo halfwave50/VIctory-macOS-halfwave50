@@ -38,6 +38,15 @@
 //! `UpdateTileMappings` is issued: the flush only settles the plan. A run is
 //! a view of its section; every other range keeps its copy. The start check
 //! reads and writes a placed buffer over a heap instead of a reserved one.
+//!
+//! One range per page (`crate::one_range`; all canonical modes but
+//! `=gpu-ranges-old` and `=verify-ranges-old`): while a view reaches a heap
+//! tile, no other GPU range does. Copies the GPU side makes over title
+//! memory ([`copy_made`]: title buffers and windows with no view, views'
+//! own bytes off their elements) hold their pages ([`CopyHold`]); a tile
+//! shown at a page under one gets no view, and views reaching it leave the
+//! registries when the copy is made or the title maps it there. A piece view
+//! may not reach a tile shown at two or more addresses.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -51,6 +60,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
+use crate::one_range::{self as rule, Cause, Copies, Refusal};
 use crate::tile_plan::{HeapTile, Never, PAGE, Plan};
 
 /// A piece's reserved buffer and its GPU address.
@@ -141,6 +151,8 @@ struct State {
     section_live: HashMap<u64, Range<usize>>,
     section_pages: HashMap<usize, u32>,
     next_hold: u64,
+    /// The one-range rule: title pages under live copies the GPU side made.
+    copies: Copies,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the state is only used
@@ -159,6 +171,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         section_live: HashMap::new(),
         section_pages: HashMap::new(),
         next_hold: 1,
+        copies: Copies::default(),
     })
 });
 
@@ -208,6 +221,91 @@ fn canonical() -> bool {
 /// but `=gpu-sections` and `=verify-sections`).
 fn pieces() -> bool {
     crate::mac_switches::alias_physical().pieces()
+}
+
+/// Whether the one-range rule holds (`crate::one_range`; canonical modes but
+/// `=gpu-ranges-old` and `=verify-ranges-old`).
+fn one_range() -> bool {
+    crate::mac_switches::alias_physical().one_range()
+}
+
+/// The one-range rule's counts, since the last line, then since the start:
+/// lookups it gave a copy for a page a copy reaches, for a piece view's page
+/// shown twice, their bytes; views it made leave, their bytes.
+static RULE: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+const RULE_COPIED: usize = 0;
+const RULE_TWICE: usize = 1;
+const RULE_REFUSED_BYTES: usize = 2;
+const RULE_DROPS: usize = 3;
+const RULE_DROP_BYTES: usize = 4;
+const RULE_SINCE_START: usize = 5;
+
+fn rule_count(i: usize, n: u64) {
+    RULE[i].fetch_add(n, Relaxed);
+    RULE[RULE_SINCE_START + i].fetch_add(n, Relaxed);
+}
+
+/// The rule refused a view of `bytes` bytes.
+fn refused(why: Refusal, bytes: usize) {
+    rule_count(
+        match why {
+            Refusal::Copied => RULE_COPIED,
+            Refusal::TwoAddresses => RULE_TWICE,
+        },
+        1,
+    );
+    rule_count(RULE_REFUSED_BYTES, bytes as u64);
+}
+
+/// A copy the GPU side made over title memory, under the one-range rule: its
+/// pages in the reservations count as reached through a copy while it lives
+/// (`crate::shadow::Shadow` holds it).
+pub(crate) struct CopyHold {
+    runs: rule::Counted,
+}
+
+impl Drop for CopyHold {
+    fn drop(&mut self) {
+        state().copies.remove(&self.runs);
+    }
+}
+
+/// Title ranges whose views the one-range rule makes leave the registries:
+/// [`Leave::now`], with no lock of `crate::shadow`'s held.
+#[must_use]
+pub(crate) struct Leave(Vec<Range<usize>>);
+
+impl Leave {
+    /// The views over the ranges leave the registries (counted).
+    pub(crate) fn now(self) {
+        for range in self.0 {
+            let (n, bytes) = crate::shadow::drop_views_counted(range.start as u64, range.end as u64, None);
+            rule_count(RULE_DROPS, n as u64);
+            rule_count(RULE_DROP_BYTES, bytes);
+        }
+    }
+}
+
+/// The GPU side made a copy of title memory `[from, to)` (a title buffer or a
+/// window `view` and `window` gave none, or a view's own bytes off its
+/// elements): under the one-range rule its pages in the reservations count
+/// as reached through a copy while the hold lives, and the views reaching
+/// the heap tiles they show leave (the [`Leave`], once the caller's locks are
+/// gone). `None` when the rule is off or no page is in a reservation.
+pub(crate) fn copy_made(from: usize, to: usize) -> Option<(CopyHold, Leave)> {
+    if !on() || !one_range() || to <= from {
+        return None;
+    }
+    let mut st = state();
+    let State { plan, copies, holds, .. } = &mut *st;
+    let runs = copies.add(plan, from, to);
+    if runs.is_empty() {
+        return None;
+    }
+    let gone = rule::leaving(plan, copies, from, to, Cause::Copy, pieces(), |t| {
+        holds.get(&t).copied().unwrap_or_default()
+    });
+    Some((CopyHold { runs }, Leave(gone)))
 }
 
 /// The tiles of a heap piece: [`crate::tile_plan::PIECE`]'s, or (tests) a
@@ -502,6 +600,7 @@ pub fn mapped(at: usize, len: usize, heap: Option<u32>, first: u32) {
     let mut st = state();
     let mut fell = Vec::new();
     let mut drops = Vec::new();
+    let mut leave = Vec::new();
     match heap.filter(|&h| st.heaps.get(h as usize).is_some_and(Option::is_some)) {
         Some(heap) => {
             if canonical() {
@@ -513,6 +612,14 @@ pub fn mapped(at: usize, len: usize, heap: Option<u32>, first: u32) {
                 });
             }
             st.plan.map(at, len, HeapTile { heap, tile: first });
+            // One range per page: a tile views reach, now shown under a copy
+            // (or, for piece views, shown twice), takes them out.
+            if one_range() {
+                let State { plan, copies, holds, .. } = &*st;
+                leave = rule::leaving(plan, copies, at, at + len, Cause::Map, pieces(), |t| {
+                    holds.get(&t).copied().unwrap_or_default()
+                });
+            }
         }
         None => {
             for id in st.plan.pieces_of(at, len) {
@@ -536,6 +643,7 @@ pub fn mapped(at: usize, len: usize, heap: Option<u32>, first: u32) {
         crate::shadow::drop_views(range.start as u64, range.end as u64, None);
     }
     dropped(drops);
+    Leave(leave).now();
 }
 
 /// `xmem` unmapped `[at, at + len)` (whole pages).
@@ -974,6 +1082,13 @@ fn section_view(st: &mut State, from: usize, to: usize) -> Option<Result<View, M
     {
         return None;
     }
+    // One range per page: no view where a copy reaches a tile.
+    if one_range()
+        && let Some(why) = rule::refuse(&st.plan, &st.copies, from, to, false)
+    {
+        refused(why, to - from);
+        return Some(Err(Mixed));
+    }
     let tiles = (0..n).map(|k| HeapTile {
         heap: first.heap,
         tile: first.tile + k,
@@ -1057,6 +1172,14 @@ fn piece_view(st: &mut State, from: usize, to: usize) -> Option<View> {
         && crate::mac_switches::alias_physical() == crate::mac_switches::AliasPhysical::GpuSingle
     {
         return kept();
+    }
+    // One range per page: no piece view where a copy reaches a tile, or over
+    // a tile shown at another address (another piece tile, another range).
+    if one_range()
+        && let Some(why) = rule::refuse(&st.plan, &st.copies, from, to, true)
+    {
+        refused(why, to - from);
+        return None;
     }
     let hold = if canonical() {
         let held = |t: u32| {
@@ -1151,6 +1274,15 @@ pub(crate) fn take_counts() -> crate::physical_runs::GpuCounts {
         kept: n[KEPT],
         mixed_total: n[MIXED_TOTAL],
         sections_only: !pieces(),
+        one_range: one_range(),
+        rule: std::array::from_fn(|i| {
+            if i < RULE_SINCE_START {
+                RULE[i].swap(0, Relaxed)
+            } else {
+                RULE[i].load(Relaxed)
+            }
+        }),
+        copy_pages: state().copies.len() as u64,
     }
 }
 
@@ -2010,6 +2142,9 @@ void main(uint3 id : SV_DispatchThreadID)
         assert!(inside.range().0 >= line as u64);
         let across = crate::shadow::find(line as u64 - 64, 128).expect("a copy");
         assert!(!across.is_view(), "across the pieces' line: a copy");
+        // Its window copy goes, so that later tests' memory there starts clean.
+        drop((inside, across));
+        crate::shadow::forget_windows(at as u64, (at + len) as u64);
         // SAFETY: our reservation.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
@@ -2149,9 +2284,12 @@ void main(uint3 id : SV_DispatchThreadID)
 
     /// I4b: while views of one kind hold a heap tile, a range over it that
     /// would be a view of the other kind keeps a copy (mixed), both ways.
+    /// With I4b's rule (`=gpu-ranges-old`): the one-range rule refuses the
+    /// piece view first (its tile is shown at two addresses).
     #[test]
     fn a_mixed_range_is_a_copy() {
-        if !canonical_on() || !pieces_on() {
+        if !canonical_on() || !pieces_on() || one_range() {
+            eprintln!("skipped: needs VICTORY_ALIAS_PHYSICAL=gpu-ranges-old");
             return;
         }
         let heap = crate::alias::physical_heap(4 * PAGE).expect("a heap");
@@ -2506,6 +2644,205 @@ void main(uint3 id : SV_DispatchThreadID)
         assert_eq!(take_counts().calls, 0, "a remap maps no tile either");
         crate::shadow::unregister(0xa1_0060, run);
         crate::shadow::unregister(0xa1_0061, scattered);
+        // SAFETY: querying device health.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The one-range rule (`=gpu`, `=gpu-sections`): a page at two title
+    /// addresses, one inside a title buffer that is a copy (not one run), the
+    /// other a title buffer of one page. Copy first: the page gets no view
+    /// at its other address. View first: the copy makes it leave the
+    /// registry. A remap that brings a tile under the copy takes the views of
+    /// that tile out; when the copy goes, views come back. With pieces, a
+    /// piece view whose tile the title shows at a second address leaves.
+    #[test]
+    fn one_range_a_copy_takes_its_tiles_from_views_both_ways() {
+        if !on() || verifying() || !one_range() {
+            eprintln!("skipped: needs VICTORY_ALIAS_PHYSICAL=gpu or =gpu-sections");
+            return;
+        }
+        let heap = crate::alias::physical_heap(8 * PAGE).expect("a heap");
+        let (t, u) = (Title::new(3), Title::new(3));
+        // t's pages 0 and 1 show heap pages 3 and 1 (not a run); u's page 0
+        // heap page 1 too, u's page 1 heap page 5.
+        t.show(&heap, 0, 3);
+        t.show(&heap, 1, 1);
+        u.show(&heap, 0, 1);
+        u.show(&heap, 1, 5);
+        let (outer, single, other) = (t.page(0) as u64, u.page(0) as u64, u.page(1) as u64);
+        let _ = take_counts();
+        // The copy first.
+        crate::shadow::register(0xa1_0080, outer, 2 * PAGE as u64);
+        let copy = crate::shadow::find(outer, 16).expect("a copy");
+        assert!(!copy.is_view() && copy.holds_copy(), "not one run: a copy, holding its pages");
+        crate::shadow::register(0xa1_0081, single, PAGE as u64);
+        let refused = crate::shadow::find(single, 16).expect("a copy");
+        assert!(!refused.is_view(), "its page is reached through the copy at its other address: a copy");
+        let counts = take_counts();
+        assert!(counts.one_range && counts.rule[0] >= 1, "counted as refused: {:?}", counts.rule);
+        crate::shadow::unregister(0xa1_0081, single);
+        drop(refused);
+        // The copy goes: the single page is a view of its section again.
+        crate::shadow::unregister(0xa1_0080, outer);
+        drop(copy);
+        crate::shadow::register(0xa1_0082, single, PAGE as u64);
+        let view = crate::shadow::find(single, 16).expect("a view");
+        assert_eq!(view.view_kind(), Some(Kind::Section), "no copy reaches it now");
+        // The view first, then the copy: the view leaves the registry.
+        crate::shadow::register(0xa1_0083, outer, 2 * PAGE as u64);
+        let copy = crate::shadow::find(outer, 16).expect("a copy");
+        assert!(!copy.is_view());
+        let again = crate::shadow::find(single, 16).expect("a copy");
+        assert!(!Arc::ptr_eq(&view, &again) && !again.is_view(), "the copy took the view's page");
+        let counts = take_counts();
+        assert!(counts.rule[3] >= 1 && counts.rule[4] >= PAGE as u64, "counted as made to leave: {:?}", counts.rule);
+        assert!(counts.copy_pages >= 2, "{counts:?}");
+        // A view of heap page 5 at u's page 1; the title maps heap page 5 at
+        // t's page 1 too, under the copy: the view leaves.
+        crate::shadow::register(0xa1_0084, other, PAGE as u64);
+        let five = crate::shadow::find(other, 16).expect("a view");
+        assert_eq!(five.view_kind(), Some(Kind::Section));
+        t.show(&heap, 1, 5);
+        let after = crate::shadow::find(other, 16).expect("a copy");
+        assert!(!Arc::ptr_eq(&five, &after) && !after.is_view(), "a remap brought the tile under the copy");
+        for (key, at) in [(0xa1_0082, single), (0xa1_0083, outer), (0xa1_0084, other)] {
+            crate::shadow::unregister(key, at);
+        }
+        drop((view, copy, again, five, after));
+        if !pieces() {
+            return;
+        }
+        // Pieces: a piece view (heap pages 6 and 4, one address each); the
+        // title shows heap page 6 at a second address: the view leaves, and
+        // the next lookup is a copy (a piece view may not reach it now).
+        let (w, x) = (Title::new(2), Title::new(1));
+        w.show(&heap, 0, 6);
+        w.show(&heap, 1, 4);
+        crate::shadow::register(0xa1_0085, w.page(0) as u64, 2 * PAGE as u64);
+        let piece = crate::shadow::find(w.page(0) as u64, 16).expect("a view");
+        assert_eq!(piece.view_kind(), Some(Kind::Piece));
+        x.show(&heap, 0, 6);
+        let next = crate::shadow::find(w.page(0) as u64, 16).expect("a copy");
+        assert!(!Arc::ptr_eq(&piece, &next) && !next.is_view(), "its tile is shown twice now");
+        assert!(take_counts().rule[1] >= 1, "refused for a page shown twice");
+        crate::shadow::unregister(0xa1_0085, w.page(0) as u64);
+    }
+
+    /// Where the window starts that holds a test's loose ranges: the first
+    /// 4 MiB line in `t` (of 192 pages, so one window and the next lie in it).
+    fn window_in(t: &Title) -> usize {
+        let block = crate::shadow::loose_window_bytes() as usize;
+        let w0 = t.at.next_multiple_of(block);
+        assert!(w0 + 2 * block <= t.at + t.pages * PAGE);
+        w0
+    }
+
+    /// The hazard as the game builds it (verify run 10:05:57, warnings #4
+    /// and #5): two loose ranges over one page in one 4 MiB window, one a run
+    /// (a view of its section), the other not (`=gpu` gives it the window's
+    /// copy). A shader writes the page through the first binding, a UAV
+    /// barrier, another reads it through the second, in one submission. With
+    /// the one-range rule the window's copy takes the run's view out of the
+    /// registry, so both bindings are the copy, and the read is fresh. With
+    /// `=gpu-ranges-old` the first is the view, the second the copy: stale.
+    #[test]
+    fn one_range_a_page_written_and_read_through_two_loose_ranges_agrees() {
+        if !on() || verifying() || !canonical() {
+            eprintln!("skipped: needs VICTORY_ALIAS_PHYSICAL=gpu, =gpu-sections or =gpu-ranges-old");
+            return;
+        }
+        let host = crate::host::host().expect("a host device");
+        let heap = crate::alias::physical_heap(8 * PAGE).expect("a heap");
+        let t = Title::new(192);
+        let w0 = window_in(&t);
+        let block = crate::shadow::loose_window_bytes() as usize;
+        let k = (w0 - t.at) / PAGE;
+        // Pages k + 1 and k + 2 a run (heap pages 2, 3), starting past the
+        // window's start (as `crate::shadow::loose` finds the innermost
+        // first); k + 3 heap page 0. The source and the output in the next
+        // window, title buffers of a page.
+        t.show(&heap, k + 1, 2);
+        t.show(&heap, k + 2, 3);
+        t.show(&heap, k + 3, 0);
+        let (s_at, o_at) = (w0 + block, w0 + block + PAGE);
+        t.show(&heap, (s_at - t.at) / PAGE, 5);
+        t.show(&heap, (o_at - t.at) / PAGE, 6);
+        t.fill(k + 2, 0x7801);
+        t.fill((s_at - t.at) / PAGE, 0x7802);
+        crate::shadow::register(0xa1_0090, s_at as u64, PAGE as u64);
+        crate::shadow::register(0xa1_0091, o_at as u64, PAGE as u64);
+        let src = crate::shadow::find(s_at as u64, 16).expect("a view");
+        let out = crate::shadow::find(o_at as u64, 16).expect("a view");
+        assert!(src.is_view() && out.is_view());
+        let x = (w0 + 2 * PAGE) as u64;
+        // The run's range, then the other one, then the run's again (the
+        // next submission's lookups).
+        let (r1, r2) = ((w0 + PAGE + 16) as u64, x + 16);
+        let first = crate::shadow::find(r1, 2 * PAGE as u64 - 32).expect("a view");
+        assert_eq!(first.view_kind(), Some(Kind::Section), "the run: a view of its section");
+        let copy = crate::shadow::find(r2, PAGE as u64).expect("a copy");
+        assert!(!copy.is_view(), "not a run: the window's copy");
+        let again = crate::shadow::find(r1, 2 * PAGE as u64 - 32).expect("a binding");
+        if one_range() {
+            assert!(Arc::ptr_eq(&again, &copy), "one range: the run's range reads the window's copy too");
+        } else {
+            assert!(Arc::ptr_eq(&again, &first), "=gpu-ranges-old: the run keeps its view beside the copy");
+        }
+        // The copy holds the title's bytes (as a submission's refresh would).
+        let (cs, cn) = copy.range();
+        copy.update(cs as usize, cn as usize);
+        let pipeline = crate::compute::pipeline(
+            SHADER,
+            s!("alias_physical test (two loose ranges)"),
+            0,
+            &[
+                Param::Srv { register: 0, space: 0 },
+                Param::Uav { register: 0 },
+                Param::Constants { register: 0, count: 4 },
+            ],
+        )
+        .expect("a pipeline");
+        let rig = Rig::new(&host.device).expect("a queue");
+        rig.run(flush, |list| {
+            let pass = |from: u64, to: u64, add: u32| {
+                let constants = [WORDS as u32, add, 0, 0];
+                // SAFETY: live pipeline and buffers, constants on this stack.
+                unsafe {
+                    list.SetComputeRootShaderResourceView(0, from);
+                    list.SetComputeRootUnorderedAccessView(1, to);
+                    list.SetComputeRoot32BitConstants(2, 4, constants.as_ptr().cast(), 0);
+                    list.Dispatch((WORDS / 64) as u32, 1, 1);
+                    list.ResourceBarrier(&[crate::host::uav_barrier()]);
+                }
+            };
+            // SAFETY: a live pipeline.
+            unsafe {
+                list.SetComputeRootSignature(&pipeline.0);
+                list.SetPipelineState(&pipeline.1);
+            }
+            // Write the page through the run's binding, read it through the other's.
+            pass(src.gpu(s_at as u64), again.gpu(x), 1);
+            pass(copy.gpu(x), out.gpu(o_at as u64), 0);
+        })
+        .expect("the submission ran");
+        let want: Vec<u32> = (0..WORDS).map(|i| word(i, 0x7802) + 1).collect();
+        // SAFETY: our own mapped page (the output's heap page).
+        let got = unsafe { std::slice::from_raw_parts(o_at as *const u32, WORDS) };
+        let stale = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        eprintln!(
+            "{}: {stale} of {WORDS} words read through the second loose range stale after the write through the first",
+            crate::mac_switches::alias_physical().name()
+        );
+        if one_range() {
+            assert_eq!(stale, 0, "one range: fresh");
+        } else {
+            assert!(stale > 0, "=gpu-ranges-old: a view beside a copy reads stale");
+            assert!(got.iter().enumerate().all(|(i, &w)| w == word(i, 0x7801)), "the copy's old words");
+        }
+        crate::shadow::unregister(0xa1_0090, s_at as u64);
+        crate::shadow::unregister(0xa1_0091, o_at as u64);
+        drop((first, copy, again));
+        crate::shadow::forget_windows(w0 as u64, (w0 + 2 * block) as u64);
         // SAFETY: querying device health.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

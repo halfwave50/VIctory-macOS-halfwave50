@@ -126,6 +126,10 @@ pub(crate) struct Shadow {
     /// mac: with `VICTORY_ALIAS_PHYSICAL=verify`, the view `=gpu` would bind
     /// in this copy's place, which `crate::alias_verify` checks.
     pub(crate) verify: crate::alias_verify::Attached,
+    /// mac: a copy the GPU side made over title memory, under the one-range
+    /// rule (`crate::alias_physical::copy_made`): its pages are reached
+    /// through a copy while it lives, so no view reaches their heap tiles.
+    copied: std::sync::OnceLock<crate::alias_physical::CopyHold>,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -590,6 +594,7 @@ impl Shadow {
             hold: None,
             reach: None,
             verify: crate::alias_verify::Attached::default(),
+            copied: std::sync::OnceLock::new(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -628,6 +633,7 @@ impl Shadow {
             hold: None,
             reach: None,
             verify: crate::alias_verify::Attached::default(),
+            copied: std::sync::OnceLock::new(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -684,11 +690,28 @@ impl Shadow {
             hold: Some(hold),
             reach: Some(reach),
             verify: crate::alias_verify::Attached::default(),
+            copied: std::sync::OnceLock::new(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// mac: this copy is one the GPU side made over title memory (the
+    /// one-range rule, `crate::alias_physical::copy_made`): it holds its pages
+    /// while it lives. The views the rule makes leave go now, outside the
+    /// registries' locks (callers hold none). A second hold is dropped.
+    pub(crate) fn hold_copy(&self, made: Option<(crate::alias_physical::CopyHold, crate::alias_physical::Leave)>) {
+        if let Some((hold, leave)) = made {
+            let _ = self.copied.set(hold);
+            leave.now();
+        }
+    }
+
+    /// mac: whether this copy holds its pages for the one-range rule.
+    pub(crate) fn holds_copy(&self) -> bool {
+        self.copied.get().is_some()
     }
 
     /// mac: whether this is a view of a piece of a reservation or of a
@@ -2508,6 +2531,9 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end);
     };
+    // mac: a copy the GPU side makes holds its pages (the one-range rule),
+    // once the registry's lock is gone.
+    let mut made = None;
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -2545,6 +2571,11 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
             );
         }
         let copy = Shadow::new(buffer, data, gpu, key.0, len);
+        // mac: where `=gpu` makes a copy too (no view), its pages are held
+        // for the one-range rule, with `=verify` too.
+        if checked.as_ref().is_none_or(Option::is_none) {
+            made = crate::alias_physical::copy_made(key.0 as usize, entry.end as usize).map(|m| (copy.clone(), m));
+        }
         if let Some(view) = checked {
             copy.verify.buffer(view);
         }
@@ -2552,7 +2583,12 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         released().remade(key.0);
         changed();
     }
-    entry.shadow.clone()
+    let found = entry.shadow.clone();
+    drop(map);
+    if let Some((copy, made)) = made {
+        copy.hold_copy(Some(made));
+    }
+    found
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -2639,10 +2675,19 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.verify.window();
+    // mac: the window's copy holds its pages for the one-range rule (with
+    // `=verify`, `crate::alias_verify` does as `=gpu` would).
+    let made = if crate::alias_physical::verifying() {
+        None
+    } else {
+        crate::alias_physical::copy_made(start as usize, (start + len) as usize)
+    };
     released().remade(start);
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
+    drop(map);
+    shadow.hold_copy(made);
     Some(shadow)
 }
 
@@ -2725,6 +2770,15 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     let (buffer, data, gpu, slice) = arena().take(len, element)?;
     let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
     map.insert((address, len, element), Arc::downgrade(&shadow));
+    // mac: a copy of the view's own bytes holds its pages for the one-range
+    // rule (with `=verify`, `crate::alias_verify` does as `=gpu` would).
+    let made = if crate::alias_physical::verifying() {
+        None
+    } else {
+        crate::alias_physical::copy_made(address as usize, address.saturating_add(len) as usize)
+    };
+    drop(guard);
+    shadow.hold_copy(made);
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2833,6 +2887,11 @@ impl Arena {
 /// remapped a page under them. New copies or views take their ranges at the
 /// next lookups; lists holding them keep them. How many left.
 pub(crate) fn drop_views(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> usize {
+    drop_views_counted(from, to, kind).0
+}
+
+/// mac: [`drop_views`], with the bytes of the views that left.
+pub(crate) fn drop_views_counted(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> (usize, u64) {
     if crate::alias_physical::verifying() {
         return drop_checked(from, to, kind);
     }
@@ -2870,14 +2929,29 @@ pub(crate) fn drop_views(from: u64, to: u64, kind: Option<crate::alias_physical:
         }
     }
     // The last references may go here, outside the registries' locks.
-    gone.len()
+    (gone.len(), gone.iter().map(|s| s.len).sum())
+}
+
+/// mac, tests: the windows (views and copies) over `[from, to)` leave the
+/// registries, `crate::alias_verify`'s too, so that later tests' memory there
+/// starts clean.
+#[cfg(test)]
+pub(crate) fn forget_windows(from: u64, to: u64) {
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map.keys().filter(|&&(s, n)| s < to && from < s + n).copied().collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    changed();
+    drop(gone);
+    crate::alias_verify::forget_windows(from, to);
 }
 
 /// mac: [`drop_views`] with `=verify`: the views kept beside title buffers'
 /// copies (`crate::alias_verify::Attached`) and windows' (`crate::alias_verify`'s
 /// own registry) over `[from, to)` leave, as views leave the registries with
 /// `=gpu`. The copies stay. How many left.
-fn drop_checked(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> usize {
+fn drop_checked(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> (usize, u64) {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let map = buffers_read();
@@ -2898,7 +2972,7 @@ fn drop_checked(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -
             crate::alias_physical::left(hold);
         }
     }
-    gone.len()
+    (gone.len(), gone.iter().map(|s| s.len).sum())
 }
 
 /// Every host copy of title memory made so far (buffers, aliases, and windows).

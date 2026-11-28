@@ -325,7 +325,11 @@ pub(crate) fn gpu_on() {
 /// the start: pieces made and fallen back, views of sections and of pieces
 /// (those with a page at two or more addresses, as flushed), copies kept
 /// for ranges in pieces, and mixed. `sections_only`: no pieces at all
-/// (`=gpu-sections`), so none of their counts is written.
+/// (`=gpu-sections`), so none of their counts is written. With the one-range
+/// rule (`one_range`, `crate::one_range`): `rule` since the last line, then
+/// since the start: lookups it gave a copy because a copy reaches a page,
+/// because a piece view's page is shown twice, their bytes, views it made
+/// leave and their bytes; and `copy_pages`, title pages under copies now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GpuCounts {
     pub(crate) fresh: u64,
@@ -347,6 +351,35 @@ pub(crate) struct GpuCounts {
     pub(crate) kept: u64,
     pub(crate) mixed_total: u64,
     pub(crate) sections_only: bool,
+    pub(crate) one_range: bool,
+    pub(crate) rule: [u64; 10],
+    pub(crate) copy_pages: u64,
+}
+
+/// The one-range rule's part of the GPU side's line (empty when off).
+fn rule_part(g: &GpuCounts, frames: f64) -> String {
+    if !g.one_range {
+        return String::new();
+    }
+    let f = |n: u64| n as f64 / frames.max(1.0);
+    let r = &g.rule;
+    format!(
+        "; one range per page: per frame {:.1} views refused for a page a copy reaches and {:.1} for a piece \
+         view's page shown twice ({:.2} MB), {:.1} views made to leave ({:.2} MB); since the start {} and {} refused \
+         ({:.1} MB), {} made to leave ({:.1} MB); {} title pages under copies now ({:.1} MB)",
+        f(r[0]),
+        f(r[1]),
+        f(r[2]) / 1e6,
+        f(r[3]),
+        f(r[4]) / 1e6,
+        r[5],
+        r[6],
+        r[7] as f64 / 1e6,
+        r[8],
+        r[9] as f64 / 1e6,
+        g.copy_pages,
+        g.copy_pages as f64 * 65536.0 / 1e6,
+    )
 }
 
 /// A section's heap of `len` bytes was made: heap-backed sections now, and
@@ -452,7 +485,7 @@ fn stage2_line(
                 f(g.section_bytes) / 1e6,
                 f(g.mixed),
                 f(g.section_drops),
-            );
+            ) + &rule_part(&g, frames);
         }
         format!(
             "; GPU side: {} pieces ({} fell back to copies); since the start {} views of sections, {} views of pieces \
@@ -478,7 +511,7 @@ fn stage2_line(
             f(g.sunk),
             f(g.calls),
             f(g.us) / 1e3
-        )
+        ) + &rule_part(&g, frames)
     })
 }
 
@@ -717,6 +750,9 @@ mod tests {
                 kept: 12,
                 mixed_total: 9,
                 sections_only: false,
+                one_range: false,
+                rule: [0; 10],
+                copy_pages: 0,
             }),
             10.0,
         );
@@ -755,6 +791,30 @@ mod tests {
                  sections, 9 mixed; per frame 4.0 views of sections made (2.50 MB), 0.3 mixed, 0.2 dropped by remaps"
             ),
             "{sections}"
+        );
+        // With the one-range rule: what it cost, after the rest.
+        let rule = stage2_line(
+            [0; 4],
+            [0; 4],
+            [0; 5],
+            &r,
+            Some([1, 0, 0, 0, 0]),
+            Some(GpuCounts {
+                sections_only: true,
+                one_range: true,
+                rule: [30, 0, 2_000_000, 10, 1_000_000, 900, 5, 64_000_000, 400, 32_000_000],
+                copy_pages: 100,
+                ..GpuCounts::default()
+            }),
+            10.0,
+        );
+        assert!(
+            rule.ends_with(
+                "0.0 dropped by remaps; one range per page: per frame 3.0 views refused for a page a copy reaches and \
+                 0.0 for a piece view's page shown twice (0.20 MB), 1.0 views made to leave (0.10 MB); since the start \
+                 900 and 5 refused (64.0 MB), 400 made to leave (32.0 MB); 100 title pages under copies now (6.6 MB)"
+            ),
+            "{rule}"
         );
     }
 
