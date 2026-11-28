@@ -1558,6 +1558,181 @@ impl Drop for Timed {
     }
 }
 
+/// One marked page prepared for `VICTORY_COPY_BACK_SPANS`: its base address,
+/// clamped byte range `[from, to)`, and any pre-fault bytes saved while armed.
+pub(crate) struct MarkedPage {
+    pub(crate) page: usize,
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) saved: Option<Box<[u8]>>,
+}
+
+impl Tracked {
+    /// Removes saved pre-fault bytes for `pages` and omits pages the title
+    /// wrote while unarmed (`MarkedKept`) under one hold of `changed` and
+    /// `saved`, keeping `pages` armed until [`Tracked::unarm_marked`] right
+    /// before writeback so a title fault racing the scan still saves pre-fault
+    /// bytes. A page omitted so is unarmed here, as the default path
+    /// (`Shadow::marked_pages`) unarms every page before it looks at it.
+    pub(crate) fn prepare_marked(
+        &self,
+        pages: &[usize],
+        start: usize,
+        end: usize,
+    ) -> Vec<MarkedPage> {
+        if pages.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(pages.len());
+        #[cfg(feature = "diagnostics")]
+        let mut kept = 0u64;
+        {
+            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+            for &page in pages {
+                let (from, to) = (page.max(start), (page + PAGE).min(end));
+                if from >= to {
+                    continue;
+                }
+                let idx = page / PAGE;
+                let before = saved.bytes.remove(&idx);
+                if before.is_none() && changed.contains(&idx) {
+                    if saved.armed(idx) {
+                        saved.unarmed.insert(idx);
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        kept += 1;
+                    }
+                    continue;
+                }
+                out.push(MarkedPage {
+                    page,
+                    from,
+                    to,
+                    saved: before,
+                });
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if kept > 0 {
+            crate::copystat::add(crate::copystat::C::MarkedKept, kept);
+        }
+        out
+    }
+
+    /// Unarms `planned` right before writeback so our own writes do not save
+    /// them again, and omits from `taken` any page that took a title fault
+    /// after [`Tracked::prepare_marked`] (its bytes saved since; the scan
+    /// reads them without taking them, [`Tracked::saved_now`]) so it stays
+    /// changed for the next refresh.
+    pub(crate) fn unarm_marked(&self, planned: &[MarkedPage], taken: &mut Vec<usize>) {
+        if planned.is_empty() {
+            return;
+        }
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        let mut late_faulted = BTreeSet::new();
+        for item in planned {
+            let idx = item.page / PAGE;
+            if saved.armed(idx) {
+                saved.unarmed.insert(idx);
+            }
+            if saved.bytes.remove(&idx).is_some() {
+                late_faulted.insert(idx);
+            }
+        }
+        if !late_faulted.is_empty() {
+            taken.retain(|p| !late_faulted.contains(p));
+        }
+    }
+}
+
+impl Tracked {
+    /// [`Tracked::saved`] without taking them: the bytes stay for
+    /// [`Tracked::unarm_marked`], which keeps such a page changed.
+    pub(crate) fn saved_now(&self, page: usize) -> Option<Box<[u8]>> {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.get(&page).cloned()
+    }
+
+    /// Whether page `page` (a page number) is armed (tests).
+    #[cfg(test)]
+    pub(crate) fn armed_now(&self, page: usize) -> bool {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed(page)
+    }
+}
+
+/// Batched [`Writing`] guard over sorted page-number intervals `[first, last)`.
+#[must_use = "the writes must happen while this lives"]
+pub(crate) struct WritingRuns {
+    runs: Vec<(usize, usize)>,
+}
+
+/// Opens all guarded pages in `runs` (`[first_page, last_page)`), marks them
+/// changed (saving pre-write bytes on any armed alias pages, including inside
+/// the same copy), and keeps them busy under a single hold of the guard lock.
+pub(crate) fn writing_runs(runs: &[(usize, usize)]) -> WritingRuns {
+    if runs.is_empty() {
+        return WritingRuns { runs: Vec::new() };
+    }
+    let mut g = guards();
+    for &(first, last) in runs {
+        g.busy.push((first, last));
+        changed(&mut g, first, last, true);
+    }
+    WritingRuns {
+        runs: runs.to_vec(),
+    }
+}
+
+impl WritingRuns {
+    /// Ends the busy intervals and re-guards `taken` (page numbers) in one
+    /// hold of the guard lock, using [`protect`] so default region and view
+    /// boundary checks stay active when `VICTORY_VETTED_PAGES` is off.
+    pub(crate) fn finish_and_take(mut self, tracked: &Tracked, taken: &[usize]) {
+        let runs = std::mem::take(&mut self.runs);
+        if runs.is_empty() && taken.is_empty() {
+            return;
+        }
+        let mut g = guards();
+        for (first, last) in runs {
+            if let Some(i) = g.busy.iter().position(|&r| r == (first, last)) {
+                g.busy.swap_remove(i);
+            }
+            changed(&mut g, first, last, false);
+        }
+        if !taken.is_empty() {
+            let mut changed_set = tracked.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            let others = aliases(&g, taken);
+            let unguarded = guard_aliases(&mut g, &others);
+            let pages: Vec<usize> = taken
+                .iter()
+                .copied()
+                .filter(|p| !unguarded.contains(p))
+                .collect();
+            for page in protect(&mut g, &pages) {
+                changed_set.remove(&page);
+                tracked.changed.taken(page);
+            }
+            set_dirty(tracked.changed.2, !changed_set.is_empty());
+        }
+    }
+}
+
+impl Drop for WritingRuns {
+    fn drop(&mut self) {
+        if self.runs.is_empty() {
+            return;
+        }
+        let mut g = guards();
+        for (first, last) in self.runs.drain(..) {
+            if let Some(i) = g.busy.iter().position(|&r| r == (first, last)) {
+                g.busy.swap_remove(i);
+            }
+            changed(&mut g, first, last, false);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2051,7 +2226,7 @@ pub(crate) mod tests {
 
     thread_local! {
         /// `VirtualProtect` calls this thread made in `protect`.
-        pub(super) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// `single` views of one page each side by side, as the runtime's page

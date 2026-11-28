@@ -746,6 +746,37 @@ fn spans_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// Whether marked and snapshot copy-backs scan 8 bytes at a time, batch
+/// marked-page tracker and guard locks, and write back only coalesced changed
+/// byte spans (`crate::copy_back_spans`, `crate::shadow::copy_back_fast`).
+/// Worker splitting stays under `VICTORY_COPY_BACK_SPLIT`. Off unless
+/// `VICTORY_COPY_BACK_SPANS=1`.
+///
+/// mac: `VICTORY_AB=VICTORY_COPY_BACK_SPANS` (`crate::ab`): read per copy-back
+/// call, and both sides leave `Shadow` and page guards in the same state.
+pub(crate) fn copy_back_spans() -> bool {
+    #[cfg(test)]
+    if tests::COPY_BACK_SPANS_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let on = copy_back_spans_rule(std::env::var("VICTORY_COPY_BACK_SPANS").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_COPY_BACK_SPANS=1: marked and snapshot copy-backs word-scan pages, batch marked-page guard locks, and write back only changed byte spans"
+            );
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_COPY_BACK_SPANS", a, |v| copy_back_spans_rule(Some(v)))
+}
+
+/// `VICTORY_COPY_BACK_SPANS`'s rule: on only for `1`.
+fn copy_back_spans_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// From VIctory-macOS #452 (18f33b86): whether a title copy made while a
 /// submission is prepared (not into memory shown at two addresses) makes
 /// only the pending refreshes whose queued ranges reach its window, leaving
@@ -1031,16 +1062,20 @@ mod ab_tests {
 
     #[test]
     fn on_off_switches_read_the_opposite_or_the_value_on_side_b() {
-        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_SYNC_EPOCH", "VICTORY_WIDENED_IN_PLACE"]) {
+        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_COPY_BACK_SPANS", "VICTORY_SYNC_EPOCH", "VICTORY_WIDENED_IN_PLACE"]) {
             return;
         }
-        assert!(!flush_overlapping() && !snapshot_spans() && !sync_epoch(|| false) && !widened_in_place());
+        assert!(!flush_overlapping() && !snapshot_spans() && !copy_back_spans() && !sync_epoch(|| false) && !widened_in_place());
         with("VICTORY_FLUSH_OVERLAPPING:10", true, || assert!(flush_overlapping()));
         with("VICTORY_FLUSH_OVERLAPPING:10", false, || assert!(!flush_overlapping(), "side A: as set"));
         with("VICTORY_FLUSH_OVERLAPPING=0:10", true, || assert!(!flush_overlapping(), "=0 on side B: off (A/A)"));
         with("VICTORY_SNAPSHOT_SPANS:10", true, || {
             assert!(snapshot_spans());
             assert!(!flush_overlapping(), "another switch keeps side A");
+        });
+        with("VICTORY_COPY_BACK_SPANS:10", true, || {
+            assert!(copy_back_spans());
+            assert!(!snapshot_spans(), "another switch keeps side A");
         });
         with("VICTORY_SYNC_EPOCH:10", true, || assert!(sync_epoch(|| false)));
         // A list's side, not the side now.
@@ -1476,7 +1511,7 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        AliasPhysical, WithheldCopies, alias_physical_rule, withheld_copies_rule, copy_order, epoch, heap_locks, heap_sync_pause,
+        AliasPhysical, WithheldCopies, alias_physical_rule, withheld_copies_rule, copy_back_spans_rule, copy_order, epoch, heap_locks, heap_sync_pause,
         heap_sync_threads, key, overlapping_rule, quick, setting, spans_rule, texture_workers,
         uav_size, whole_wave_lds, writers,
     };
@@ -1593,6 +1628,37 @@ pub(crate) mod tests {
     impl Drop for SpansHere {
         fn drop(&mut self) {
             SPANS_HERE.with(|on| on.set(false));
+        }
+    }
+
+    thread_local! {
+        /// `copy_back_spans` is on for this thread's copy-backs ([`CopyBackSpansHere`]).
+        pub(crate) static COPY_BACK_SPANS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) struct CopyBackSpansHere;
+
+    impl CopyBackSpansHere {
+        #[cfg_attr(not(windows), allow(dead_code))]
+        pub(crate) fn new() -> Self {
+            COPY_BACK_SPANS_HERE.with(|on| on.set(true));
+            CopyBackSpansHere
+        }
+    }
+
+    impl Drop for CopyBackSpansHere {
+        fn drop(&mut self) {
+            COPY_BACK_SPANS_HERE.with(|on| on.set(false));
+        }
+    }
+
+    #[test]
+    fn copy_back_spans_are_on_only_when_asked_for() {
+        assert!(copy_back_spans_rule(Some("1")));
+        assert!(copy_back_spans_rule(Some(" 1 ")));
+        for off in [None, Some(""), Some("0"), Some("2"), Some("on")] {
+            assert!(!copy_back_spans_rule(off), "{off:?}");
         }
     }
 

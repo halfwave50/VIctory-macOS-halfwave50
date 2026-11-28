@@ -964,6 +964,9 @@ impl Shadow {
             }
             return 0;
         }
+        if crate::mac_switches::copy_back_spans() {
+            return self.copy_back_or_not_spans(address, len, back);
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Snapshot(segments, compared, spans) = &mut *snapshot;
@@ -1109,6 +1112,9 @@ impl Shadow {
                 flush(from, to);
             }
             return 0;
+        }
+        if crate::mac_switches::copy_back_spans() {
+            return self.copy_back_marked_spans(pages);
         }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = &self.tracked else {
@@ -1953,13 +1959,34 @@ thread_local! {
     /// A test's choice, whatever the environment says.
     static SPLIT_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static MARKED_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread `(blocks_changed, blocks_compared)` tally from the last
+    /// `copy_back_marked` call, isolated from concurrent tests.
+    static LAST_MARKED_BLOCKS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// mac: of [`copy_back_marks`] since the last frame line: marked pages of
 /// host copies compared with title memory, marked pages of aliased copies
 /// (told to the other trackers, nothing to compare), bytes written back
-/// from the compared pages, and the calls' microseconds.
-static MARKED_BACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// from the compared pages, the calls' microseconds, and with
+/// `VICTORY_COPY_BACK_SPANS=1` only (`copy_back_fast`) 4 KiB blocks written
+/// back and 4 KiB blocks compared: the default path compares a page whole,
+/// stopping at its first difference, as before.
+static MARKED_BACK: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(super) fn record_marked_blocks(blocks_changed: u64, blocks_compared: u64) {
+    MARKED_BACK[4].fetch_add(blocks_changed, Ordering::Relaxed);
+    MARKED_BACK[5].fetch_add(blocks_compared, Ordering::Relaxed);
+    #[cfg(test)]
+    LAST_MARKED_BLOCKS.with(|c| {
+        let (prev_c, prev_n) = c.get();
+        c.set((prev_c + blocks_changed, prev_n + blocks_compared));
+    });
+}
+
+#[cfg(test)]
+pub(super) fn take_last_marked_blocks() -> (u64, u64) {
+    LAST_MARKED_BLOCKS.with(|c| c.replace((0, 0)))
+}
 
 /// Adds the time it lived to [`MARKED_BACK`]'s microseconds.
 struct MarkedClock(std::time::Instant);
@@ -1970,18 +1997,34 @@ impl Drop for MarkedClock {
     }
 }
 
+/// The line's text as before, with `VICTORY_COPY_BACK_SPANS`'s block
+/// counts at its end (when the switch is on, or counted in the window).
+pub(super) fn format_marked_back_line(
+    [compared, aliased, bytes, us, blocks_changed, blocks_compared]: [f64; 6],
+    spans: bool,
+) -> String {
+    let blocks = if spans || blocks_compared > 0.0 {
+        format!(
+            ", 4 KiB blocks {blocks_changed:.0} written back of {blocks_compared:.0} compared (VICTORY_COPY_BACK_SPANS)"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "; marked pages copied back: {compared:.0} compared, {:.1} MB written back from them, {aliased:.0} more in \
+         aliased memory told only, in {:.1} ms{blocks}",
+        bytes / 1e6,
+        us / 1e3
+    )
+}
+
 /// The frame line's part for [`MARKED_BACK`] (`frames` since the last
 /// one), always, at the end of the line: the line's "copying back ... MB"
 /// counts the declared ranges only (`crate::host`), not these.
 pub(crate) fn marked_back_line(frames: f64) -> String {
-    let [compared, aliased, bytes, us] =
+    let vals =
         MARKED_BACK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
-    format!(
-        "; marked pages copied back: {compared:.0} compared, {:.1} MB written back from them, {aliased:.0} more in \
-         aliased memory told only, in {:.1} ms",
-        bytes / 1e6,
-        us / 1e3
-    )
+    format_marked_back_line(vals, crate::mac_switches::copy_back_spans())
 }
 
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
@@ -3157,6 +3200,10 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
+mod copy_back_fast;
+
+#[cfg(test)]
+mod copy_back_bench;
 #[cfg(test)]
 mod parallel_copy_tests;
 #[cfg(test)]
