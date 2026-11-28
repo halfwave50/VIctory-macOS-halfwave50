@@ -121,6 +121,11 @@ pub(crate) struct Shadow {
     /// it goes. Never given up by [`release_idle`] (it is aliased).
     view: bool,
     hold: Option<crate::alias_physical::Hold>,
+    /// mac: a view's reach: what its buffer's bytes show (`crate::verify_plan`).
+    reach: Option<crate::verify_plan::Reach>,
+    /// mac: with `VICTORY_ALIAS_PHYSICAL=verify`, the view `=gpu` would bind
+    /// in this copy's place, which `crate::alias_verify` checks.
+    pub(crate) verify: crate::alias_verify::Attached,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -530,6 +535,7 @@ impl Shadow {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }
+        crate::alias_verify::gpu_wrote(self, from, n);
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
             t.taken(&[page / PAGE]);
@@ -582,6 +588,8 @@ impl Shadow {
             used: AtomicU64::new(crate::queue::presented()),
             view: false,
             hold: None,
+            reach: None,
+            verify: crate::alias_verify::Attached::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -618,6 +626,8 @@ impl Shadow {
             used: AtomicU64::new(crate::queue::presented()),
             view: false,
             hold: None,
+            reach: None,
+            verify: crate::alias_verify::Attached::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -632,15 +642,27 @@ impl Shadow {
     /// nothing is copied or copied back, and writes through it are only told
     /// to the other trackers, as for an aliased region.
     pub(crate) fn new_view(view: crate::alias_physical::View) -> Arc<Shadow> {
+        Shadow::view_marked(view, true)
+    }
+
+    /// mac: [`Shadow::new_view`] for `crate::alias_verify` (`=verify`): the
+    /// view the copy in its place stands for, never bound, so with no marks
+    /// (the bitmap is the copies').
+    pub(crate) fn new_view_checked(view: crate::alias_physical::View) -> Arc<Shadow> {
+        Shadow::view_marked(view, false)
+    }
+
+    fn view_marked(view: crate::alias_physical::View, marked: bool) -> Arc<Shadow> {
         let crate::alias_physical::View {
             buffer,
             gpu,
             base,
             range,
             hold,
+            reach,
         } = view;
         let (start, len) = (range.start as u64, range.len() as u64);
-        let marks = marks().take(pages(start, len));
+        let marks = if marked { marks().take(pages(start, len)) } else { None };
         let shadow = Arc::new(Shadow {
             buffer,
             data: start as *mut u8,
@@ -660,6 +682,8 @@ impl Shadow {
             used: AtomicU64::new(crate::queue::presented()),
             view: true,
             hold: Some(hold),
+            reach: Some(reach),
+            verify: crate::alias_verify::Attached::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -676,6 +700,20 @@ impl Shadow {
     /// mac: what a view reaches its pages through (`None`: not a view).
     pub(crate) fn view_kind(&self) -> Option<crate::alias_physical::Kind> {
         self.hold.as_ref().map(crate::alias_physical::Hold::kind)
+    }
+
+    /// mac: what a view's buffer bytes show (`None`: not a view).
+    pub(crate) fn reach(&self) -> Option<crate::verify_plan::Reach> {
+        self.reach
+    }
+
+    /// The root view a shader reads `address` through: the byte of
+    /// `buffer` the view starts at (where the copy starts in it: 0, or a
+    /// view's `base`) and the offset of `address` from there
+    /// (`crate::draw`'s root views; `crate::alias_verify` checks views with
+    /// the same arithmetic).
+    pub(crate) fn root_place(&self, address: u64) -> (u64, u64) {
+        (self.base(), self.offset(address) - self.base())
     }
 
     /// Where the title buffer starts in `buffer`: 0 but for runs of a shared
@@ -872,6 +910,8 @@ impl Shadow {
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+        // mac: `VICTORY_ALIAS_PHYSICAL=verify`: would a view have let them in?
+        crate::alias_verify::withheld(self, address, len);
         self.copy_back_or_not(address, len, false);
     }
 
@@ -963,6 +1003,7 @@ impl Shadow {
                     if merge_writeback(title, host, old) {
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        crate::alias_verify::gpu_wrote(self, start + at, n);
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
@@ -1090,6 +1131,7 @@ impl Shadow {
             // widened_source keeps the merged bytes stable until the write.
             let src = unsafe { self.data.add(from - start) };
             crate::host::write_mapped(from as *mut u8, src, len);
+            crate::alias_verify::gpu_wrote(self, from, len);
             len
         };
         let written = if split && writes.len() >= 2 {
@@ -2427,12 +2469,19 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // mac: in one piece of a reservation (`VICTORY_ALIAS_PHYSICAL=gpu`,
-        // `crate::alias_physical`): a view of the piece, no copy.
-        if let Some(view) = crate::alias_physical::view(key.0 as usize, entry.end as usize) {
-            entry.shadow = Some(Shadow::new_view(view));
-            changed();
-            return entry.shadow.clone();
-        }
+        // `crate::alias_physical`): a view of the piece, no copy. With
+        // `=verify` the view is only kept beside the copy, to be checked
+        // (`crate::alias_verify`).
+        let checked = if crate::alias_physical::verifying() {
+            Some(crate::alias_physical::view(key.0 as usize, entry.end as usize).map(Shadow::new_view_checked))
+        } else {
+            if let Some(view) = crate::alias_physical::view(key.0 as usize, entry.end as usize) {
+                entry.shadow = Some(Shadow::new_view(view));
+                changed();
+                return entry.shadow.clone();
+            }
+            None
+        };
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -2452,7 +2501,11 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        let copy = Shadow::new(buffer, data, gpu, key.0, len);
+        if let Some(view) = checked {
+            copy.verify.buffer(view);
+        }
+        entry.shadow = Some(copy);
         released().remade(key.0);
         changed();
     }
@@ -2463,7 +2516,7 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches. Smaller windows retain
 /// fewer unused bytes and require more host buffers and page-table entries.
-fn loose_window_bytes() -> u64 {
+pub(crate) fn loose_window_bytes() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
         if crate::switch::on("VICTORY_SMALL_LOOSE_WINDOWS") {
@@ -2517,7 +2570,11 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // pages (the run inside the window and its heap piece), else of the piece
     // over the range's own pages; with `=gpu-tiles`, of the piece over the
     // 256 MiB block holding the range, cut to the piece.
-    if let Some(view) = crate::alias_physical::window(address as usize, end as usize, window as usize) {
+    // (With `=verify` the copy below is made, and `crate::alias_verify` asks
+    // for the view at each check of a range in it.)
+    if !crate::alias_physical::verifying()
+        && let Some(view) = crate::alias_physical::window(address as usize, end as usize, window as usize)
+    {
         let (from, n) = (view.range.start as u64, view.range.len() as u64);
         let shadow = Shadow::new_view(view);
         LOOSE_SPAN.fetch_max(n, Ordering::Relaxed);
@@ -2538,6 +2595,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.verify.window();
     released().remade(start);
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
@@ -2732,6 +2790,9 @@ impl Arena {
 /// remapped a page under them. New copies or views take their ranges at the
 /// next lookups; lists holding them keep them. How many left.
 pub(crate) fn drop_views(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> usize {
+    if crate::alias_physical::verifying() {
+        return drop_checked(from, to, kind);
+    }
     let over = |s: &Shadow| {
         s.view && s.start < to && from < s.start + s.len && (kind.is_none() || s.view_kind() == kind)
     };
@@ -2766,6 +2827,34 @@ pub(crate) fn drop_views(from: u64, to: u64, kind: Option<crate::alias_physical:
         }
     }
     // The last references may go here, outside the registries' locks.
+    gone.len()
+}
+
+/// mac: [`drop_views`] with `=verify`: the views kept beside title buffers'
+/// copies (`crate::alias_verify::Attached`) and windows' (`crate::alias_verify`'s
+/// own registry) over `[from, to)` leave, as views leave the registries with
+/// `=gpu`. The copies stay. How many left.
+fn drop_checked(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> usize {
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers_read();
+        let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+        for (_, entry) in map.range((lowest, 0)..(to, 0)) {
+            if let Some(copy) = &entry.shadow
+                && copy.start < to
+                && from < copy.start + copy.len
+                && let Some(view) = copy.verify.drop_over(from, to, kind)
+            {
+                gone.push(view);
+            }
+        }
+    }
+    gone.extend(crate::alias_verify::drop_windows(from, to, kind));
+    for view in &gone {
+        if let Some(hold) = &view.hold {
+            crate::alias_physical::left(hold);
+        }
+    }
     gone.len()
 }
 

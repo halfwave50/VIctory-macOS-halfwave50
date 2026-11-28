@@ -247,10 +247,16 @@ pub(crate) fn on() -> bool {
             Ok(()) => {
                 crate::physical_runs::gpu_on();
                 tracing::info!(
-                    "{}: the GPU side is on: one reserved buffer per piece of at most 4 GiB less a tile of each \
+                    "{}: the GPU side is on{}: one reserved buffer per piece of at most 4 GiB less a tile of each \
                      placeholder reservation, tiled from the sections' heaps as the title maps its pages, flushed \
                      before each submission (nulls first, unmapped tiles on a zeroed sink){}; the start check passed",
                     mode.name(),
+                    if mode.verify() {
+                        " to be checked, not drawn through: every lookup keeps its host copy, and each view the \
+                         GPU side would have bound is compared on the CPU with the title's bytes (alias verify lines)"
+                    } else {
+                        ""
+                    },
                     if mode.canonical() {
                         "; a range that is one run of a section's pages is a view of a placed buffer over the \
                          section's heap (canonical views), other ranges in one piece views of the piece"
@@ -269,6 +275,49 @@ pub(crate) fn on() -> bool {
             }
         }
     })
+}
+
+/// Whether the GPU side runs only to be checked (`=verify`, `=verify-tiles`):
+/// [`view`] and [`window`] answer as with `=gpu`, but `crate::shadow` keeps
+/// its copies and hands the views to `crate::alias_verify`, which checks them
+/// on the CPU. One load and a branch after the first call.
+pub(crate) fn verifying() -> bool {
+    static VERIFY: OnceLock<bool> = OnceLock::new();
+    *VERIFY.get_or_init(|| on() && crate::mac_switches::alias_physical().verify())
+}
+
+/// `f` with the plan as xmem maps it now and a reader of heap tiles' bytes
+/// through their heaps' CPU mappings (`tile`, offset in it, out; false for
+/// a heap that is gone or a tile past it): the verify mode's compare
+/// (`crate::alias_verify`). Under the state lock: `f` must take none of
+/// `crate::shadow`'s.
+pub(crate) fn with_plan<R>(f: impl FnOnce(&Plan, &dyn Fn(HeapTile, usize, &mut [u8]) -> bool) -> R) -> R {
+    let st = state();
+    let heaps: Vec<Option<(usize, u32)>> = st
+        .heaps
+        .iter()
+        .map(|h| h.as_ref().map(|h| (h.sink - h.tiles as usize * PAGE, h.tiles)))
+        .collect();
+    let read = |t: HeapTile, offset: usize, out: &mut [u8]| {
+        let Some(Some((cpu, tiles))) = heaps.get(t.heap as usize).copied() else {
+            return false;
+        };
+        if t.tile >= tiles || offset + out.len() > PAGE {
+            return false;
+        }
+        // SAFETY: inside heap `t.heap`'s CPU mapping, alive while the state
+        // lock holds its entry; the GPU may write it meanwhile (then the
+        // bytes are as racy as the title's own reads).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (cpu + t.tile as usize * PAGE + offset) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        true
+    };
+    f(&st.plan, &read)
 }
 
 /// A heap-backed section's heap of `tiles` pages, its sink tile's CPU
@@ -625,6 +674,10 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue) {
         return;
     }
     let mut st = state();
+    // `=verify`: what the submission's lists bound, against the plan now.
+    if verifying() {
+        crate::alias_verify::submitted(&st.plan);
+    }
     st.graveyard.clear();
     let Some((sink, sink_cpu)) = sink(&st) else {
         // No heap yet: nothing can be mapped, so nothing is to change.
@@ -748,6 +801,9 @@ pub(crate) struct View {
     pub(crate) base: u64,
     pub(crate) range: Range<usize>,
     pub(crate) hold: Hold,
+    /// What its buffer's bytes show (`crate::verify_plan::Reach`): the
+    /// piece's tiles, or the section buffer's heap tiles.
+    pub(crate) reach: crate::verify_plan::Reach,
 }
 
 /// The view title memory `[from, to)` (a title buffer) gets, if any
@@ -849,6 +905,11 @@ fn section_view(st: &mut State, from: usize, to: usize) -> Option<Result<View, M
     }
     let (buffer, gpu) = heap.sections.get(j as usize)?.clone();
     let base = u64::from(first.tile - j * heap.per) * PAGE as u64 + (from % PAGE) as u64;
+    let reach = crate::verify_plan::Reach::Section {
+        heap: first.heap,
+        tile0: j * heap.per,
+        tiles: heap.per.min(heap.tiles - j * heap.per),
+    };
     let pages = from / PAGE * PAGE..to.next_multiple_of(PAGE);
     if st
         .plan
@@ -907,6 +968,7 @@ fn section_view(st: &mut State, from: usize, to: usize) -> Option<Result<View, M
             n,
             tracked: true,
         },
+        reach,
     }))
 }
 
@@ -984,13 +1046,15 @@ fn piece_view(st: &mut State, from: usize, to: usize) -> Option<View> {
         base: u64::from(offset),
         range: from..to,
         hold,
+        reach: crate::verify_plan::Reach::Piece { piece: id },
     })
 }
 
 /// The piece title address `at` is in, if it has a buffer and has not
 /// fallen back: its title range (`crate::memory::pointer_pages`'s budget).
 pub(crate) fn piece_at(at: usize) -> Option<std::ops::Range<usize>> {
-    if !on() {
+    // With `=verify` lookups make copies, which count against the budget.
+    if !on() || verifying() {
         return None;
     }
     let st = state();
@@ -1344,10 +1408,19 @@ mod tests {
 
     /// Canonical views are on (`VICTORY_ALIAS_PHYSICAL=gpu` under Wine).
     fn canonical_on() -> bool {
-        if on() && canonical() {
+        if on() && canonical() && !verifying() {
             return true;
         }
         eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu (canonical views) is not on here");
+        false
+    }
+
+    /// `VICTORY_ALIAS_PHYSICAL=verify` is on (under Wine).
+    fn verify_on() -> bool {
+        if verifying() && canonical() {
+            return true;
+        }
+        eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=verify is not on here");
         false
     }
 
@@ -1443,7 +1516,7 @@ void main(uint3 id : SV_DispatchThreadID)
     /// `VICTORY_COPY_ORDER=split`) under Wine on Rosetta; else skipped.
     #[test]
     fn title_pages_reach_a_dispatch_through_the_pieces_and_back() {
-        if !on() {
+        if !on() || verifying() {
             eprintln!(
                 "skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here (set it, with its prerequisites, under Wine)"
             );
@@ -1618,7 +1691,7 @@ void main(uint3 id : SV_DispatchThreadID)
     /// root views and title memory's page-table pairs now do).
     #[test]
     fn a_range_in_a_reservation_is_a_view() {
-        if !on() {
+        if !on() || verifying() {
             eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here");
             return;
         }
@@ -1771,7 +1844,7 @@ void main(uint3 id : SV_DispatchThreadID)
     /// the second piece is a view.
     #[test]
     fn a_straddling_range_keeps_a_copy() {
-        if !on() {
+        if !on() || verifying() {
             eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here");
             return;
         }
@@ -1810,7 +1883,7 @@ void main(uint3 id : SV_DispatchThreadID)
     /// a copy.
     #[test]
     fn a_fallen_back_reservation_gives_copies() {
-        if !on() {
+        if !on() || verifying() {
             eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here");
             return;
         }
@@ -2018,6 +2091,86 @@ void main(uint3 id : SV_DispatchThreadID)
         crate::shadow::unregister(0xa1_0041, start);
     }
 
+    /// Verify mode (`VICTORY_ALIAS_PHYSICAL=verify` under Wine): a title
+    /// buffer over a run of a section's pages keeps its copy, with the
+    /// section view `=gpu` would bind beside it, and a root view checked
+    /// through it equals the title's bytes. A view whose base is one page
+    /// off (a deliberately wrong offset) is reported: the address, the heap
+    /// tiles on both sides and both first words. After the title maps
+    /// another page under the section view, a table view's check through
+    /// the view that left (what a heap slot made before reads with `=gpu`)
+    /// differs, and the lookup now (a copy: the old view still holds its
+    /// tiles) has nothing to differ.
+    #[test]
+    fn verify_reports_a_wrong_offset_and_a_stale_section_view() {
+        use crate::alias_verify::{
+            Bind, check, forget_seen, table, take_for_test, take_last, take_stale, view_of,
+        };
+        if !verify_on() {
+            return;
+        }
+        let heap = crate::alias::physical_heap(8 * PAGE).expect("a heap");
+        let id = heap.id().expect("a heap of the pieces'");
+        let t = Title::new(4);
+        t.show(&heap, 0, 2);
+        t.show(&heap, 1, 3);
+        t.show(&heap, 2, 4);
+        for k in 0..3 {
+            t.fill(k, 0x7400 + k as u32);
+        }
+        let (start, len) = (t.page(0) as u64 + 0x100, 3 * PAGE as u64 - 0x200);
+        crate::shadow::register(0xa1_0050, start, len);
+        let copy = crate::shadow::find(start + 64, 128).expect("a copy");
+        assert!(!copy.is_view(), "verify mode keeps the copy");
+        let view = view_of(&copy).expect("the view =gpu would bind");
+        assert_eq!(view.view_kind(), Some(Kind::Section));
+        assert_eq!(view.base(), 2 * PAGE as u64 + 0x100, "heap page 2's place");
+        let _ = (take_for_test(Bind::Root), take_for_test(Bind::Table), take_last(), take_stale(Bind::Table));
+        forget_seen();
+        check(Bind::Root, &copy, start + 64, 2 * PAGE as u64);
+        assert_eq!(take_for_test(Bind::Root), [1, 1, 0, 0], "checked and equal");
+        assert!(take_last().is_none());
+        // A deliberately wrong offset: the view's base one page too far.
+        let wrong = View {
+            buffer: view.buffer.clone(),
+            gpu: view.gpu(start) + PAGE as u64,
+            base: view.base() + PAGE as u64,
+            range: start as usize..(start + len) as usize,
+            hold: Hold::untracked(Kind::Section),
+            reach: view.reach().expect("a view's reach"),
+        };
+        copy.verify.buffer(Some(crate::shadow::Shadow::new_view_checked(wrong)));
+        forget_seen();
+        let at = t.page(1) as u64 + 0x40;
+        check(Bind::Root, &copy, at, 256);
+        assert_eq!(take_for_test(Bind::Root), [1, 0, 1, 0], "checked and different");
+        let (bind, stale, f) = take_last().expect("the difference");
+        assert_eq!((bind, stale), (Bind::Root, false));
+        assert_eq!(f.at, at as usize, "at the binding's address");
+        assert_eq!(f.title_tile, Some(HeapTile { heap: id, tile: 3 }));
+        assert_eq!(f.view_tile, Ok(Some(HeapTile { heap: id, tile: 4 })));
+        assert_eq!(f.expected[0], word(0x10, 0x7401), "the title's word");
+        assert_eq!(f.found[0], word(0x10, 0x7402), "the next page's word");
+        // The right view again: a table view of page 1 is equal. Then the
+        // title maps heap page 5 at page 1: the section view leaves.
+        copy.verify.buffer(Some(view.clone()));
+        drop(view);
+        forget_seen();
+        table(Bind::Table, at, 256, 4);
+        assert_eq!(take_for_test(Bind::Table), [1, 1, 0, 0]);
+        t.show(&heap, 1, 5);
+        assert!(view_of(&copy).is_none(), "the view left with the remap");
+        forget_seen();
+        table(Bind::Table, at, 256, 4);
+        assert_eq!(take_stale(Bind::Table), [1, 1], "through the view that left: different");
+        let (_, stale, f) = take_last().expect("the stale difference");
+        assert!(stale);
+        assert_eq!(f.title_tile, Some(HeapTile { heap: id, tile: 5 }));
+        assert_eq!(f.view_tile, Ok(Some(HeapTile { heap: id, tile: 3 })));
+        assert_eq!(take_for_test(Bind::Table), [1, 0, 0, 1], "the lookup now: a copy (mixed)");
+        crate::shadow::unregister(0xa1_0050, start);
+    }
+
     /// I4b, the coordinator's GPU test: one page at two title addresses (two
     /// reservations), each a title buffer, both bound in one submission: read
     /// through the second, a shader writes through the first, a UAV barrier,
@@ -2028,7 +2181,7 @@ void main(uint3 id : SV_DispatchThreadID)
     #[test]
     fn one_page_at_two_addresses_is_fresh_through_one_range() {
         let mode = crate::mac_switches::alias_physical();
-        if !on() || mode == crate::mac_switches::AliasPhysical::GpuSingle {
+        if !on() || verifying() || mode == crate::mac_switches::AliasPhysical::GpuSingle {
             eprintln!("skipped: needs VICTORY_ALIAS_PHYSICAL=gpu or =gpu-tiles under Wine");
             return;
         }

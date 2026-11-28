@@ -2121,6 +2121,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// mac: a buffer view's title range and its element's bytes, as
+/// [`view_copy`] asks [`crate::shadow::for_view`] for them
+/// (`crate::alias_verify`, `VICTORY_ALIAS_PHYSICAL=verify`).
+pub(crate) fn view_layout(view: &View) -> Option<(u64, u64, u64)> {
+    let (address, len) = buffer_range(view)?;
+    Some((address, len, u64::from(view_stride(view))))
+}
+
 /// The host copy a buffer view's bytes are in (the one its host view
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {

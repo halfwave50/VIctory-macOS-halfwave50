@@ -139,6 +139,13 @@ mod texture;
 mod tile_plan;
 #[cfg(windows)]
 mod twin;
+// mac: stage 2's verify mode (`VICTORY_ALIAS_PHYSICAL=verify`): the compare
+// over the tile plan in plain std, so its tests run everywhere; the hooks on
+// Windows.
+#[cfg(any(windows, test))]
+mod verify_plan;
+#[cfg(windows)]
+mod alias_verify;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
