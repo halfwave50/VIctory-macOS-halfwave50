@@ -18,7 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
@@ -348,6 +348,35 @@ struct Lanes {
     /// Requests into physical pages.
     pages: u64,
     since: Option<std::time::Instant>,
+    /// mac: commands keep the sequence numbers of their enqueue order while
+    /// held ([`order_on`], `VICTORY_DSTORAGE_ORDER=1`; Native-Victory-macOS
+    /// f28024f6).
+    ordered: bool,
+    /// mac: Submits that released held commands after reads queued behind
+    /// them were numbered, and the reads and status entries they released
+    /// (with [`Lanes::ordered`] these keep their place, else they go
+    /// behind the later reads).
+    overtaken: [u64; 3],
+}
+
+/// mac: whether DirectStorage commands keep the sequence numbers of their
+/// enqueue order while a queue that submitted itself holds them (from
+/// Native-Victory-macOS f28024f6, their issue #550): only with
+/// `VICTORY_DSTORAGE_ORDER=1`. Without it a held read into physical pages,
+/// and a status entry behind it, are numbered only at the title's Submit:
+/// after plain reads queued later, so held reads start after those, and a
+/// status entry waits for later reads and can report their failure.
+fn order_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DSTORAGE_ORDER").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!(
+                "VICTORY_DSTORAGE_ORDER=1: held DirectStorage reads and status entries keep their enqueue order"
+            );
+        }
+        on
+    })
 }
 
 /// A queue's requests in the scheduler.
@@ -359,12 +388,17 @@ struct Lane {
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
     /// Left out when the queue submitted itself, until the title's Submit:
-    /// reads into physical pages and the status entries behind them.
-    held: Vec<Command>,
+    /// reads into physical pages and the status entries behind them, with
+    /// the sequence numbers of their enqueue order when
+    /// [`Lanes::ordered`] (else `None`: numbered at the Submit).
+    held: Vec<(Option<u64>, Command)>,
+    /// mac: a read was numbered while this lane held a read (queued later
+    /// than it), since the last Submit that released the held ones.
+    overtaken: bool,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
-    statuses: VecDeque<(u64, Status)>,
+    reads: BTreeMap<u64, Request>,
+    statuses: BTreeMap<u64, Status>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
@@ -409,6 +443,8 @@ fn scheduler() -> Option<&'static Scheduler> {
                     bcpack: Default::default(),
                     pages: 0,
                     since: None,
+                    ordered: order_on(),
+                    overtaken: [0; 3],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -515,17 +551,17 @@ impl Lanes {
         let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
         let (_, _, id) = busy()
             .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+            .filter_map(|(&id, l)| Some((l.clock, *l.reads.keys().next()?, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let (&seq, &request) = lane.reads.first_key_value()?;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        lane.reads.pop_first();
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -584,23 +620,57 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
-        commands.append(&mut lane.unsubmitted);
-        for command in commands {
+        // mac: with `ordered` (Native-Victory-macOS f28024f6), commands are
+        // numbered in enqueue order as they leave `unsubmitted`, held ones
+        // too; without it, held ones get theirs at the Submit, after reads
+        // queued later.
+        let ordered = self.ordered;
+        let mut commands: Vec<(Option<u64>, Command)> = Vec::new();
+        if explicit {
+            if std::mem::take(&mut lane.overtaken) && !lane.held.is_empty() {
+                let reads = lane.held.iter().filter(|(_, c)| matches!(c, Command::Read(_))).count();
+                let [submits, overtaken, statuses] = &mut self.overtaken;
+                *submits += 1;
+                *overtaken += reads as u64;
+                *statuses += (lane.held.len() - reads) as u64;
+            }
+            commands = std::mem::take(&mut lane.held);
+        }
+        for command in std::mem::take(&mut lane.unsubmitted) {
+            let seq = ordered.then(|| {
+                self.next_seq += 1;
+                self.next_seq - 1
+            });
+            commands.push((seq, command));
+        }
+        for (seq, command) in commands {
             let hold = !explicit
                 && match &command {
                     Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Status(_) if ordered => lane
+                        .held
+                        .iter()
+                        .any(|(s, c)| *s < seq && matches!(c, Command::Read(_))),
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
-                lane.held.push(command);
+                lane.held.push((seq, command));
                 continue;
             }
-            let seq = self.next_seq;
-            self.next_seq += 1;
+            let seq = seq.unwrap_or_else(|| {
+                self.next_seq += 1;
+                self.next_seq - 1
+            });
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
+                Command::Read(request) => {
+                    if lane.held.iter().any(|(_, c)| matches!(c, Command::Read(_))) {
+                        lane.overtaken = true;
+                    }
+                    lane.reads.insert(seq, request);
+                }
+                Command::Status(status) => {
+                    lane.statuses.insert(seq, status);
+                }
             }
         }
         lane.flush();
@@ -615,8 +685,9 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             held: Vec::new(),
-            reads: VecDeque::new(),
-            statuses: VecDeque::new(),
+            overtaken: false,
+            reads: BTreeMap::new(),
+            statuses: BTreeMap::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
@@ -634,16 +705,24 @@ impl Lane {
 
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
-            if waiting
+        while let Some((&seq, _)) = self.statuses.first_key_value() {
+            // mac: held reads numbered before the entry (only with
+            // `Lanes::ordered`; else held reads have no number yet, and the
+            // entries behind them are held too).
+            let held_read = self
+                .held
+                .iter()
+                .find_map(|(s, c)| s.filter(|_| matches!(c, Command::Read(_))));
+            let waiting = self.reads.keys().next().copied();
+            if held_read
                 .into_iter()
+                .chain(waiting)
                 .chain(self.running.first().copied())
                 .any(|s| s < seq)
             {
                 return;
             }
-            let Some((_, status)) = self.statuses.pop_front() else {
+            let Some((_, status)) = self.statuses.pop_first() else {
                 return;
             };
             let later = self.failures.split_off(&seq);
@@ -837,8 +916,18 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
+    let before = lanes.overtaken[0];
     lanes.submit(id);
     scheduler.work.notify_all();
+    let [submits, reads, statuses] = lanes.overtaken;
+    if submits != before && submits.is_power_of_two() {
+        let order = if lanes.ordered { "1" } else { "off" };
+        let place = if lanes.ordered { "they keep their enqueue order" } else { "they go behind the later reads" };
+        tracing::info!(
+            "dstorage: {submits} Submits released held commands after later reads: reads reordered {reads}, \
+             statuses matched {statuses} (VICTORY_DSTORAGE_ORDER={order}: {place})"
+        );
+    }
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -1398,6 +1487,8 @@ mod tests {
             bcpack: Default::default(),
             pages: 0,
             since: None,
+            ordered: false,
+            overtaken: [0; 3],
         }
     }
 
@@ -1706,6 +1797,83 @@ mod tests {
         assert!(!l.lanes[&0].statuses.is_empty());
         l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    /// The sequence of Native-Victory-macOS f28024f6's test (their issue
+    /// #550): two auto-submits hold a page read and two status entries
+    /// while plain reads queued later run, one of them failing.
+    /// Reads by (sequence number, size) in start order, the two status
+    /// results, and [`Lanes::overtaken`].
+    type Outcome = (Vec<(u64, u32)>, (HRESULT, HRESULT), [u64; 3]);
+
+    fn held_auto_submits(ordered: bool) -> Outcome {
+        let mut l = lanes(STAGING);
+        l.ordered = ordered;
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(2).cast::<Instance<StatusArray>>();
+        let status = |index| {
+            add_ref_instance(array);
+            // SAFETY: an array we created.
+            unsafe { (*array).state.entries[index as usize].store(E_PENDING, Ordering::Release) };
+            Command::Status(Status { array, index })
+        };
+        let results = || (result(array.cast(), 0), result(array.cast(), 1));
+        let mut started = Vec::new();
+        // Batch 1 submits itself: a page read and status 0 are held, plain
+        // read A runs.
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(0));
+        l.submit_as(0, false);
+        let a = l.start().unwrap();
+        started.push((a.seq, a.request.destination_size));
+        l.finish(&a, Ok(()));
+        assert_eq!(result(array.cast(), 0), E_PENDING);
+        // Batch 2 submits itself before the title's Submit: plain read B
+        // runs and fails, status 1 is held, plain read C waits.
+        read(&mut l, 0, 0, 32);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(1));
+        read(&mut l, 0, 0, 64);
+        l.submit_as(0, false);
+        let b = l.start().unwrap();
+        started.push((b.seq, b.request.destination_size));
+        l.finish(&b, Err(INVALID_DATA));
+        assert_eq!(results(), (E_PENDING, E_PENDING));
+        // The title's Submit; then every read runs.
+        l.submit(0);
+        while let Some(job) = l.start() {
+            started.push((job.seq, job.request.destination_size));
+            l.finish(&job, Ok(()));
+        }
+        (started, results(), l.overtaken)
+    }
+
+    /// mac: with `VICTORY_DSTORAGE_ORDER=1` (Native-Victory-macOS
+    /// f28024f6), the held page read starts ahead of plain read C, queued
+    /// after it, and each status entry reports its own segment: status 0
+    /// `S_OK`, status 1 plain read B's failure.
+    #[test]
+    fn held_auto_submits_keep_sequence_order_status_boundaries_and_errors() {
+        let (started, results, overtaken) = held_auto_submits(true);
+        // Sequence numbers in enqueue order: page 0, A 1, status 0 2, B 3,
+        // status 1 4, C 5.
+        assert_eq!(started, [(1, 16), (3, 32), (0, 16), (5, 64)]);
+        assert_eq!(results, (S_OK, INVALID_DATA), "status 0 must not take segment 1's failure");
+        // One Submit released one read and two status entries held behind
+        // later reads.
+        assert_eq!(overtaken, [1, 1, 2]);
+    }
+
+    /// mac: without the switch (as before), the held page read and status
+    /// entries are numbered at the Submit: the page read starts after
+    /// plain read C, and status 0 reports read B's failure while status 1,
+    /// whose segment it is, reports `S_OK`. The counters see the same.
+    #[test]
+    fn held_auto_submits_go_behind_later_reads_without_the_switch() {
+        let (started, results, overtaken) = held_auto_submits(false);
+        assert_eq!(started, [(0, 16), (1, 32), (2, 64), (3, 16)]);
+        assert_eq!(results, (INVALID_DATA, S_OK));
+        assert_eq!(overtaken, [1, 1, 2]);
     }
 
     #[test]
