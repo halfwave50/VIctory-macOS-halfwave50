@@ -1544,14 +1544,33 @@ void main(uint3 id : SV_DispatchThreadID)
             &want[..],
             "a remap is seen at the next submission"
         );
-        // Unmapped: page 0 reads zero (the sink).
+        // Unmapped: page 0 reads zero (the sink), not heap page 7, which it
+        // showed until now and which still holds 0x3333's words (the title's
+        // CPU view of page 0 still shows it: only the GPU side is told). So a
+        // null mapping that did not take (upstream VIctory-macOS #653: D3DMetal
+        // ignores them) cannot pass this: the sink mapping after it must.
         unmapped(a.page(0), PAGE);
         dispatch(a.page(0), a.page(2), 3, false);
         assert!(
             a.words(2).iter().all(|&w| w == 3),
-            "an unmapped page reads zero"
+            "an unmapped page reads zero, not the heap page it showed"
         );
         assert_eq!(tile_at(a.page(0)), None);
+        // A write through the unmapped page lands on the sink, not in heap
+        // page 7; the next submission reads zero there again (the sink is
+        // zeroed before each).
+        dispatch(a.page(1), a.page(0), 9, false);
+        let old: Vec<u32> = (0..WORDS).map(|i| word(i, 0x3333)).collect();
+        assert_eq!(
+            a.words(0),
+            &old[..],
+            "a write through an unmapped page left the heap page it showed alone"
+        );
+        dispatch(a.page(0), a.page(2), 4, false);
+        assert!(
+            a.words(2).iter().all(|&w| w == 4),
+            "the sink reads zero again in the next submission"
+        );
         // Heap page 1 read through b (range B, which caches it), written
         // through a (range A), read through B again, each submission waited
         // for by polling its fence alone: fresh (probe 8: a CPU wait drops
