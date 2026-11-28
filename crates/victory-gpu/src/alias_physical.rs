@@ -809,8 +809,17 @@ fn release(hold: &Hold) {
 
 /// Before a submission's lists go to `queue`: the tile changes since the
 /// last, and the sink zeroed. On the submitting thread, with the GPU idle
-/// (`Host::run` has finished the submission before).
+/// (`Host::run` has finished the submission before). With canonical views
+/// (`=gpu`, whose piece views hold their tiles) lazily: only the changes of
+/// tiles live piece views reach, so a title map or unmap no view reaches
+/// costs the GPU nothing (the kernel's submit time grew with the tile
+/// traffic, run 10:00:44).
 pub(crate) fn flush(queue: &ID3D12CommandQueue) {
+    flush_with(queue, false);
+}
+
+/// [`flush`]; `whole`: every change, lazy or not (tests).
+fn flush_with(queue: &ID3D12CommandQueue, whole: bool) {
     if !on() {
         return;
     }
@@ -840,7 +849,12 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue) {
         return;
     }
     let started = Instant::now();
-    let flush = st.plan.flush(sink);
+    let flush = if canonical() && !whole {
+        let State { plan, piece_held, .. } = &mut *st;
+        plan.flush_tiles(sink, piece_held.keys().copied())
+    } else {
+        st.plan.flush(sink)
+    };
     let mut calls = 0;
     for (piece, ranges) in &flush.clears {
         let Some(Some(p)) = st.pieces.get(*piece) else {
@@ -1306,8 +1320,8 @@ pub fn tile_at(at: usize) -> Option<(u32, u32)> {
         .map(|t| (t.heap, t.tile))
 }
 
-/// Flushes on a queue of the host device's own (tests of `victory_hle`'s
-/// hooks, which have no submission).
+/// Flushes every change, lazy or not, on a queue of the host device's own
+/// (tests of `victory_hle`'s hooks, which have no submission).
 pub fn flush_now() -> bool {
     let Some(host) = crate::host::host() else {
         return false;
@@ -1315,7 +1329,7 @@ pub fn flush_now() -> bool {
     let Ok(rig) = Rig::new(&host.device) else {
         return false;
     };
-    flush(&rig.queue);
+    flush_with(&rig.queue, true);
     rig.wait().is_ok()
 }
 
@@ -1840,6 +1854,9 @@ void main(uint3 id : SV_DispatchThreadID)
                     list.Dispatch((WORDS / 64) as u32, 1, 1);
                 }
             };
+            // The test reads the pieces with no views over them: every
+            // change flushed, as without the lazy flush.
+            let flush = |queue: &ID3D12CommandQueue| flush_with(queue, true);
             if !polled {
                 return rig.run(flush, record).expect("the dispatch ran");
             }

@@ -452,15 +452,46 @@ impl Plan {
     pub(crate) fn flush(&mut self, sink: HeapTile) -> Flush {
         let mut out = Flush::default();
         for id in std::mem::take(&mut self.dirty) {
+            let pending = std::mem::take(&mut self.pieces[id].pending);
+            self.apply(id, pending, sink, true, &mut out);
+        }
+        out
+    }
+
+    /// mac: a lazy flush (`crate::alias_physical`, `=gpu`): only the changes
+    /// waiting for `tiles` (piece, tile), the tiles live piece views reach;
+    /// the others wait, so no tile no view reaches is mapped, remapped or
+    /// pointed at the sink. What the tiles are to show ([`Plan::current`]) is
+    /// the same either way. No sink fill ([`Never::Sink`] needs a whole
+    /// flush).
+    pub(crate) fn flush_tiles(&mut self, sink: HeapTile, tiles: impl IntoIterator<Item = (usize, u32)>) -> Flush {
+        let mut by_piece: BTreeMap<usize, BTreeMap<u32, Change>> = BTreeMap::new();
+        for (id, tile) in tiles {
+            if let Some(piece) = self.pieces.get_mut(id)
+                && let Some(change) = piece.pending.remove(&tile)
+            {
+                by_piece.entry(id).or_default().insert(tile, change);
+            }
+        }
+        let mut out = Flush::default();
+        for (id, pending) in by_piece {
+            self.apply(id, pending, sink, false, &mut out);
+        }
+        out
+    }
+
+    /// Piece `id`'s changes `pending` against what its tiles show, into
+    /// `out` (`whole`: all its changes, its first flush filling the sink).
+    fn apply(&mut self, id: usize, pending: BTreeMap<u32, Change>, sink: HeapTile, whole: bool, out: &mut Flush) {
+        {
             let never = self.never;
             let refs = &mut self.refs;
             let piece = &mut self.pieces[id];
-            let pending = std::mem::take(&mut piece.pending);
             // Tiles to change, in order: (tile, what it shows now); and the
             // tiles to null first.
             let mut set: Vec<(TileRange, u32)> = Vec::new();
             let mut clear: Vec<u32> = Vec::new();
-            let fill = piece.new && never == Never::Sink;
+            let fill = whole && piece.new && never == Never::Sink;
             let mut gap_from = 0u32;
             for (&tile, &change) in &pending {
                 if fill && tile > gap_from {
@@ -518,7 +549,9 @@ impl Plan {
                 piece.floor = Some(Now::Sink);
                 piece.now.retain(|_, now| *now != Now::Sink);
             }
-            piece.new = false;
+            if whole {
+                piece.new = false;
+            }
             // The nulls, consecutive tiles joined.
             let mut nulls: Vec<(u32, u32)> = Vec::new();
             for tile in clear {
@@ -549,7 +582,6 @@ impl Plan {
                     ranges,
                 }));
         }
-        out
     }
 }
 
@@ -693,6 +725,36 @@ mod tests {
         // Pages outside the reservations are not recorded.
         plan.map(A + 2 * GIB, PAGE, heap(30));
         assert!(at(&plan, 30).is_empty());
+    }
+
+    /// mac: a lazy flush maps only the tiles it is given; the others wait
+    /// for a later flush, and what each tile is to show stays the same.
+    #[test]
+    fn a_lazy_flush_maps_only_the_tiles_views_reach() {
+        let mut plan = Plan::new(Never::Untouched);
+        plan.reserve(A, 8 * PAGE);
+        plan.map(A, 4 * PAGE, heap(10));
+        let flush = plan.flush_tiles(SINK, [(0, 1), (0, 2), (0, 7)]);
+        assert_eq!(ranges(&flush), vec![(0, 0, vec![r(1, 2, 11, false)])], "tiles 1 and 2 only");
+        assert_eq!(flush.fresh, 2);
+        assert_eq!(plan.pending(), 2, "tiles 0 and 3 wait");
+        assert_eq!(plan.shows(0, 0), None);
+        assert_eq!(plan.current(0, 0), Some(heap(10)), "what it is to show is the same");
+        assert_eq!(plan.shows(0, 1), Some(heap(11)));
+        // An unmap of a tile no view reaches waits too: nothing to the sink.
+        plan.unmap(A + PAGE, PAGE);
+        let flush = plan.flush_tiles(SINK, [(0, 2)]);
+        assert!(flush.updates.is_empty() && flush.clears.is_empty() && flush.sunk == 0, "{flush:?}");
+        assert_eq!(plan.shows(0, 1), Some(heap(11)), "still mapped on the GPU, as last flushed");
+        assert_eq!(plan.current(0, 1), None);
+        // Once a view reaches it: nulled and on the sink.
+        let flush = plan.flush_tiles(SINK, [(0, 1)]);
+        assert_eq!(flush.clears, vec![(0, vec![(1, 1)])]);
+        assert_eq!(flush.sunk, 1);
+        // A whole flush takes the rest.
+        let flush = plan.flush(SINK);
+        assert_eq!(ranges(&flush), vec![(0, 0, vec![r(0, 1, 10, false), r(3, 1, 13, false)])]);
+        assert_eq!(plan.pending(), 0);
     }
 
     #[test]
