@@ -68,7 +68,7 @@ pub(crate) mod lines;
 /// them (`VICTORY_ASYNC_SUBMIT=1`).
 pub(crate) fn on() -> bool {
     #[cfg(test)]
-    if tests::FORCED.load(Relaxed) {
+    if tests::FORCED.load(Relaxed) && tests::ours() {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
@@ -128,7 +128,7 @@ pub(crate) fn prewarms() -> bool {
 /// submission.
 fn signals() -> bool {
     #[cfg(test)]
-    if flights::FORCED.load(Relaxed) {
+    if flights::FORCED.load(Relaxed) && tests::ours() {
         return on() && idler().is_some();
     }
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1150,6 +1150,15 @@ mod tests {
                 HOLDS_SHARED.with(|h| h.set(false));
             }
         }
+    }
+
+    /// Whether the forced switches are this thread's to see: the test that
+    /// set them (they are set only under [`Exclusive`]), a thread that works
+    /// under the submission lock (while they are set, only that test's
+    /// work), and our thread. Another test's Signals and waits go on
+    /// meanwhile as with the switches off.
+    pub(super) fn ours() -> bool {
+        OWNS_EXCLUSIVE.with(std::cell::Cell::get) || IS_IDLER.with(std::cell::Cell::get) || holds_submissions()
     }
 
     /// Exclusive access to the host submission path for tests that toggle
