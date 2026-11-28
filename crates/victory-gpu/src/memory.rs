@@ -915,14 +915,17 @@ mod tests {
         let mut marks = vec![0u32; BITMAP_WORDS];
         marks[BLOCK / 32] = 1 << (BLOCK % 32);
         assert!(has_missed(&marks, &l), "a miss as before");
-        let before = pointer_pages::take_spared();
-        pointer_pages::NULL_FREE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = pointer_pages::take_spared_here();
+        let null_free = pointer_pages::NullFreeHere::new();
         let free = has_missed(&marks, &l);
-        let noted = pointer_pages::take_spared();
+        // Another test's submission may take the shared note at any time
+        // (`note_submission`): here one always does.
+        std::thread::spawn(pointer_pages::take_spared).join().unwrap();
+        let noted = pointer_pages::take_spared_here();
         let next = BLOCK + 1;
         marks[next / 32] |= 1 << (next % 32);
         let other = has_missed(&marks, &l);
-        pointer_pages::NULL_FREE.store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(null_free);
         assert!(!free, "the null page alone");
         assert!(other, "the page after it");
         assert!(!before, "a miss counted as one notes nothing");
