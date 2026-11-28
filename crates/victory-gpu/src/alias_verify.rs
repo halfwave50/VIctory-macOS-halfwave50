@@ -29,6 +29,16 @@
 //!
 //! Lines: `alias verify: ...` every 5 s beside the physical pages line, and
 //! the first 20 differences and 10 hazards in full.
+//!
+//! The one-range rule (`crate::one_range`) sees `=gpu`'s copies: a title
+//! buffer's copy `=gpu` would make too holds its pages, and so do the window
+//! copies and views' own copies `=gpu` would make, kept here (window copies
+//! in [`WINDOWS`] as `=gpu`'s window registry holds them, views' own copies
+//! while asked for). Each hazard is also told against copy mode: the copy
+//! each binding reads here is the range copy mode gives it, so a tile copy
+//! mode reaches through one range and `=gpu` through two is a new hazard; one
+//! copy mode reaches through two already (a page at two title addresses,
+//! nested buffers' copies) is as before.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -208,7 +218,7 @@ fn count(bind: Bind, n: N, by: u64) {
 /// of section views stale at submission; title copies into view memory and
 /// their bytes; texture refreshes from view memory, their bytes, and those
 /// from pages the GPU wrote through would-be views.
-static OTHER: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+static OTHER: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 const DIFF_SECTION: usize = 0;
 const DIFF_PIECE: usize = 1;
 const HAZARDS: usize = 2;
@@ -224,6 +234,14 @@ const WITHHELD: usize = 11;
 const WITHHELD_BYTES: usize = 12;
 const LANDED: usize = 13;
 const LANDED_BYTES: usize = 14;
+/// Of [`HAZARDS`], those copy mode reaches through one range (new with
+/// `=gpu`); and heap tiles copy mode itself reaches through two ranges with
+/// a write in a submission (as before stage 2).
+const HAZARDS_NEW: usize = 15;
+const COPY_MODE_PAIRS: usize = 16;
+/// Bindings checked through views of sections, and of pieces.
+const VIA_SECTION: usize = 17;
+const VIA_PIECE: usize = 18;
 
 /// Withheld writes in aliased memory since the last line, by the aliased
 /// region (its start and length): bytes.
@@ -368,10 +386,17 @@ fn first_this_frame(bind: Bind, copy: &Shadow, address: u64, len: u64) -> bool {
     true
 }
 
+/// What `=gpu`'s windows registry would hold: a view, or (one-range rule) a
+/// window copy, which holds its pages as `=gpu`'s would.
+enum Win {
+    View(Arc<Shadow>),
+    Copy(#[allow(dead_code)] Option<crate::alias_physical::CopyHold>),
+}
+
 /// The views of windows (ranges outside title buffers) `=gpu` would have
-/// made, by (start, length), as `crate::shadow`'s windows registry holds
-/// them with `=gpu`.
-static WINDOWS: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// made, and its window copies, by (start, length), as `crate::shadow`'s
+/// windows registry holds them with `=gpu`.
+static WINDOWS: Mutex<BTreeMap<(u64, u64), Win>> = Mutex::new(BTreeMap::new());
 
 /// The view `=gpu` would bind for `[address, address + len)` of `copy`, if
 /// any.
@@ -390,36 +415,62 @@ fn view_for(copy: &Shadow, address: u64, len: u64) -> Option<Arc<Shadow>> {
             let (start, n) = copy.range();
             let view = crate::alias_physical::view(start as usize, (start + n) as usize)
                 .map(Shadow::new_view_checked);
-            let mut h = copy.verify.held();
-            if h.ask {
-                h.ask = false;
-                h.paired = false;
-                h.view = view;
+            let none = view.is_none();
+            let found = {
+                let mut h = copy.verify.held();
+                if h.ask {
+                    h.ask = false;
+                    h.paired = false;
+                    h.view = view;
+                }
+                h.view.clone()
+            };
+            // `=gpu` makes a copy now: it holds its pages (one-range rule).
+            if none && found.is_none() && !copy.holds_copy() {
+                copy.hold_copy(crate::alias_physical::copy_made(start as usize, (start + n) as usize));
             }
-            h.view.clone()
+            found
         }
         What::Window => window_view(address, address.saturating_add(len.max(1))),
     }
 }
 
-/// The window view `=gpu` would hold `[address, end)` in, made if need be.
+/// The window view `=gpu` would hold `[address, end)` in, made if need be
+/// (`None`: `=gpu` reads it from a window copy, made here as `=gpu` would).
 fn window_view(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let mut map = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    // `crate::shadow::loose`'s search: the one starting closest below.
     let found = map
         .range(..=(address, u64::MAX))
         .rev()
         .take(64)
         .find(|&(&(s, n), _)| s <= address && end <= s + n)
-        .map(|(_, v)| v.clone());
-    if found.is_some() {
+        .map(|(_, w)| match w {
+            Win::View(v) => Some(v.clone()),
+            Win::Copy(_) => None,
+        });
+    if let Some(found) = found {
         return found;
     }
-    let block = crate::shadow::loose_window_bytes() as usize;
-    let view = crate::alias_physical::window(address as usize, end as usize, block)?;
-    let (from, n) = (view.range.start as u64, view.range.len() as u64);
-    let view = Shadow::new_view_checked(view);
-    map.insert((from, n), view.clone());
-    Some(view)
+    let block = crate::shadow::loose_window_bytes();
+    if let Some(view) = crate::alias_physical::window(address as usize, end as usize, block as usize) {
+        let (from, n) = (view.range.start as u64, view.range.len() as u64);
+        let view = Shadow::new_view_checked(view);
+        map.insert((from, n), Win::View(view.clone()));
+        return Some(view);
+    }
+    // `=gpu` makes the window's copy: with the one-range rule it holds its
+    // pages, and the views over them leave (outside this lock).
+    let start = address & !(block - 1);
+    let len = end.checked_next_multiple_of(block)? - start;
+    let made = crate::alias_physical::copy_made(start as usize, (start + len) as usize);
+    let (hold, leave) = made.map_or((None, None), |(h, l)| (Some(h), Some(l)));
+    map.insert((start, len), Win::Copy(hold));
+    drop(map);
+    if let Some(leave) = leave {
+        leave.now();
+    }
+    None
 }
 
 /// The window views over `[from, to)` (of `kind`) leave, as with `=gpu`.
@@ -431,10 +482,67 @@ pub(crate) fn drop_windows(
     let mut map = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     let keys: Vec<(u64, u64)> = map
         .iter()
-        .filter(|&(&(s, n), v)| s < to && from < s + n && (kind.is_none() || v.view_kind() == kind))
+        .filter(|&(&(s, n), w)| {
+            s < to && from < s + n && matches!(w, Win::View(v) if kind.is_none() || v.view_kind() == kind)
+        })
         .map(|(&k, _)| k)
         .collect();
-    keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    keys.into_iter()
+        .filter_map(|k| match map.remove(&k) {
+            Some(Win::View(v)) => Some(v),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Tests: the windows (views and copies) over `[from, to)` go.
+#[cfg(test)]
+pub(crate) fn forget_windows(from: u64, to: u64) {
+    let gone: Vec<Win> = {
+        let mut map = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map.keys().filter(|&&(s, n)| s < to && from < s + n).copied().collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    drop(gone);
+}
+
+/// The copies of views' own bytes `=gpu` would make (`crate::shadow::for_view`
+/// off the view's elements), by (address, length, element), each holding its
+/// pages for the one-range rule, with the frame it was last asked for in:
+/// `=gpu` keeps one while heap slots and lists hold it, here while asked for
+/// within [`OWN_FRAMES`] frames.
+#[allow(clippy::type_complexity)]
+static OWN: LazyLock<Mutex<HashMap<(u64, u64, u64), (Option<crate::alias_physical::CopyHold>, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const OWN_FRAMES: u64 = 60;
+
+/// `=gpu` would give the view of `[address, address + len)` of `element`-byte
+/// elements a copy of its own: hold its pages as that copy would.
+fn own_copy(address: u64, len: u64, element: u64) {
+    let frame = crate::queue::presented();
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = own.get_mut(&(address, len, element)) {
+        entry.1 = frame;
+        return;
+    }
+    let mut gone = Vec::new();
+    if own.len() >= 4096 {
+        let old: Vec<(u64, u64, u64)> = own
+            .iter()
+            .filter(|(_, (_, at))| frame.saturating_sub(*at) >= OWN_FRAMES)
+            .map(|(&k, _)| k)
+            .collect();
+        gone.extend(old.into_iter().filter_map(|k| own.remove(&k)));
+    }
+    let made = crate::alias_physical::copy_made(address as usize, address.saturating_add(len) as usize);
+    let (hold, leave) = made.map_or((None, None), |(h, l)| (Some(h), Some(l)));
+    own.insert((address, len, element), (hold, frame));
+    drop(own);
+    // Their holds go outside the lock (`crate::alias_physical`'s).
+    drop(gone);
+    if let Some(leave) = leave {
+        leave.now();
+    }
 }
 
 /// A binding of `[address, address + len)` of `copy`, of kind `bind` (root
@@ -459,16 +567,29 @@ pub(crate) fn check(bind: Bind, copy: &Arc<Shadow>, address: u64, len: u64) {
         return;
     }
     count(bind, N::Checked, 1);
+    let id = copy_id(copy);
     let Some(view) = view_for(copy, address, len) else {
         count(bind, N::Copy, 1);
-        note_copy(bind, copy, address, len, None);
+        note_copy(bind, id, address, len, id);
         return;
     };
     let Some(place) = place(bind, &view, address) else {
         count(bind, N::Different, 1);
         return;
     };
-    compare(bind, &view, address, len, place, false);
+    compare(bind, &view, address, len, place, false, id);
+}
+
+/// The range a copy is, for telling ranges over one page apart (with the
+/// title page): copies by their address, views' own copies by the view's
+/// title address, both above the views' ids (`crate::verify_plan::Reach::
+/// range_id`: pieces below 2^61, sections from 2^63).
+fn copy_id(copy: &Shadow) -> u64 {
+    1 << 62 | std::ptr::from_ref(copy) as u64 & ((1 << 61) - 1)
+}
+
+fn own_id(address: u64) -> u64 {
+    1 << 62 | 1 << 61 | address & ((1 << 61) - 1)
 }
 
 /// A table view (through the title's tables or the heap, or a constant
@@ -491,6 +612,13 @@ pub(crate) fn table(bind: Bind, address: u64, len: u64, element: u64) {
         return;
     }
     count(bind, N::Checked, 1);
+    // The range copy mode reads it through: the copy, or the view's own copy
+    // where the view is off the copy's elements (`crate::shadow::for_view`).
+    let id = if element > 1 && !copy.offset(address).is_multiple_of(element) {
+        own_id(address)
+    } else {
+        copy_id(&copy)
+    };
     // A heap slot or a list made before a remap made the view leave reads
     // through the old one with `=gpu`.
     let stale = copy.verify.held().stale.clone();
@@ -498,25 +626,27 @@ pub(crate) fn table(bind: Bind, address: u64, len: u64, element: u64) {
         let offset = stale.offset(address);
         let (start, n) = stale.range();
         if address >= start && address + len <= start + n && offset.is_multiple_of(element.max(1)) {
-            compare(bind, &stale, address, len, offset, true);
+            compare(bind, &stale, address, len, offset, true, id);
         }
     }
     let Some(view) = view_for(&copy, address, len) else {
         count(bind, N::Copy, 1);
-        note_copy(bind, &copy, address, len, None);
+        note_copy(bind, id, address, len, id);
         return;
     };
     let offset = view.offset(address);
     if element > 1 && !offset.is_multiple_of(element) {
         // `=gpu` would give the view an exact copy of its own, beside the
-        // view over the same pages: two GPU ranges.
+        // view over the same pages: two GPU ranges, unless the one-range rule
+        // makes the view leave (the copy holds its pages, as `=gpu`'s would).
         count(bind, N::Exact, 1);
-        note_copy(bind, &copy, address, len, Some(address));
+        own_copy(address, len, element);
+        note_copy(bind, own_id(address), address, len, id);
         return;
     }
     let element = element.max(1);
     let place = offset / element * element;
-    compare(bind, &view, address, len, place, false);
+    compare(bind, &view, address, len, place, false, id);
 }
 
 /// The buffer byte a binding of kind `bind` puts title address `address` at
@@ -553,7 +683,9 @@ fn place(bind: Bind, view: &Shadow, address: u64) -> Option<u64> {
 /// kind `bind` reads it through `view`, title address `address` at buffer
 /// byte `place`; counts, logs the first differences, and notes the pages
 /// for the submission's checks.
-fn compare(bind: Bind, view: &Shadow, address: u64, len: u64, place: u64, stale: bool) {
+/// `copy`: the range copy mode reads the binding through (`copy_id`).
+#[allow(clippy::too_many_arguments)]
+fn compare(bind: Bind, view: &Shadow, address: u64, len: u64, place: u64, stale: bool, copy: u64) {
     let Some(reach) = view.reach() else {
         return;
     };
@@ -601,6 +733,7 @@ fn compare(bind: Bind, view: &Shadow, address: u64, len: u64, place: u64, stale:
                     page: s.at / PAGE,
                     tile: t,
                     range: reach.range_id(s.byte),
+                    copy: (copy, (s.at / PAGE) as u32),
                     uav,
                     view: true,
                     section: matches!(reach, Reach::Section { .. }),
@@ -616,6 +749,12 @@ fn compare(bind: Bind, view: &Shadow, address: u64, len: u64, place: u64, stale:
     }
     if !stale {
         note(notes);
+        OTHER[if matches!(reach, Reach::Section { .. }) {
+            VIA_SECTION
+        } else {
+            VIA_PIECE
+        }]
+        .fetch_add(1, Relaxed);
     }
     count(bind, N::Bytes, outcome.bytes);
     if stale {
@@ -704,7 +843,8 @@ fn log_difference(
 }
 
 /// A page a submission's binding reaches: the title page, the heap tile,
-/// the GPU range (buffer and tile in it), whether written, whether through
+/// the GPU range (buffer and tile in it), the range copy mode reaches it
+/// through (the copy and the title page), whether written, whether through
 /// a view (else a copy `=gpu` keeps), and whether through a section view
 /// (fixed tiles).
 #[derive(Clone, Copy)]
@@ -712,6 +852,7 @@ struct Note {
     page: usize,
     tile: HeapTile,
     range: (u64, u32),
+    copy: (u64, u32),
     uav: bool,
     view: bool,
     section: bool,
@@ -727,10 +868,9 @@ fn note(notes: Vec<Note>) {
     p.extend(notes.into_iter().take(room));
 }
 
-/// A binding `=gpu` leaves on a copy (`exact`: an exact copy of its own at
-/// that address): its pages in reservations, as a GPU range of their own.
-fn note_copy(bind: Bind, copy: &Shadow, address: u64, len: u64, exact: Option<u64>) {
-    let id = 1 << 62 | exact.unwrap_or(std::ptr::from_ref(copy) as u64) & ((1 << 62) - 1);
+/// A binding `=gpu` leaves on a copy, the range `id` (`copy_id`, `own_id`);
+/// copy mode reads it through range `copy`: its pages in reservations.
+fn note_copy(bind: Bind, id: u64, address: u64, len: u64, copy: u64) {
     let samples = verify_plan::samples(
         address as usize,
         address.saturating_add(len) as usize,
@@ -746,6 +886,7 @@ fn note_copy(bind: Bind, copy: &Shadow, address: u64, len: u64, exact: Option<u6
                     page: s.at / PAGE,
                     tile: t,
                     range: (id, (s.at / PAGE) as u32),
+                    copy: (copy, (s.at / PAGE) as u32),
                     uav: bind.uav(),
                     view: false,
                     section: false,
@@ -765,49 +906,87 @@ pub(crate) fn submitted(plan: &Plan) {
     if notes.is_empty() {
         return;
     }
-    // Per heap tile: the first range, whether written, whether a view
-    // reached it, and whether it was counted.
-    let mut by_tile: HashMap<HeapTile, ((u64, u32), bool, bool, bool)> = HashMap::new();
-    let mut hazards = 0u64;
+    // Per heap tile: the ranges `=gpu` reaches it through (each with a title
+    // page) and those copy mode does, whether written, whether a view
+    // reached it.
+    #[derive(Default)]
+    struct Tile {
+        ranges: Vec<((u64, u32), usize)>,
+        copies: Vec<(u64, u32)>,
+        uav: bool,
+        view: bool,
+    }
+    let mut by_tile: HashMap<HeapTile, Tile> = HashMap::new();
     let mut stale = 0u64;
     for n in &notes {
-        match by_tile.entry(n.tile) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((n.range, n.uav, n.view, false));
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                let (range, uav, view, flagged) = e.get_mut();
-                *uav |= n.uav;
-                *view |= n.view;
-                // Two copies over one page are as before stage 2: only
-                // pairs with a view count.
-                if *range != n.range && *uav && *view && !*flagged {
-                    *flagged = true;
-                    hazards += 1;
-                    if LOGGED[1].fetch_add(1, Relaxed) < 10 {
-                        tracing::warn!(
-                            "alias verify: heap {} tile {} is reached through two GPU ranges in one submission, one \
-                             of them written (title page {:#x}; ranges {:x?} and {:x?}): the second reads stale \
-                             bytes within the submission (probes 5 and 8)",
-                            n.tile.heap,
-                            n.tile.tile,
-                            n.page * PAGE,
-                            range,
-                            n.range
-                        );
-                    }
-                }
-            }
+        let t = by_tile.entry(n.tile).or_default();
+        if !t.ranges.iter().any(|&(r, _)| r == n.range) && t.ranges.len() < 8 {
+            t.ranges.push((n.range, n.page));
         }
+        if !t.copies.contains(&n.copy) && t.copies.len() < 8 {
+            t.copies.push(n.copy);
+        }
+        t.uav |= n.uav;
+        t.view |= n.view;
         if n.section && plan.current_at(n.page * PAGE) != Some(n.tile) {
             stale += 1;
+        }
+    }
+    let (mut hazards, mut new, mut pairs) = (0u64, 0u64, 0u64);
+    for (tile, t) in &by_tile {
+        if t.uav && t.copies.len() >= 2 {
+            pairs += 1;
+        }
+        // Two copies over one page are as before stage 2: only pairs with
+        // a view count.
+        if !(t.uav && t.view && t.ranges.len() >= 2) {
+            continue;
+        }
+        hazards += 1;
+        let fresh = t.copies.len() == 1;
+        if fresh {
+            new += 1;
+        }
+        if LOGGED[1].fetch_add(1, Relaxed) < 10 {
+            let [(a, pa), (b, pb)] = [t.ranges[0], t.ranges[1]];
+            tracing::warn!(
+                "alias verify: heap {} tile {} is reached through two GPU ranges in one submission, one of them \
+                 written (title pages {:#x} and {:#x}; ranges {a:x?} and {b:x?}): the second reads stale bytes within \
+                 the submission (probes 5 and 8); {}",
+                tile.heap,
+                tile.tile,
+                pa * PAGE,
+                pb * PAGE,
+                if fresh {
+                    "new against copy mode, which reaches it through one range".to_owned()
+                } else {
+                    format!("as in copy mode, which reaches it through {} ranges too", t.copies.len())
+                }
+            );
         }
     }
     if hazards > 0 {
         OTHER[HAZARDS].fetch_add(hazards, Relaxed);
         OTHER[HAZARD_SUBMISSIONS].fetch_add(1, Relaxed);
+        OTHER[HAZARDS_NEW].fetch_add(new, Relaxed);
     }
+    OTHER[COPY_MODE_PAIRS].fetch_add(pairs, Relaxed);
     OTHER[STALE_AT_SUBMIT].fetch_add(stale, Relaxed);
+    #[cfg(test)]
+    {
+        *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = [hazards, new, pairs];
+    }
+}
+
+/// Tests: the last submission's hazards, those new against copy mode, and
+/// copy mode's own two-range tiles with a write.
+#[cfg(test)]
+static SUBMITTED: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+
+/// Tests: [`SUBMITTED`], taken.
+#[cfg(test)]
+pub(crate) fn take_submitted() -> [u64; 3] {
+    std::mem::take(&mut *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// A title copy (run on the CPU at submission) into `[dst, dst + len)`.
@@ -928,9 +1107,12 @@ pub(crate) fn line(frames: f64) -> Option<String> {
         100.0 * checked as f64 / (checked + skipped) as f64
     };
     Some(format!(
-        "alias verify, per frame: {}; differences through views of sections {:.1}, of pieces {:.1}; {:.1}% of the \
+        "alias verify, per frame: {}; bindings checked through views of sections {:.1}, of pieces {:.1}; differences \
+         through views of sections {:.1}, of pieces {:.1}; {:.1}% of the \
          frame's distinct bindings checked ({:.0} over the budget); heap tiles reached through two GPU ranges with \
-         a write {:.1} (in {:.1} submissions); section views' pages remapped before their submission ran {:.1}; \
+         a write {:.1} (in {:.1} submissions; {:.1} of them new against copy mode, the rest as in copy mode); heap \
+         tiles copy mode reaches through two ranges with a write {:.1}; section views' pages remapped before their \
+         submission ran {:.1}; \
          title copies into view memory {:.1} ({:.1} KB); textures refreshed from view memory {:.1} ({:.1} MB), {:.1} \
          of them over pages the GPU wrote through would-be views; {written} such pages since the last line; \
          textures asked for changes over heap tiles written through views that tell other pages {:.1}; \
@@ -941,12 +1123,16 @@ pub(crate) fn line(frames: f64) -> Option<String> {
         } else {
             parts.join("; ")
         },
+        f(o[VIA_SECTION]),
+        f(o[VIA_PIECE]),
         f(o[DIFF_SECTION]),
         f(o[DIFF_PIECE]),
         share,
         f(skipped),
         f(o[HAZARDS]),
         f(o[HAZARD_SUBMISSIONS]),
+        f(o[HAZARDS_NEW]),
+        f(o[COPY_MODE_PAIRS]),
         f(o[STALE_AT_SUBMIT]),
         f(o[COPIES_IN]),
         f(o[COPIED_IN]) / 1e3,

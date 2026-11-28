@@ -1186,6 +1186,22 @@ pub(crate) enum AliasPhysical {
     Verify,
     /// `verify-tiles`: `verify` in `gpu-tiles`' order (no section views).
     VerifyTiles,
+    /// `gpu-sections`: `gpu`'s views of sections alone: no reserved pieces,
+    /// no tile mappings, no sink and no flush. A range that is one run of one
+    /// section's pages is a view of the placed buffer over the section's heap
+    /// (every title address of a page reaches that one GPU range); every other
+    /// range keeps its host copy, as with the switch off
+    /// (`notes/alias-physical-debug.md`, "One range per page").
+    GpuSections,
+    /// `verify-sections`: `verify` for `gpu-sections` (views of sections only,
+    /// checked, never drawn through).
+    VerifySections,
+    /// `gpu-ranges-old`: `gpu` with I4b's rule for views beside copies (a
+    /// lookup over tiles views of the other kind hold keeps a copy, and
+    /// nothing else), for comparison with the one-range rule.
+    GpuRangesOld,
+    /// `verify-ranges-old`: `verify` with I4b's rule, as `gpu-ranges-old`.
+    VerifyRangesOld,
 }
 
 impl AliasPhysical {
@@ -1199,12 +1215,17 @@ impl AliasPhysical {
                 | AliasPhysical::GpuSingle
                 | AliasPhysical::Verify
                 | AliasPhysical::VerifyTiles
+                | AliasPhysical::GpuSections
+                | AliasPhysical::VerifySections
+                | AliasPhysical::GpuRangesOld
+                | AliasPhysical::VerifyRangesOld
         )
     }
 
-    /// Whether the reservations' pieces are made and tiled from the heaps
-    /// (`crate::alias_physical`): the GPU reads the pages through them, or
-    /// (`verify`) their views are checked and not used.
+    /// Whether the GPU side is on (`crate::alias_physical`): the GPU reads the
+    /// pages through views of the sections' heaps and (but `gpu-sections`)
+    /// of the reservations' pieces, or (`verify`) their views are checked
+    /// and not used.
     pub(crate) fn gpu(self) -> bool {
         matches!(
             self,
@@ -1213,19 +1234,51 @@ impl AliasPhysical {
                 | AliasPhysical::GpuSingle
                 | AliasPhysical::Verify
                 | AliasPhysical::VerifyTiles
+                | AliasPhysical::GpuSections
+                | AliasPhysical::VerifySections
+                | AliasPhysical::GpuRangesOld
+                | AliasPhysical::VerifyRangesOld
         )
+    }
+
+    /// Whether the reservations get pieces, reserved buffers tiled from the
+    /// heaps as the title maps its pages (all GPU modes but `gpu-sections`
+    /// and `verify-sections`, which never map a tile).
+    pub(crate) fn pieces(self) -> bool {
+        self.gpu() && !matches!(self, AliasPhysical::GpuSections | AliasPhysical::VerifySections)
     }
 
     /// Whether runs of a section's pages are views of the section's heap
     /// (`=gpu`, canonical views first; `=verify` checks them).
     pub(crate) fn canonical(self) -> bool {
-        matches!(self, AliasPhysical::Gpu | AliasPhysical::Verify)
+        matches!(
+            self,
+            AliasPhysical::Gpu
+                | AliasPhysical::Verify
+                | AliasPhysical::GpuSections
+                | AliasPhysical::VerifySections
+                | AliasPhysical::GpuRangesOld
+                | AliasPhysical::VerifyRangesOld
+        )
+    }
+
+    /// Whether a heap tile is reached through one GPU range at most while
+    /// views reach it (`crate::one_range`): all canonical modes but
+    /// `gpu-ranges-old` and `verify-ranges-old`, which keep I4b's rule.
+    pub(crate) fn one_range(self) -> bool {
+        self.canonical() && !matches!(self, AliasPhysical::GpuRangesOld | AliasPhysical::VerifyRangesOld)
     }
 
     /// Whether the views are only checked, never drawn through (`verify`,
-    /// `verify-tiles`).
+    /// `verify-tiles`, `verify-sections`, `verify-ranges-old`).
     pub(crate) fn verify(self) -> bool {
-        matches!(self, AliasPhysical::Verify | AliasPhysical::VerifyTiles)
+        matches!(
+            self,
+            AliasPhysical::Verify
+                | AliasPhysical::VerifyTiles
+                | AliasPhysical::VerifySections
+                | AliasPhysical::VerifyRangesOld
+        )
     }
 
     /// The switch as written.
@@ -1239,6 +1292,10 @@ impl AliasPhysical {
             AliasPhysical::GpuSingle => "VICTORY_ALIAS_PHYSICAL=gpu-single",
             AliasPhysical::Verify => "VICTORY_ALIAS_PHYSICAL=verify",
             AliasPhysical::VerifyTiles => "VICTORY_ALIAS_PHYSICAL=verify-tiles",
+            AliasPhysical::GpuSections => "VICTORY_ALIAS_PHYSICAL=gpu-sections",
+            AliasPhysical::VerifySections => "VICTORY_ALIAS_PHYSICAL=verify-sections",
+            AliasPhysical::GpuRangesOld => "VICTORY_ALIAS_PHYSICAL=gpu-ranges-old",
+            AliasPhysical::VerifyRangesOld => "VICTORY_ALIAS_PHYSICAL=verify-ranges-old",
         }
     }
 }
@@ -1301,7 +1358,8 @@ pub(crate) fn alias_physical() -> AliasPhysical {
         let (rule, known) = alias_physical_rule(value.as_deref());
         if !known {
             tracing::warn!(
-                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu, gpu, gpu-tiles, gpu-single, verify and verify-tiles; stage 2's counts alone",
+                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu, gpu, gpu-tiles, gpu-single, gpu-sections, gpu-ranges-old, \
+                 verify, verify-tiles, verify-sections and verify-ranges-old; stage 2's counts alone",
                 value.as_deref().unwrap_or_default()
             );
         }
@@ -1325,6 +1383,10 @@ fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
         Some("gpu-single") => (AliasPhysical::GpuSingle, true),
         Some("verify") => (AliasPhysical::Verify, true),
         Some("verify-tiles") => (AliasPhysical::VerifyTiles, true),
+        Some("gpu-sections") => (AliasPhysical::GpuSections, true),
+        Some("verify-sections") => (AliasPhysical::VerifySections, true),
+        Some("gpu-ranges-old") => (AliasPhysical::GpuRangesOld, true),
+        Some("verify-ranges-old") => (AliasPhysical::VerifyRangesOld, true),
         Some(_) => (AliasPhysical::Count, false),
     }
 }
@@ -1432,6 +1494,37 @@ pub(crate) mod tests {
         let v = AliasPhysical::VerifyTiles;
         assert!(v.heaps() && v.gpu() && !v.canonical() && v.verify());
         assert!(!AliasPhysical::Cpu.verify() && !AliasPhysical::Count.verify());
+        // Sections alone: no pieces, no tiles.
+        for s in [AliasPhysical::GpuSections, AliasPhysical::VerifySections] {
+            assert!(s.heaps() && s.gpu() && s.canonical() && !s.pieces(), "{s:?}");
+        }
+        assert!(AliasPhysical::VerifySections.verify() && !AliasPhysical::GpuSections.verify());
+        for pieces in [
+            AliasPhysical::Gpu,
+            AliasPhysical::Verify,
+            AliasPhysical::GpuTiles,
+            AliasPhysical::GpuSingle,
+            AliasPhysical::VerifyTiles,
+        ] {
+            assert!(pieces.pieces(), "{pieces:?}");
+        }
+        assert!(!AliasPhysical::Cpu.pieces() && !AliasPhysical::Off.pieces());
+        // The one-range rule: every canonical mode but the old ones.
+        for one in [
+            AliasPhysical::Gpu,
+            AliasPhysical::Verify,
+            AliasPhysical::GpuSections,
+            AliasPhysical::VerifySections,
+        ] {
+            assert!(one.one_range(), "{one:?}");
+        }
+        for old in [AliasPhysical::GpuRangesOld, AliasPhysical::VerifyRangesOld] {
+            assert!(old.gpu() && old.canonical() && old.pieces() && !old.one_range(), "{old:?}");
+        }
+        assert!(AliasPhysical::VerifyRangesOld.verify() && !AliasPhysical::GpuRangesOld.verify());
+        for tiles in [AliasPhysical::GpuTiles, AliasPhysical::GpuSingle, AliasPhysical::VerifyTiles] {
+            assert!(!tiles.one_range(), "{tiles:?}");
+        }
         assert!(AliasPhysical::Cpu.heaps() && !AliasPhysical::Cpu.gpu());
         assert!(!AliasPhysical::Count.heaps() && !AliasPhysical::Off.heaps());
         for off in [None, Some(""), Some("0")] {
@@ -1451,6 +1544,10 @@ pub(crate) mod tests {
             ("gpu-single", AliasPhysical::GpuSingle),
             ("verify", AliasPhysical::Verify),
             (" verify-tiles", AliasPhysical::VerifyTiles),
+            ("gpu-sections", AliasPhysical::GpuSections),
+            ("verify-sections ", AliasPhysical::VerifySections),
+            ("gpu-ranges-old", AliasPhysical::GpuRangesOld),
+            ("verify-ranges-old", AliasPhysical::VerifyRangesOld),
         ] {
             assert_eq!(alias_physical_rule(Some(value)), (rule, true), "{value:?}");
         }

@@ -1503,10 +1503,16 @@ mod tests {
     /// mac: whether this test process runs with `VICTORY_ALIAS_PHYSICAL=cpu`
     /// (with `VICTORY_ALIAS_BUFFERS=1` and `VICTORY_COPY_ORDER=split`, which
     /// it needs): then its sections must be heap-backed, or the switch did
-    /// not take.
+    /// not take. The values whose sections get heaps (victory-gpu's
+    /// `AliasPhysical::heaps`).
     fn forced_heap() -> bool {
-        std::env::var("VICTORY_ALIAS_PHYSICAL")
-            .is_ok_and(|v| matches!(v.trim(), "cpu" | "gpu" | "gpu-tiles" | "gpu-single" | "verify" | "verify-tiles"))
+        std::env::var("VICTORY_ALIAS_PHYSICAL").is_ok_and(|v| {
+            matches!(
+                v.trim(),
+                "cpu" | "gpu" | "gpu-tiles" | "gpu-single" | "verify" | "verify-tiles"
+                    | "gpu-sections" | "verify-sections" | "gpu-ranges-old" | "verify-ranges-old"
+            )
+        })
             || cfg!(feature = "diagnostics")
                 && std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1")
     }

@@ -141,6 +141,10 @@ pub(crate) struct Plan {
     /// How many tiles show each heap tile, as flushed: a page at two or
     /// more addresses is a heap tile shown twice or more.
     refs: HashMap<HeapTile, u32>,
+    /// mac: the title page addresses showing each heap tile now (xmem's
+    /// mapping: the changes waiting over what was flushed), for the one-range
+    /// rule (`crate::alias_physical`): where a page is shown, and how often.
+    at_now: HashMap<HeapTile, Vec<usize>>,
 }
 
 impl Plan {
@@ -151,6 +155,7 @@ impl Plan {
             pieces: Vec::new(),
             dirty: BTreeSet::new(),
             refs: HashMap::new(),
+            at_now: HashMap::new(),
         }
     }
 
@@ -169,6 +174,18 @@ impl Plan {
         for s in over {
             let (l, first) = self.reservations.remove(&s).expect("listed above");
             for id in first..first + l.div_ceil(PIECE) {
+                // Its pages show nothing any more.
+                let shown: Vec<(usize, HeapTile)> = {
+                    let piece = &self.pieces[id];
+                    let tiles: BTreeSet<u32> = piece.now.keys().chain(piece.pending.keys()).copied().collect();
+                    tiles
+                        .into_iter()
+                        .filter_map(|t| self.current(id, t).map(|h| (piece.base + t as usize * PAGE, h)))
+                        .collect()
+                };
+                for (page, t) in shown {
+                    forget_at(&mut self.at_now, t, page);
+                }
                 let piece = &mut self.pieces[id];
                 piece.gone = true;
                 piece.pending.clear();
@@ -271,12 +288,29 @@ impl Plan {
                 k += 1;
                 continue;
             };
-            let piece = &mut self.pieces[id];
             let start = offset as usize / PAGE;
             // The rest of the range in this piece, at once.
-            let n = (pages - k).min(piece.tiles as usize - start);
+            let n = (pages - k).min(self.pieces[id].tiles as usize - start);
             for j in 0..n {
-                piece.pending.insert((start + j) as u32, change(k + j));
+                let tile = (start + j) as u32;
+                let new = change(k + j);
+                // The page's address moves from the heap tile it showed to
+                // the one it is to show.
+                let old = self.current(id, tile);
+                let to = match new {
+                    Change::Map(t) => Some(t),
+                    Change::Unmap => None,
+                };
+                if old != to {
+                    let page = self.pieces[id].base + tile as usize * PAGE;
+                    if let Some(old) = old {
+                        forget_at(&mut self.at_now, old, page);
+                    }
+                    if let Some(to) = to {
+                        self.at_now.entry(to).or_default().push(page);
+                    }
+                }
+                self.pieces[id].pending.insert(tile, new);
             }
             self.dirty.insert(id);
             k += n;
@@ -304,6 +338,12 @@ impl Plan {
         (first..first.saturating_add(n)).any(|t| {
             matches!(piece.now.get(&t), Some(Now::Heap(h)) if self.refs.get(h).is_some_and(|&n| n >= 2))
         })
+    }
+
+    /// mac: the title page addresses (64 KiB aligned) showing heap tile `t`
+    /// now, in no order (xmem's mapping, as [`Plan::current`]).
+    pub(crate) fn addresses(&self, t: HeapTile) -> &[usize] {
+        self.at_now.get(&t).map_or(&[], Vec::as_slice)
     }
 
     /// What tile `tile` of piece `id` is to show: its change waiting, else
@@ -412,15 +452,46 @@ impl Plan {
     pub(crate) fn flush(&mut self, sink: HeapTile) -> Flush {
         let mut out = Flush::default();
         for id in std::mem::take(&mut self.dirty) {
+            let pending = std::mem::take(&mut self.pieces[id].pending);
+            self.apply(id, pending, sink, true, &mut out);
+        }
+        out
+    }
+
+    /// mac: a lazy flush (`crate::alias_physical`, `=gpu`): only the changes
+    /// waiting for `tiles` (piece, tile), the tiles live piece views reach;
+    /// the others wait, so no tile no view reaches is mapped, remapped or
+    /// pointed at the sink. What the tiles are to show ([`Plan::current`]) is
+    /// the same either way. No sink fill ([`Never::Sink`] needs a whole
+    /// flush).
+    pub(crate) fn flush_tiles(&mut self, sink: HeapTile, tiles: impl IntoIterator<Item = (usize, u32)>) -> Flush {
+        let mut by_piece: BTreeMap<usize, BTreeMap<u32, Change>> = BTreeMap::new();
+        for (id, tile) in tiles {
+            if let Some(piece) = self.pieces.get_mut(id)
+                && let Some(change) = piece.pending.remove(&tile)
+            {
+                by_piece.entry(id).or_default().insert(tile, change);
+            }
+        }
+        let mut out = Flush::default();
+        for (id, pending) in by_piece {
+            self.apply(id, pending, sink, false, &mut out);
+        }
+        out
+    }
+
+    /// Piece `id`'s changes `pending` against what its tiles show, into
+    /// `out` (`whole`: all its changes, its first flush filling the sink).
+    fn apply(&mut self, id: usize, pending: BTreeMap<u32, Change>, sink: HeapTile, whole: bool, out: &mut Flush) {
+        {
             let never = self.never;
             let refs = &mut self.refs;
             let piece = &mut self.pieces[id];
-            let pending = std::mem::take(&mut piece.pending);
             // Tiles to change, in order: (tile, what it shows now); and the
             // tiles to null first.
             let mut set: Vec<(TileRange, u32)> = Vec::new();
             let mut clear: Vec<u32> = Vec::new();
-            let fill = piece.new && never == Never::Sink;
+            let fill = whole && piece.new && never == Never::Sink;
             let mut gap_from = 0u32;
             for (&tile, &change) in &pending {
                 if fill && tile > gap_from {
@@ -478,7 +549,9 @@ impl Plan {
                 piece.floor = Some(Now::Sink);
                 piece.now.retain(|_, now| *now != Now::Sink);
             }
-            piece.new = false;
+            if whole {
+                piece.new = false;
+            }
             // The nulls, consecutive tiles joined.
             let mut nulls: Vec<(u32, u32)> = Vec::new();
             for tile in clear {
@@ -509,7 +582,6 @@ impl Plan {
                     ranges,
                 }));
         }
-        out
     }
 }
 
@@ -522,6 +594,18 @@ pub(crate) fn heap_piece(first: u32, n: u32, per: u32) -> Option<u32> {
     }
     let j = first / per;
     (first.checked_add(n - 1)? / per == j).then_some(j)
+}
+
+/// Title page `page` no longer shows heap tile `t` (`Plan::at_now`).
+fn forget_at(at_now: &mut HashMap<HeapTile, Vec<usize>>, t: HeapTile, page: usize) {
+    if let Some(pages) = at_now.get_mut(&t) {
+        if let Some(i) = pages.iter().position(|&p| p == page) {
+            pages.swap_remove(i);
+        }
+        if pages.is_empty() {
+            at_now.remove(&t);
+        }
+    }
 }
 
 /// One tile fewer shows heap tile `t`.
@@ -592,6 +676,85 @@ mod tests {
             .iter()
             .map(|u| (u.piece, u.heap, u.ranges.clone()))
             .collect()
+    }
+
+    /// mac: the addresses each heap tile is shown at now follow maps,
+    /// remaps and unmaps before and after flushes, and a reservation made
+    /// over another takes its pages' addresses away.
+    #[test]
+    fn addresses_follow_the_mapping_now() {
+        let mut plan = Plan::new(Never::Untouched);
+        plan.reserve(A, 8 * PAGE);
+        plan.reserve(A + GIB, 4 * PAGE);
+        let at = |plan: &Plan, t: u32| {
+            let mut v = plan.addresses(heap(t)).to_vec();
+            v.sort_unstable();
+            v
+        };
+        // Heap tile 5 at pages 0 and 3 of the first reservation and page 1
+        // of the second; tile 6 at page 1.
+        plan.map(A, PAGE, heap(5));
+        plan.map(A + PAGE, PAGE, heap(6));
+        plan.map(A + 3 * PAGE, PAGE, heap(5));
+        plan.map(A + GIB + PAGE, PAGE, heap(5));
+        assert_eq!(at(&plan, 5), vec![A, A + 3 * PAGE, A + GIB + PAGE]);
+        assert_eq!(at(&plan, 6), vec![A + PAGE]);
+        plan.flush(SINK);
+        assert_eq!(at(&plan, 5).len(), 3, "a flush changes nothing");
+        // Remapped (page 3 now shows 6), mapped again over itself, unmapped.
+        plan.map(A + 3 * PAGE, PAGE, heap(6));
+        plan.map(A, PAGE, heap(5));
+        assert_eq!(at(&plan, 5), vec![A, A + GIB + PAGE]);
+        assert_eq!(at(&plan, 6), vec![A + PAGE, A + 3 * PAGE]);
+        plan.unmap(A + PAGE, PAGE);
+        assert_eq!(at(&plan, 6), vec![A + 3 * PAGE]);
+        // Two changes of one page before a flush: the last counts.
+        plan.map(A + 2 * PAGE, PAGE, heap(7));
+        plan.map(A + 2 * PAGE, PAGE, heap(8));
+        assert!(at(&plan, 7).is_empty());
+        assert_eq!(at(&plan, 8), vec![A + 2 * PAGE]);
+        plan.flush(SINK);
+        assert_eq!(at(&plan, 8), vec![A + 2 * PAGE]);
+        // A run of pages over consecutive heap tiles.
+        plan.map(A + 4 * PAGE, 3 * PAGE, heap(20));
+        assert_eq!(at(&plan, 21), vec![A + 5 * PAGE]);
+        // The first reservation is made over again: its pages show nothing.
+        plan.reserve(A, 8 * PAGE);
+        assert_eq!(at(&plan, 5), vec![A + GIB + PAGE]);
+        assert!(at(&plan, 6).is_empty() && at(&plan, 8).is_empty() && at(&plan, 21).is_empty());
+        // Pages outside the reservations are not recorded.
+        plan.map(A + 2 * GIB, PAGE, heap(30));
+        assert!(at(&plan, 30).is_empty());
+    }
+
+    /// mac: a lazy flush maps only the tiles it is given; the others wait
+    /// for a later flush, and what each tile is to show stays the same.
+    #[test]
+    fn a_lazy_flush_maps_only_the_tiles_views_reach() {
+        let mut plan = Plan::new(Never::Untouched);
+        plan.reserve(A, 8 * PAGE);
+        plan.map(A, 4 * PAGE, heap(10));
+        let flush = plan.flush_tiles(SINK, [(0, 1), (0, 2), (0, 7)]);
+        assert_eq!(ranges(&flush), vec![(0, 0, vec![r(1, 2, 11, false)])], "tiles 1 and 2 only");
+        assert_eq!(flush.fresh, 2);
+        assert_eq!(plan.pending(), 2, "tiles 0 and 3 wait");
+        assert_eq!(plan.shows(0, 0), None);
+        assert_eq!(plan.current(0, 0), Some(heap(10)), "what it is to show is the same");
+        assert_eq!(plan.shows(0, 1), Some(heap(11)));
+        // An unmap of a tile no view reaches waits too: nothing to the sink.
+        plan.unmap(A + PAGE, PAGE);
+        let flush = plan.flush_tiles(SINK, [(0, 2)]);
+        assert!(flush.updates.is_empty() && flush.clears.is_empty() && flush.sunk == 0, "{flush:?}");
+        assert_eq!(plan.shows(0, 1), Some(heap(11)), "still mapped on the GPU, as last flushed");
+        assert_eq!(plan.current(0, 1), None);
+        // Once a view reaches it: nulled and on the sink.
+        let flush = plan.flush_tiles(SINK, [(0, 1)]);
+        assert_eq!(flush.clears, vec![(0, vec![(1, 1)])]);
+        assert_eq!(flush.sunk, 1);
+        // A whole flush takes the rest.
+        let flush = plan.flush(SINK);
+        assert_eq!(ranges(&flush), vec![(0, 0, vec![r(0, 1, 10, false), r(3, 1, 13, false)])]);
+        assert_eq!(plan.pending(), 0);
     }
 
     #[test]
