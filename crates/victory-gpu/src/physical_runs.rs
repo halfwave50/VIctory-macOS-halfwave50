@@ -143,9 +143,9 @@ pub fn counting() -> bool {
     crate::mac_switches::alias_physical() != crate::mac_switches::AliasPhysical::Off
 }
 
-/// 4 GiB: the largest piece of a reservation one reserved buffer covers in
-/// stage 2 (root views and clamp batches take 32-bit offsets).
-pub(crate) const PIECE: usize = 1 << 32;
+/// The largest piece of a reservation one reserved buffer covers in stage 2
+/// (`crate::tile_plan::PIECE`: 4 GiB less one tile).
+pub(crate) const PIECE: usize = crate::tile_plan::PIECE;
 
 /// What [`STAGE2`] holds.
 #[derive(Clone, Copy)]
@@ -331,11 +331,11 @@ struct Reservations {
     n: usize,
     bytes: usize,
     largest: usize,
-    /// Over 4 GiB: more than one piece.
+    /// Over 4 GiB.
     over: usize,
     /// Wholly below 4 GiB (32-bit memory).
     low: usize,
-    /// Pieces of at most 4 GiB, from each reservation's start.
+    /// Pieces of at most 4 GiB less a tile, from each reservation's start.
     pieces: usize,
 }
 
@@ -345,7 +345,7 @@ fn reservations(all: &[(usize, usize)]) -> Reservations {
         r.n += 1;
         r.bytes += len;
         r.largest = r.largest.max(len);
-        r.over += usize::from(len > PIECE);
+        r.over += usize::from(len > 1 << 32);
         r.low += usize::from(at.saturating_add(len) <= 1 << 32);
         r.pieces += len.div_ceil(PIECE);
     }
@@ -372,7 +372,7 @@ fn stage2_line(
          {unmapped:.1} unmapped, {again:.1} mapped again over themselves; since the start {} fresh, {} remapped, {} \
          unmapped; now {mapped} page addresses mapped in {views} views, {twice} pages at two or more addresses ({extra} \
          addresses past the first); {} placeholder reservations {:.2} GB (largest {} MB, {} over 4 GiB, {} below 4 GiB, \
-         {} pieces of at most 4 GiB); {sections} sections {:.2} GB",
+         {} pieces below 4 GiB); {sections} sections {:.2} GB",
         total[S::Fresh as usize],
         total[S::Remapped as usize],
         total[S::Unmapped as usize],
@@ -534,7 +534,8 @@ mod tests {
                 largest: 9 * GIB,
                 over: 1,
                 low: 1,
-                pieces: 6,
+                // 4 GiB is two pieces of at most 4 GiB less a tile.
+                pieces: 7,
             }
         );
         // A reservation ending at 4 GiB is 32-bit memory; one past it is not.
@@ -560,7 +561,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("now 900 page addresses mapped in 12 views, 3 pages at two or more addresses (4 addresses past the first)"), "{line}");
-        assert!(line.contains("1 placeholder reservations 5.37 GB (largest 5120 MB, 1 over 4 GiB, 0 below 4 GiB, 2 pieces of at most 4 GiB)"), "{line}");
+        assert!(line.contains("1 placeholder reservations 5.37 GB (largest 5120 MB, 1 over 4 GiB, 0 below 4 GiB, 2 pieces below 4 GiB)"), "{line}");
         assert!(line.ends_with("; 1 sections 6.55 GB"), "{line}");
         // No frames (a flip of `VICTORY_AB` can end a window early): per frame as one.
         assert!(

@@ -3,8 +3,10 @@
 //! mappings of physical pages become tile mappings of reserved buffers.
 //!
 //! Each placeholder reservation (`xmem`'s 64 KiB-page reservations) is covered
-//! from its start by pieces of at most 4 GiB, one reserved buffer each: root
-//! views and clamp batches take 32-bit offsets. Tile `t` of a piece is the
+//! from its start by pieces of at most 4 GiB less one tile, one reserved
+//! buffer each: descriptor-table views of a buffer of exactly 4 or 8 GiB read
+//! zeros (probe 6, `notes/tile-probe.md`), and root views and clamp batches
+//! take 32-bit offsets. Tile `t` of a piece is the
 //! page address `piece base + t * 64 KiB`. `xmem` tells each view it maps
 //! (a title range showing consecutive tiles of one heap: a section's pages)
 //! and each it unmaps, after its CPU remap; the last change of a tile before
@@ -31,8 +33,9 @@ use std::ops::Range;
 
 /// The 64 KiB page physical pages come in, and a D3D12 tile.
 pub(crate) const PAGE: usize = 64 << 10;
-/// The largest piece one reserved buffer covers.
-pub(crate) const PIECE: usize = 1 << 32;
+/// The largest piece one reserved buffer covers: 4 GiB less one tile (a
+/// table view of a buffer of 4 GiB or 8 GiB reads zeros; probe 6).
+pub(crate) const PIECE: usize = (1 << 32) - PAGE;
 
 /// A tile of a heap: the heap (one per physical section) and the tile's
 /// number in it (a section's page index, or its sink's).
@@ -413,26 +416,33 @@ mod tests {
                 dropped: vec![]
             }
         );
-        assert_eq!(plan.piece(0), Some(A..A + 4 * GIB));
-        assert_eq!(plan.piece(1), Some(A + 4 * GIB..A + 8 * GIB));
-        assert_eq!(plan.piece(2), Some(A + 8 * GIB..A + 9 * GIB));
-        assert_eq!(plan.pieces[0].tiles, 65_536);
-        assert_eq!(plan.pieces[2].tiles, 16_384);
-        // Exactly 4 GiB is one piece; the 174 MiB heap below 4 GiB one too.
-        assert_eq!(plan.reserve(A + 16 * GIB, 4 * GIB).pieces, 3..4);
-        assert_eq!(plan.reserve(0x1084_0000, 0xae0_0000).pieces, 4..5);
+        // Pieces of 4 GiB less one tile: a table view of a buffer of exactly
+        // 4 GiB reads zeros (probe 6).
+        assert_eq!(PIECE, (4 << 30) - (64 << 10));
+        assert_eq!(plan.piece(0), Some(A..A + PIECE));
+        assert_eq!(plan.piece(1), Some(A + PIECE..A + 2 * PIECE));
+        assert_eq!(plan.piece(2), Some(A + 2 * PIECE..A + 9 * GIB));
+        assert_eq!(plan.pieces[0].tiles, 65_535);
+        assert_eq!(plan.pieces[2].tiles, 16_386);
+        // Exactly 4 GiB is two pieces, 4 GiB less a tile one; the 174 MiB
+        // heap below 4 GiB one too. The game's 24 GiB reservations are 7.
+        assert_eq!(plan.reserve(A + 16 * GIB, 4 * GIB).pieces, 3..5);
+        assert_eq!(plan.reserve(A + 24 * GIB, PIECE).pieces, 5..6);
+        assert_eq!(plan.reserve(0x1084_0000, 0xae0_0000).pieces, 6..7);
+        assert_eq!(plan.reserve(A + 32 * GIB, 24 * GIB).pieces, 7..14);
+        assert!((0..14).all(|id| plan.piece(id).is_some_and(|r| r.len() <= PIECE)));
         // Where a range lies: the piece, and its offset there (32 bits).
         assert_eq!(plan.locate(A, A + 1), Some((0, 0)));
         assert_eq!(
-            plan.locate(A + 4 * GIB - 8, A + 4 * GIB),
-            Some((0, (4 * GIB - 8) as u32))
+            plan.locate(A + PIECE - 8, A + PIECE),
+            Some((0, (PIECE - 8) as u32))
         );
-        assert_eq!(plan.locate(A + 4 * GIB, A + 4 * GIB + 8), Some((1, 0)));
+        assert_eq!(plan.locate(A + PIECE, A + PIECE + 8), Some((1, 0)));
         assert_eq!(
             plan.locate(A + 9 * GIB - 1, A + 9 * GIB),
-            Some((2, (GIB - 1) as u32))
+            Some((2, (9 * GIB - 1 - 2 * PIECE) as u32))
         );
-        assert_eq!(plan.locate(0x1084_0000 + 64, 0x1084_0100), Some((4, 64)));
+        assert_eq!(plan.locate(0x1084_0000 + 64, 0x1084_0100), Some((6, 64)));
         // Past the end, before the start, empty.
         assert_eq!(plan.locate(A + 9 * GIB, A + 9 * GIB + 1), None);
         assert_eq!(plan.locate(A - 1, A + 1), None);
@@ -443,17 +453,17 @@ mod tests {
     fn a_range_straddling_two_pieces_is_split() {
         let mut plan = Plan::new(Never::Untouched);
         plan.reserve(A, 5 * GIB);
-        // A view's lookup across the 4 GiB line finds no one piece (a copy).
-        assert_eq!(plan.locate(A + 4 * GIB - 8, A + 4 * GIB + 8), None);
+        // A view's lookup across the pieces' line finds no one piece (a copy).
+        assert_eq!(plan.locate(A + PIECE - 8, A + PIECE + 8), None);
         assert_eq!(plan.locate(A, A + 5 * GIB), None);
         // A view mapped across it: the last two tiles of piece 0 and the first
         // two of piece 1, heap tiles 10 to 13 in order.
-        assert_eq!(plan.map(A + 4 * GIB - 2 * PAGE, 4 * PAGE, heap(10)), 0);
+        assert_eq!(plan.map(A + PIECE - 2 * PAGE, 4 * PAGE, heap(10)), 0);
         let flush = plan.flush(SINK);
         assert_eq!(
             ranges(&flush),
             vec![
-                (0, 0, vec![r(65_534, 2, 10, false)]),
+                (0, 0, vec![r(65_533, 2, 10, false)]),
                 (1, 0, vec![r(0, 2, 12, false)])
             ]
         );
@@ -544,12 +554,12 @@ mod tests {
         assert_eq!(ranges(&flush), vec![(0, 0, vec![r(0, 1, 9, false)])]);
         assert_eq!((flush.fresh, flush.remapped, flush.sunk), (0, 1, 0));
         // A whole piece with no change at its first flush: one range.
-        plan.reserve(A + GIB, 4 * GIB);
+        plan.reserve(A + GIB, PIECE);
         plan.unmap(A + GIB, PAGE);
         let flush = plan.flush(SINK);
         assert_eq!(
             ranges(&flush),
-            vec![(1, 0, vec![r(0, 65_536, SINK.tile, true)])]
+            vec![(1, 0, vec![r(0, 65_535, SINK.tile, true)])]
         );
     }
 
