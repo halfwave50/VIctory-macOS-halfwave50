@@ -250,7 +250,7 @@ pub(crate) fn words(bytes: &[u8]) -> [u32; 4] {
 /// tiles of its section buffer: the buffer's first tile (`tile0`) is the
 /// heap piece's, `j * per`.
 pub(crate) fn section_tile0(first: u32, per: u32) -> u32 {
-    if per == 0 { 0 } else { first / per * per }
+    first.checked_div(per).map_or(0, |j| j * per)
 }
 
 /// Pages `[from, to)` reaches, for counting ranges over one page.
