@@ -309,6 +309,7 @@ impl Lower<'_> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
+        let in_view = off;
         if !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
@@ -329,6 +330,14 @@ impl Lower<'_> {
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        // Mac (`Mac::code_table_loads`): a descriptor built around the
+        // code's table (`code_table`).
+        if let Source::Built { address, words: [n, _], .. } = src
+            && address.param == CODE
+            && self.code_table_load()
+        {
+            return self.code_buffer_load(inst, (off, in_view), *n, index.is_some(), guard);
         }
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an

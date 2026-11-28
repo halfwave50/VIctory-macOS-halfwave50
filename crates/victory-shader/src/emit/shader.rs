@@ -68,7 +68,11 @@ pub const ATOMIC_LOCK_ROUNDS: u32 = 4;
 /// lock: at 2^16 tries, 2,048 groups adding into one texel lost adds on an
 /// M5 Pro (2 of 100 runs in turns, 1 of 40 in rounds), as 8 groups did on
 /// an M2 Max (#240), and at 2^22 none did in 100 runs of each. macOS does
-/// not end a compute dispatch for running long, so the wait costs time only.
+/// not end a compute dispatch for running long when the GPU is otherwise
+/// free, but it can end a compute command buffer of about 500 ms when
+/// WindowServer needs the GPU (an M1 Pro's trace, halfwave50 issue #7):
+/// then the locks its shader held stay taken unless the host frees them
+/// (`VICTORY_FREE_LOCKS=1`, `victory-gpu` `host/free_locks.rs`).
 pub const ATOMIC_LOCK_SPINS: u32 = 1 << 22;
 /// The same in the other stages, whose draws macOS ends when their pixels
 /// run about 50 ms (`docs/macos.md`, "Metal ends long draws"). An ended draw

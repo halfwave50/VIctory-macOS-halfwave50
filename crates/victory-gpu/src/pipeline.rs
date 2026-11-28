@@ -238,7 +238,9 @@ impl Shader {
                     {
                         *container = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
                     }
+                    let _ = victory_shader::emit::code_table_loads();
                     let done = translate(&container, self.options);
+                    note_code_table_loads(&self.hash, &done);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
                     let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
@@ -300,6 +302,28 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+/// Mac (`VICTORY_CODE_TABLE_LOADS`): a program that loads from its own
+/// constant table through a buffer descriptor is named once, when it is
+/// translated (not when its translation comes from the cache): without the
+/// switch such a load is a missing value (LakshanSivakumar/Native-Victory-macOS
+/// 578eb743, a display LUT of one value).
+#[cfg(windows)]
+fn note_code_table_loads(
+    hash: &impl std::fmt::Display,
+    done: &(Result<Translated, String>, bool),
+) {
+    let loads = victory_shader::emit::code_table_loads();
+    if loads > 0 {
+        tracing::info!(
+            hash = %hash,
+            loads,
+            read = crate::mac_switches::code_table_loads(),
+            translated = done.0.is_ok(),
+            "a buffer load through a descriptor around the code's constant table (VICTORY_CODE_TABLE_LOADS=1 reads it)"
+        );
     }
 }
 

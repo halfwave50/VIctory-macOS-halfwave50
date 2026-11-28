@@ -2042,3 +2042,78 @@ fn a_scalar_load_wrapping_past_32_bits_is_read_a_dword_a_call() {
     let wide = scalar_load_raw_loads(4, -16, true);
     assert_eq!(wide, [(Some(0xffff_fff0), Some(0xF))]);
 }
+
+/// Mac (`Mac::cross_page_reads`, VIctory-macOS #595): a scalar load of four
+/// dwords from title memory (a pointer in root constants) gains the next
+/// page's lookup (in a block only lanes whose read crosses run)
+/// (its level-1 block and its entry, two loads) and a one-dword load
+/// through that page's view for each of the four dwords (all four are
+/// stored, so none is dropped as unused); off, the lowering is as before.
+#[test]
+fn a_title_memory_read_looks_up_the_next_page_only_with_the_setting() {
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0: the table at s4
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0: the UAV
+        0xF408_0300,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[0:1], 0: title memory
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:0
+        0x7E02_020D, // v_mov_b32 v1, s13
+        0xE070_0004,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:4
+        0x7E02_020E, // v_mov_b32 v1, s14
+        0xE070_0008,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:8
+        0x7E02_020F, // v_mov_b32 v1, s15
+        0xE070_000C,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:12
+        S_ENDPGM,
+    ];
+    let layout = || {
+        vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ]
+    };
+    let used = || {
+        vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }]
+    };
+    let lowered = |cross_page_reads| {
+        let mac = super::Mac {
+            cross_page_reads,
+            ..Default::default()
+        };
+        lower_mac(&words, layout(), used(), false, mac).expect("lower")
+    };
+    let (off, on) = (lowered(false), lowered(true));
+    assert!(off.memory && on.memory);
+    let entries = |l: &Lowered| l.raw_load_args.iter().filter(|a| a.1 == Some(3)).count();
+    assert_eq!(entries(&on), entries(&off) + 1, "the next page's entry: {:?}", on.raw_load_args);
+    assert_eq!(on.raw_load_args.len(), off.raw_load_args.len() + 2 + 4, "{:?}", on.raw_load_args);
+}

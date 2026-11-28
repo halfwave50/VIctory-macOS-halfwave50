@@ -685,11 +685,19 @@ fn translate(
                         lds_rounds: checks.lds_rounds,
                         halves_whole_wave: checks.whole_wave,
                         descriptor_as_data: victory_gpu::shader_cache::descriptor_as_data(),
+                        code_table_loads: victory_gpu::shader_cache::code_table_loads(),
                         ..Default::default()
                     };
-                    let _ = emit::uav_size_queries();
+                    let _ = (emit::uav_size_queries(), emit::code_table_loads());
                     let emitted = emit::emit_with(&container, &p, &program, &s, &i, &r, marks);
                     let sizes = emit::uav_size_queries();
+                    if t.list && emit::code_table_loads() > 0 {
+                        t.lines.push(format!(
+                            "{}  buffer loads of the code's constant table ({})",
+                            label(),
+                            if marks.code_table_loads { "read" } else { "missing values" }
+                        ));
+                    }
                     match emitted {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;

@@ -2198,8 +2198,21 @@ fn locked_atomics64(
     words: &[u32],
     rounds: bool,
     umax: bool,
+    size: (u32, u32),
+    groups: u32,
+) -> Option<(Vec<u64>, Vec<u32>, &'static str, std::time::Duration)> {
+    locked_atomics64_holding(words, rounds, umax, size, groups, None)
+}
+
+/// mac: [`locked_atomics64`] with the lock buffer holding `locks` (its
+/// [`super::VIEW_WRITES_BYTES`] / 4 dwords) instead of zeros.
+fn locked_atomics64_holding(
+    words: &[u32],
+    rounds: bool,
+    umax: bool,
     (width, height): (u32, u32),
     groups: u32,
+    locks: Option<Vec<u32>>,
 ) -> Option<(Vec<u64>, Vec<u32>, &'static str, std::time::Duration)> {
     let shader = lower_cs32_with(words, &[(4, ResourceType::Uav, 0, 8)], true, true, rounds, umax);
     let (host, label) = [("hardware", false), ("warp", true)]
@@ -2218,7 +2231,13 @@ fn locked_atomics64(
                 data: vec![super::VIEW_MARK_NONE, 0],
             },
         ),
-        (2, Root::Uav(super::VIEW_WRITES_BYTES / 4)),
+        (
+            2,
+            match locks {
+                Some(locks) => Root::UavHolding(locks),
+                None => Root::Uav(super::VIEW_WRITES_BYTES / 4),
+            },
+        ),
     ];
     let start = std::time::Instant::now();
     let mut out = host
@@ -2546,6 +2565,86 @@ fn adds64_apply_once(words: &[u32], groups: u64, rounds: bool) -> bool {
     );
     assert_eq!(gave_up, 0, "{label}: lanes that gave up their lock");
     true
+}
+
+/// mac (halfwave50 issue #7): every lock word left taken, as a shader the
+/// host GPU ended while it held them leaves them, and lanes `0..n` of one
+/// group each add `0xFFFF_FFFF` into their own texel (l, 0). Each waits out
+/// [`super::ATOMIC_LOCK_SPINS`], gives up and adds without the lock: the
+/// adds apply, the give-up count is `n`, and the locks stay taken (only the
+/// host frees them, `VICTORY_FREE_LOCKS`). Prints how long the wait took
+/// against the same run with free locks, so that the bound can be set
+/// against the ~500 ms after which macOS may end a compute command buffer.
+/// 32 lanes run only if one lane's wait times 32 stays under 1 s (in turns
+/// a wave's lanes wait one after another). Run with `--ignored --nocapture`
+/// on a Mac.
+#[test]
+#[ignore = "a timing, for D3DMetal (halfwave50 #7)"]
+fn a_lock_left_taken_is_waited_out_and_counted() {
+    let v0 = vgpr(0);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dwords = (super::VIEW_WRITES_BYTES / 4) as usize;
+    let first = (super::ATOMIC_LOCKS_AT / 4) as usize;
+    let lock_range = first..first + super::ATOMIC_LOCKS as usize;
+    let mut taken = vec![0u32; dwords];
+    taken[lock_range.clone()].fill(1);
+    let mut one_lane = None;
+    for n in [1u32, 32] {
+        if let Some(wait) = one_lane
+            && wait * 32 > std::time::Duration::from_secs(1)
+        {
+            eprintln!("one lane waited {wait:.1?}: 32 lanes not run");
+            break;
+        }
+        let mut words = atomics64_prologue();
+        words.extend([
+            // v_cmpx_gt_u32 exec, n, v0: lanes 0..n.
+            0x7C00_0000 | 0xD4 << 17 | (v0 as u32 & 0xFF) << 9 | (128 + n),
+            vop1(0x001, 1, 255), // v_mov_b32 v1, 0xFFFF_FFFF: the low dword
+            u32::MAX,
+            vop1(0x001, 2, 128), // v_mov_b32 v2, 0: the high dword
+            vop1(0x001, 3, v0),  // v_mov_b32 v3, v0: x
+            vop1(0x001, 4, 128), // v_mov_b32 v4, 0: y
+        ]);
+        words.extend(image_atomic(0x11, 1, 3, 8, 3, false));
+        words.push(S_ENDPGM);
+        let want: Vec<u64> = (0..32).map(|l| if l < n { u64::from(u32::MAX) } else { 0 }).collect();
+        for rounds in [false, true] {
+            let form = if rounds { "rounds" } else { "turns" };
+            let mut took = [std::time::Duration::ZERO; 2];
+            for (i, locks) in [None, Some(taken.clone())].into_iter().enumerate() {
+                let held = locks.is_some();
+                // A second, warm run is the one timed.
+                for _ in 0..2 {
+                    let Some((got, out, label, t)) =
+                        locked_atomics64_holding(&words, rounds, false, (32, 1), 1, locks.clone())
+                    else {
+                        eprintln!("no SM 6.6 device; skipped");
+                        return;
+                    };
+                    let label = format!("{label}, {form}, {n} lanes, locks {}", if held { "taken" } else { "free" });
+                    assert_eq!(got, want, "{label}: the adds");
+                    let gave_up = out[dwords - 1];
+                    assert_eq!(gave_up, if held { n } else { 0 }, "{label}: lanes that gave up");
+                    let left = out[lock_range.clone()].iter().filter(|&&w| w != 0).count();
+                    let all = super::ATOMIC_LOCKS as usize;
+                    assert_eq!(left, if held { all } else { 0 }, "{label}: lock words taken after");
+                    took[i] = t;
+                }
+            }
+            let wait = took[1].saturating_sub(took[0]);
+            if n == 1 && !rounds {
+                one_lane = Some(wait);
+            }
+            eprintln!(
+                "{form}, {n} lanes: locks free {:.1?}, taken {:.1?}: {wait:.1?} waiting out {} tries ({:.1} ns a try a lane)",
+                took[0],
+                took[1],
+                super::ATOMIC_LOCK_SPINS,
+                wait.as_secs_f64() * 1e9 / f64::from(super::ATOMIC_LOCK_SPINS) / f64::from(n)
+            );
+        }
+    }
 }
 
 /// Lanes of compute and mesh programs wait longer for a held lock than
