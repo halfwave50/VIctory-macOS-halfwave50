@@ -4434,6 +4434,35 @@ pub(crate) fn copy_order_parts(
 /// ([`Batch::title_copied`]) only what it writes. What the title's threads
 /// write meanwhile is for later submissions (on the console it would race
 /// the GPU).
+/// mac: a hash for keys that are addresses (`Batch`'s copies, keyed by
+/// their `Arc`'s address). The standard map hashes with SipHash, made to
+/// resist chosen keys, which costs more than the lookup here: the profile
+/// of 27 November (prison cell) put 4.4 ms a frame in `hash_one::<&usize>`
+/// on the submitting thread, as `flush_work` looks a copy up for each of
+/// ~23,000 ranges. One multiply spreads an address's bits to the high bits
+/// the map's table uses; the keys come from our own allocations.
+#[derive(Default, Clone, Copy)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// A map keyed by addresses, with [`AddressHasher`].
+type AddressMap<V> = std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<AddressHasher>>;
+
 #[derive(Default)]
 struct Batch {
     /// The ranges still to bring up to date, by copy.
@@ -4442,12 +4471,11 @@ struct Batch {
     /// (`unwaited::flights`; `Shadow::update_early`).
     early: bool,
     /// Where each copy's refreshes are in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
+    pending: AddressMap<usize>,
     /// The ranges of each copy brought up to date since the last write that
     /// can have changed them, by copy (held, so that its address names no
     /// other).
-    current: std::collections::HashMap<
-        usize,
+    current: AddressMap<
         (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
     >,
     /// Totals and the largest ranges refreshed by this submission, for a
@@ -4464,7 +4492,7 @@ struct Batch {
     extents: victory_formats::extents::Extents,
     /// Aliased memory asked for (`crate::alias`), by copy: never copied,
     /// counted once per submission for the frame line.
-    zero_copy: std::collections::HashMap<usize, crate::ranges::Ranges>,
+    zero_copy: AddressMap<crate::ranges::Ranges>,
     /// Host copies refreshed with bytes copied, and those bytes (counted with
     /// `zero_copy`).
     copied: (usize, usize),
