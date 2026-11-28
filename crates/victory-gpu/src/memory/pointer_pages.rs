@@ -82,7 +82,7 @@ fn level() -> u8 {
 /// ([`note_spared`]).
 pub(crate) fn null_page_free() -> bool {
     #[cfg(test)]
-    if NULL_FREE.load(Ordering::Relaxed) {
+    if NULL_FREE_HERE.with(std::cell::Cell::get) {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
@@ -116,6 +116,8 @@ pub(crate) fn note_null_read() {
 
 /// A miss check let a null-page read pass (`super::has_missed`).
 pub(crate) fn note_spared_check() {
+    #[cfg(test)]
+    SPARED_HERE.with(|noted| noted.set(true));
     SPARED.store(true, Ordering::Relaxed);
 }
 
@@ -237,9 +239,43 @@ pub(crate) fn is_null_page(blocks: &[usize], entry: usize, block_len: usize) -> 
     block != 0 && blocks.get(block) == Some(&0) && entry % block_len == 0
 }
 
-/// Tests: [`null_page_free`] whatever the variable says.
 #[cfg(test)]
-pub(crate) static NULL_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// [`null_page_free`] holds on this thread ([`NullFreeHere`]).
+    static NULL_FREE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Whether a miss check of this thread let a null-page read pass since
+    /// its last [`take_spared_here`].
+    static SPARED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: while it lives, [`null_page_free`] holds on this thread, whatever
+/// the variables say (other threads' tests keep the default).
+#[cfg(test)]
+pub(crate) struct NullFreeHere;
+
+#[cfg(test)]
+impl NullFreeHere {
+    pub(crate) fn new() -> Self {
+        NULL_FREE_HERE.with(|on| on.set(true));
+        NullFreeHere
+    }
+}
+
+#[cfg(test)]
+impl Drop for NullFreeHere {
+    fn drop(&mut self) {
+        NULL_FREE_HERE.with(|on| on.set(false));
+    }
+}
+
+/// Tests: whether a miss check of this thread let a null-page read pass
+/// since its last call. [`take_spared`] tells of every thread's checks, and
+/// other tests' submissions call it at any time (`super::note_submission`).
+#[cfg(test)]
+pub(crate) fn take_spared_here() -> bool {
+    SPARED_HERE.with(std::cell::Cell::take)
+}
 
 /// Tests: [`on`] whatever the variable says.
 #[cfg(test)]
