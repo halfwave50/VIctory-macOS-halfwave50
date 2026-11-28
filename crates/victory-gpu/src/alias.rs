@@ -850,12 +850,19 @@ mod tests {
     }
 
     impl Drop for AliasedAlloc {
+        /// The alias goes, then the copies this thread's lookups keep (the
+        /// alias's among them, with its tracker), then the memory, unless the
+        /// guards still name it ([`crate::watch::tests::free`]). Freed with
+        /// the alias's tracker still in the lookup cache, the pages stayed
+        /// guarded or held until the test's thread ended, and a test given
+        /// the same addresses meanwhile had its guard skipped or opened: its
+        /// writes went unseen.
         fn drop(&mut self) {
             if self.aliased {
                 unalias_region(self.ptr as usize);
             }
-            // SAFETY: `self.ptr` was allocated by `VirtualAlloc`.
-            unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+            crate::shadow::tests::forget_lookups();
+            crate::watch::tests::free(self.ptr as usize);
         }
     }
 
@@ -1365,9 +1372,13 @@ mod tests {
         assert!(shadow.is_aliased());
         assert!(unalias_region(ptr as usize));
         assert!(crate::shadow::find(ptr as u64, len as u64).is_none_or(|s| !s.is_aliased()));
+        // The copy goes before the memory: ours, and the one the lookups
+        // keep (see `AliasedAlloc`'s drop). Nothing names the pages then.
+        drop(shadow);
+        crate::shadow::tests::forget_lookups();
+        assert!(!crate::watch::tests::still_watched(ptr as usize), "the guards let go of the pages");
         // SAFETY: `ptr` was allocated by `VirtualAlloc`.
         assert_ne!(unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) }, 0);
-        drop(shadow);
         // SAFETY: querying device health.
         assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
     }

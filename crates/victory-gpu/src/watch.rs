@@ -1599,7 +1599,7 @@ pub(crate) mod tests {
     }
 
     /// Whether the guards guard or hold a page of the allocation at `p`.
-    fn still_watched(p: usize) -> bool {
+    pub(crate) fn still_watched(p: usize) -> bool {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // The allocation's length: its regions, while they start from `p`
         // (guarded and open pages are regions of their own).
