@@ -1162,9 +1162,11 @@ mod tests {
     }
 
     /// Exclusive access to the host submission path for tests that toggle
-    /// `FORCED`, `flights::FORCED`, or `IDLE_HELD`. Settles any in-flight
-    /// submission and resets all switches on drop, even on panic: memory a
-    /// test's submission writes is declared before this, to outlive it.
+    /// `FORCED`, `flights::FORCED`, or `IDLE_HELD` (and, under them,
+    /// `flights::FORCED_ALIAS`, `FORCED_WRITES`, `FORCED_UPLOADS(2)`). Settles
+    /// any in-flight submission and resets all switches on drop, even on
+    /// panic: memory a test's submission writes is declared before this, to
+    /// outlive it.
     struct Exclusive(std::sync::RwLockWriteGuard<'static, ()>);
 
     impl Exclusive {
@@ -1189,6 +1191,12 @@ mod tests {
             // test binary.
             let settled = std::panic::catch_unwind(|| settle(By::Signal));
             IDLE_HELD.store(false, Relaxed);
+            // mac: a test that failed with one of these on (they are set
+            // under this guard) leaves it on no longer than the guard.
+            flights::FORCED_ALIAS.store(false, Relaxed);
+            flights::FORCED_WRITES.store(false, Relaxed);
+            flights::FORCED_UPLOADS.store(false, Relaxed);
+            flights::FORCED_UPLOADS2.store(false, Relaxed);
             flights::FORCED.store(false, Relaxed);
             FORCED.store(false, Relaxed);
             OWNS_EXCLUSIVE.with(|f| f.set(false));
