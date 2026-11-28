@@ -258,7 +258,11 @@ fn settle_before(by: By, next: &[&HostList]) -> bool {
         return false;
     }
     let Some(host) = host() else { return false };
+    #[cfg(test)]
+    let shared = shared();
     drop(host.submissions(by, next));
+    #[cfg(test)]
+    drop(shared);
     take_done().into_iter().for_each(crate::list::recycle);
     true
 }
@@ -606,53 +610,20 @@ pub(super) fn log(frames: f64) {
     );
 }
 
-/// Holds the submission lock, and in tests a shared lock that keeps concurrent
-/// GPU tests out of `unwaited::tests`'s exclusive sections.
-/// Fields drop in declaration order: `guard` before `_shared`.
-pub(super) struct Submitted<'a> {
-    guard: std::sync::MutexGuard<'a, u64>,
-    #[cfg(test)]
-    _shared: Shared,
-}
-
-impl std::ops::Deref for Submitted<'_> {
-    type Target = u64;
-
-    fn deref(&self) -> &u64 {
-        &self.guard
-    }
-}
-
-impl std::ops::DerefMut for Submitted<'_> {
-    fn deref_mut(&mut self) -> &mut u64 {
-        &mut self.guard
-    }
-}
-
+/// Tests: taken by what waits for the submission lock ([`Host::run`],
+/// [`settle`], [`Host::quiet`]), so that it stays out while a test here has
+/// the submissions to itself.
 #[cfg(test)]
-pub(super) struct Shared {
-    _guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
-}
-
-#[cfg(test)]
-pub(super) fn shared() -> Shared {
-    tests::shared()
-}
+pub(super) use tests::{Shared, shared};
 
 impl Host {
     /// The submission lock, once the submission left to the host GPU (if
     /// any) is finished: the holder prepares or submits with none running.
     /// `next`: the lists that run next, if known ([`Host::prewarm`]).
-    pub(super) fn submissions(&self, by: By, next: &[&HostList]) -> Submitted<'_> {
-        #[cfg(test)]
-        let _shared = shared();
-        let mut guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        self.settle_held(&mut guard, by, next);
-        Submitted {
-            guard,
-            #[cfg(test)]
-            _shared,
-        }
+    pub(super) fn submissions(&self, by: By, next: &[&HostList]) -> std::sync::MutexGuard<'_, u64> {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.settle_held(&mut submitted, by, next);
+        submitted
     }
 
     /// [`Host::submissions`]' part under the lock: the submission left, if
@@ -1121,15 +1092,32 @@ mod tests {
 
     thread_local! {
         static OWNS_EXCLUSIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static HOLDS_SHARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static IS_IDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    pub(super) fn shared() -> Shared {
-        if OWNS_EXCLUSIVE.with(std::cell::Cell::get) || IS_IDLER.with(std::cell::Cell::get) {
-            return Shared { _guard: None };
+    /// The shared side of [`EXCLUSIVE`], until dropped. Nothing for the test
+    /// that holds it exclusively, for our thread (which finishes what that
+    /// test leaves), and for a thread that holds it already (a submission's
+    /// dumps submit lists of their own, diagnostics): a second shared lock
+    /// would wait behind a test that waits for the first to go.
+    pub(in crate::host) struct Shared(Option<std::sync::RwLockReadGuard<'static, ()>>);
+
+    pub(in crate::host) fn shared() -> Shared {
+        if OWNS_EXCLUSIVE.with(std::cell::Cell::get)
+            || IS_IDLER.with(std::cell::Cell::get)
+            || HOLDS_SHARED.with(|h| h.replace(true))
+        {
+            return Shared(None);
         }
-        Shared {
-            _guard: Some(EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner())),
+        Shared(Some(EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner())))
+    }
+
+    impl Drop for Shared {
+        fn drop(&mut self) {
+            if self.0.is_some() {
+                HOLDS_SHARED.with(|h| h.set(false));
+            }
         }
     }
 

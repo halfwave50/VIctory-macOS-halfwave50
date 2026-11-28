@@ -1900,6 +1900,9 @@ impl Host {
     /// (with the queue they are of), and may be left to the host GPU
     /// without waiting for it ([`unwaited`]): whether they were.
     fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>) -> bool {
+        // (Tests: not while a test of `unwaited` has the submissions to itself.)
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         // The one before, if the host GPU was not waited for, is finished
@@ -2299,7 +2302,7 @@ impl Host {
     /// and their bottom-of-pipe writes. `submitted`: the submission lock,
     /// given up before a listed frame's dumps (diagnostics); none for a
     /// submission finished later ([`unwaited`]), whose finisher keeps it.
-    fn finish(&self, submitted: Option<unwaited::Submitted<'_>>, runs: &[&HostList], ran: Ran) {
+    fn finish(&self, submitted: Option<std::sync::MutexGuard<'_, u64>>, runs: &[&HostList], ran: Ran) {
         let Ran { gpu, removed_in, batch, heaps, traced } = ran;
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
