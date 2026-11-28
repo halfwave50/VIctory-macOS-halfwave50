@@ -15,6 +15,7 @@ mod host;
 pub mod modules;
 mod registry;
 pub mod runtime;
+mod stream_watch;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
