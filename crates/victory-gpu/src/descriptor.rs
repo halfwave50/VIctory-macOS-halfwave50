@@ -268,8 +268,39 @@ thread_local! {
     static PAGE_BUF: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
+#[cfg(all(windows, test))]
+static SYNC_ISOLATION: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(all(windows, test))]
+thread_local! {
+    static EXCLUSIVE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Exclusive guard for tests that adopt a heap into global `reports` state and
+/// call `sync_heaps()`: prevents concurrent tests' `sync_heaps()` calls from
+/// stealing `ASKED`, `written` pages, or `COUNTS`.
+#[cfg(all(windows, test))]
+pub(crate) struct ExclusiveSync(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+#[cfg(all(windows, test))]
+impl Drop for ExclusiveSync {
+    fn drop(&mut self) {
+        EXCLUSIVE_SYNC.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn exclusive_sync() -> ExclusiveSync {
+    let guard = SYNC_ISOLATION.write().unwrap_or_else(|e| e.into_inner());
+    EXCLUSIVE_SYNC.with(|flag| flag.set(true));
+    ExclusiveSync(guard)
+}
+
 #[cfg(windows)]
 fn sync(ran: Option<&dyn Fn() -> bool>) {
+    #[cfg(test)]
+    let _shared_sync = (!EXCLUSIVE_SYNC.with(|flag| flag.get()))
+        .then(|| SYNC_ISOLATION.read().unwrap_or_else(|e| e.into_inner()));
     // mac: lock waits and made slots are counted as a sync's (`slots`).
     let _syncing = slots::Syncing::enter();
     // Held throughout: a heap is not dropped while its slots are made.
