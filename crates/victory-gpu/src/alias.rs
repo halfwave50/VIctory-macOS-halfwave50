@@ -1530,7 +1530,10 @@ mod tests {
         let shadow = crate::shadow::find(ptr as u64, len as u64).expect("aliased shadow");
         assert!(shadow.is_aliased());
         assert!(unalias_region(ptr as usize));
-        assert!(crate::shadow::find(ptr as u64, len as u64).is_none_or(|s| !s.is_aliased()));
+        // Asked of the aliases alone: `find` would make a loose window's copy
+        // here (4 MiB), whose tracker holds the free memory around the page
+        // for the rest of the run, where other tests' allocations land.
+        assert!(crate::shadow::find_aliased(ptr as u64, ptr as u64 + len as u64).is_none(), "the alias is gone");
         // The copy goes before the memory: ours, and the one the lookups
         // keep (see `AliasedAlloc`'s drop). Nothing names the pages then.
         drop(shadow);
