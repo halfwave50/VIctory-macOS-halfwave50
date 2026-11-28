@@ -279,6 +279,11 @@ thread_local! {
 /// Exclusive guard for tests that adopt a heap into global `reports` state and
 /// call `sync_heaps()`: prevents concurrent tests' `sync_heaps()` calls from
 /// stealing `ASKED`, `written` pages, or `COUNTS`.
+///
+/// Taken after the submission lock, never before it: a submission syncs the
+/// heaps under that lock (`Host::run`), so a holder of this guard that waited
+/// for the lock (`Heap::host` and `Host::quiet`, a submission of its own, a
+/// settle) and a submission waiting here would wait for each other.
 #[cfg(all(windows, test))]
 pub(crate) struct ExclusiveSync(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 

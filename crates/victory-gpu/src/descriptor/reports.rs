@@ -982,7 +982,6 @@ pub(crate) mod tests {
             exclusive_sync, heap, sync_heaps,
         };
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        let _sync = exclusive_sync();
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -1002,6 +1001,10 @@ pub(crate) mod tests {
             crate::watch::tests::free(memory);
             return;
         };
+        // The syncs to ourselves from here on, and only now: making the
+        // host heap above waits for the submission lock (`Host::quiet`),
+        // which a submission holds while its own sync waits for this.
+        let _sync = exclusive_sync();
         // A record of ours, written where no heap sees it, copied in as
         // bytes the way the title copies records (the heap's page is
         // guarded: our handler opens it).
