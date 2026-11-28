@@ -144,7 +144,7 @@ pub fn counting() -> bool {
 }
 
 /// Whether `VICTORY_ALIAS_PHYSICAL` asks for the GPU side (`=gpu`,
-/// `=gpu-single`): `xmem` then tells `crate::alias_physical` its
+/// `=gpu-tiles`, `=gpu-single`): `xmem` then tells `crate::alias_physical` its
 /// reservations, maps and unmaps. Read once; after that one load and a branch.
 #[inline]
 pub fn gpu_mode() -> bool {
@@ -317,6 +317,36 @@ pub(crate) fn gpu_on() {
     GPU_ON.store(true, Relaxed);
 }
 
+/// mac: the GPU side's counts for the line (`crate::alias_physical::take_counts`):
+/// since the last line, tiles mapped fresh, nulled and mapped again, pointed
+/// at the sink, `UpdateTileMappings` calls and their microseconds; views of
+/// sections made and their bytes, views of pieces made, ranges that kept a
+/// copy as mixed, views of sections and of pieces dropped by remaps. Since
+/// the start: pieces made and fallen back, views of sections and of pieces
+/// (those with a page at two or more addresses, as flushed), copies kept
+/// for ranges in pieces, and mixed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GpuCounts {
+    pub(crate) fresh: u64,
+    pub(crate) remapped: u64,
+    pub(crate) sunk: u64,
+    pub(crate) calls: u64,
+    pub(crate) us: u64,
+    pub(crate) section_views: u64,
+    pub(crate) section_bytes: u64,
+    pub(crate) piece_views: u64,
+    pub(crate) mixed: u64,
+    pub(crate) section_drops: u64,
+    pub(crate) piece_drops: u64,
+    pub(crate) pieces: u64,
+    pub(crate) fallen: u64,
+    pub(crate) section_total: u64,
+    pub(crate) piece_total: u64,
+    pub(crate) shared: u64,
+    pub(crate) kept: u64,
+    pub(crate) mixed_total: u64,
+}
+
 /// A section's heap of `len` bytes was made: heap-backed sections now, and
 /// their bytes.
 pub(crate) fn heap_made(len: usize) -> [i64; 2] {
@@ -379,7 +409,7 @@ fn stage2_line(
     now: [i64; 5],
     r: &Reservations,
     backing: Option<[i64; 5]>,
-    gpu: Option<[u64; 10]>,
+    gpu: Option<GpuCounts>,
     frames: f64,
 ) -> String {
     let [fresh, remapped, unmapped, again] = window.map(|n| n as f64 / frames.max(1.0));
@@ -407,17 +437,32 @@ fn stage2_line(
              view remaps retried, {failed} failed",
             bytes as f64 / 1e9
         )
-    }) + &gpu.map_or(String::new(), |[fresh, remapped, sunk, calls, us, made, fallen, views, shared, kept]| {
+    }) + &gpu.map_or(String::new(), |g| {
         let f = |n: u64| n as f64 / frames.max(1.0);
         format!(
-            "; GPU side: {made} pieces ({fallen} fell back to copies), {views} views made ({shared} with a page at \
-             two or more addresses), {kept} copies kept for ranges in pieces; per frame {:.1} tiles mapped fresh, \
-             {:.1} nulled and mapped again, {:.1} to the sink, in {:.1} UpdateTileMappings, {:.2} ms",
-            f(fresh),
-            f(remapped),
-            f(sunk),
-            f(calls),
-            f(us) / 1e3
+            "; GPU side: {} pieces ({} fell back to copies); since the start {} views of sections, {} views of pieces \
+             ({} with a page at two or more addresses), {} copies kept for ranges in pieces, {} mixed; per frame \
+             {:.1} views of sections made ({:.2} MB), {:.1} views of pieces made, {:.1} mixed, {:.1} views of \
+             sections and {:.1} of pieces dropped by remaps, {:.1} tiles mapped fresh, {:.1} nulled and mapped \
+             again, {:.1} to the sink, in {:.1} UpdateTileMappings, {:.2} ms",
+            g.pieces,
+            g.fallen,
+            g.section_total,
+            g.piece_total,
+            g.shared,
+            g.kept,
+            g.mixed_total,
+            f(g.section_views),
+            f(g.section_bytes) / 1e6,
+            f(g.piece_views),
+            f(g.mixed),
+            f(g.section_drops),
+            f(g.piece_drops),
+            f(g.fresh),
+            f(g.remapped),
+            f(g.sunk),
+            f(g.calls),
+            f(g.us) / 1e3
         )
     })
 }
@@ -632,14 +677,35 @@ mod tests {
             [0; 5],
             &r,
             Some([1, 0, 0, 0, 0]),
-            Some([1000, 50, 20, 30, 4_000, 17, 1, 900, 300, 12]),
+            Some(GpuCounts {
+                fresh: 1000,
+                remapped: 50,
+                sunk: 20,
+                calls: 30,
+                us: 4_000,
+                section_views: 40,
+                section_bytes: 25_000_000,
+                piece_views: 7,
+                mixed: 3,
+                section_drops: 2,
+                piece_drops: 1,
+                pieces: 17,
+                fallen: 1,
+                section_total: 1_500,
+                piece_total: 900,
+                shared: 300,
+                kept: 12,
+                mixed_total: 9,
+            }),
             10.0,
         );
         assert!(
             gpu.ends_with(
-                "; GPU side: 17 pieces (1 fell back to copies), 900 views made (300 with a page at two or more \
-                 addresses), 12 copies kept for ranges in pieces; per frame 100.0 tiles mapped fresh, 5.0 nulled and \
-                 mapped again, 2.0 to the sink, in 3.0 UpdateTileMappings, 0.40 ms"
+                "; GPU side: 17 pieces (1 fell back to copies); since the start 1500 views of sections, 900 views of \
+                 pieces (300 with a page at two or more addresses), 12 copies kept for ranges in pieces, 9 mixed; per \
+                 frame 4.0 views of sections made (2.50 MB), 0.7 views of pieces made, 0.3 mixed, 0.2 views of \
+                 sections and 0.1 of pieces dropped by remaps, 100.0 tiles mapped fresh, 5.0 nulled and mapped again, \
+                 2.0 to the sink, in 3.0 UpdateTileMappings, 0.40 ms"
             ),
             "{gpu}"
         );

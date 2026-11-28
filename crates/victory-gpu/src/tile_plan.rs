@@ -306,6 +306,98 @@ impl Plan {
         })
     }
 
+    /// What tile `tile` of piece `id` is to show: its change waiting, else
+    /// what it shows as flushed (`None`: the sink, never mapped, or a piece
+    /// whose reservation is gone). This is xmem's mapping now.
+    pub(crate) fn current(&self, id: usize, tile: u32) -> Option<HeapTile> {
+        let piece = self.pieces.get(id).filter(|p| !p.gone)?;
+        match piece.pending.get(&tile) {
+            Some(Change::Map(t)) => Some(*t),
+            Some(Change::Unmap) => None,
+            None => self.shows(id, tile),
+        }
+    }
+
+    /// The piece and tile title page `at` (64 KiB aligned) is, if it is in
+    /// a piece.
+    pub(crate) fn tile_of(&self, at: usize) -> Option<(usize, u32)> {
+        let (id, offset) = self.locate(at, at + PAGE)?;
+        Some((id, offset / PAGE as u32))
+    }
+
+    /// The heap tile title page `at` (64 KiB aligned) shows now
+    /// ([`Plan::current`]).
+    pub(crate) fn current_at(&self, at: usize) -> Option<HeapTile> {
+        let (id, tile) = self.tile_of(at)?;
+        self.current(id, tile)
+    }
+
+    /// Whether title memory `[from, to)` is one unbroken run of one heap's
+    /// tiles as xmem maps it now: page `k` of the range shows heap tile
+    /// `first + k`, across pieces and reservations alike. The first heap tile
+    /// and the run's length in tiles.
+    pub(crate) fn run(&self, from: usize, to: usize) -> Option<(HeapTile, u32)> {
+        if to <= from {
+            return None;
+        }
+        let (first_page, last_page) = (from / PAGE, (to - 1) / PAGE);
+        let first = self.current_at(first_page * PAGE)?;
+        for (k, page) in (first_page + 1..=last_page).enumerate() {
+            let want = HeapTile {
+                heap: first.heap,
+                tile: first.tile.checked_add(k as u32 + 1)?,
+            };
+            if self.current_at(page * PAGE) != Some(want) {
+                return None;
+            }
+        }
+        Some((first, (last_page - first_page + 1) as u32))
+    }
+
+    /// The longest run ([`Plan::run`]) holding `[from, to)`, if that is one,
+    /// within title memory `[lo, hi)` (64 KiB aligned) and heap tiles `tiles`:
+    /// its title range (whole pages) and the heap tile its first page shows.
+    pub(crate) fn run_around(
+        &self,
+        from: usize,
+        to: usize,
+        lo: usize,
+        hi: usize,
+        tiles: Range<u32>,
+    ) -> Option<(Range<usize>, HeapTile)> {
+        let (first, n) = self.run(from, to)?;
+        if !tiles.contains(&first.tile) || first.tile + n > tiles.end {
+            return None;
+        }
+        let mut start = from / PAGE * PAGE;
+        let mut end = start + n as usize * PAGE;
+        let mut head = first;
+        while start > lo && head.tile > tiles.start {
+            let want = HeapTile {
+                heap: head.heap,
+                tile: head.tile - 1,
+            };
+            if self.current_at(start - PAGE) != Some(want) {
+                break;
+            }
+            start -= PAGE;
+            head = want;
+        }
+        let mut next = first.tile + n;
+        while end < hi && next < tiles.end {
+            let want = HeapTile {
+                heap: first.heap,
+                tile: next,
+            };
+            if self.current_at(end) != Some(want) {
+                break;
+            }
+            end += PAGE;
+            next += 1;
+        }
+        Some((start..end, head))
+    }
+
     /// Tiles with a change waiting.
     pub(crate) fn pending(&self) -> usize {
         self.dirty
@@ -419,6 +511,17 @@ impl Plan {
         }
         out
     }
+}
+
+/// The heap piece the `n` heap tiles from `first` on lie in wholly, if one
+/// does: a heap's pieces are consecutive spans of `per` tiles from its start
+/// (the section buffers of canonical views, `crate::alias_physical`).
+pub(crate) fn heap_piece(first: u32, n: u32, per: u32) -> Option<u32> {
+    if n == 0 || per == 0 {
+        return None;
+    }
+    let j = first / per;
+    (first.checked_add(n - 1)? / per == j).then_some(j)
 }
 
 /// One tile fewer shows heap tile `t`.
@@ -769,6 +872,79 @@ mod tests {
         assert_eq!(flush.clears, vec![(0, vec![(3, 1)])]);
         assert_eq!(ranges(&flush), vec![(0, 0, vec![r(3, 1, 9, false)])]);
         assert_eq!((flush.fresh, flush.remapped, flush.sunk), (0, 1, 0));
+    }
+
+    /// xmem's mapping now (the plan's changes over what was flushed), and runs
+    /// of one heap's tiles read from it, for canonical views.
+    #[test]
+    fn runs_are_read_from_the_mapping_now() {
+        let mut plan = Plan::new(Never::Untouched);
+        plan.reserve(A, 2 * PIECE);
+        let other = A + 4 * PIECE;
+        plan.reserve(other, 8 * PAGE);
+        plan.map(A, 4 * PAGE, heap(10));
+        // Pending: the mapping now is the change waiting.
+        assert_eq!(plan.current(0, 2), Some(heap(12)));
+        assert_eq!(plan.shows(0, 2), None, "not flushed yet");
+        assert_eq!(plan.run(A + 100, A + 4 * PAGE), Some((heap(10), 4)));
+        plan.flush(SINK);
+        assert_eq!(plan.current(0, 2), Some(heap(12)));
+        // An unmap waiting: nothing now, though the buffer still shows it.
+        plan.unmap(A + 2 * PAGE, PAGE);
+        assert_eq!(plan.current(0, 2), None);
+        assert_eq!(plan.shows(0, 2), Some(heap(12)));
+        assert_eq!(plan.run(A, A + 4 * PAGE), None, "a hole");
+        assert_eq!(plan.run(A, A + 2 * PAGE), Some((heap(10), 2)));
+        assert_eq!(plan.run(A + 3 * PAGE, A + 3 * PAGE + 1), Some((heap(13), 1)));
+        // Another heap, or tiles out of order, break a run.
+        plan.map(A + 2 * PAGE, PAGE, HeapTile { heap: 1, tile: 12 });
+        assert_eq!(plan.run(A + PAGE, A + 3 * PAGE), None);
+        plan.map(A + 2 * PAGE, PAGE, heap(20));
+        assert_eq!(plan.run(A + PAGE, A + 3 * PAGE), None);
+        // Across two pieces of a reservation: one run all the same.
+        plan.map(A + PIECE - PAGE, 2 * PAGE, heap(500));
+        assert_eq!(plan.run(A + PIECE - 8, A + PIECE + 8), Some((heap(500), 2)));
+        // A page outside the reservations: no run.
+        assert_eq!(plan.run(A - PAGE, A + PAGE), None);
+        // A page at two addresses: a run at each.
+        plan.map(other + 3 * PAGE, PAGE, heap(11));
+        assert_eq!(plan.run(other + 3 * PAGE, other + 4 * PAGE), Some((heap(11), 1)));
+        assert_eq!(plan.run(A + PAGE, A + 2 * PAGE), Some((heap(11), 1)));
+        // The longest run around a range, within title and heap bounds.
+        plan.map(other, 3 * PAGE, heap(8));
+        plan.map(other + 4 * PAGE, 2 * PAGE, heap(12));
+        assert_eq!(
+            plan.run_around(other + 3 * PAGE + 4, other + 3 * PAGE + 8, other, other + 8 * PAGE, 0..1000),
+            Some((other..other + 6 * PAGE, heap(8)))
+        );
+        assert_eq!(
+            plan.run_around(other + 3 * PAGE, other + 4 * PAGE, other + PAGE, other + 5 * PAGE, 0..1000),
+            Some((other + PAGE..other + 5 * PAGE, heap(9)))
+        );
+        assert_eq!(
+            plan.run_around(other + 3 * PAGE, other + 4 * PAGE, other, other + 8 * PAGE, 10..12),
+            Some((other + 2 * PAGE..other + 4 * PAGE, heap(10))),
+            "cut to heap tiles 10 and 11"
+        );
+        assert_eq!(
+            plan.run_around(other + 3 * PAGE, other + 4 * PAGE, other, other + 8 * PAGE, 12..20),
+            None,
+            "the range itself outside the heap tiles"
+        );
+        // A reservation made again: its pieces show nothing.
+        plan.reserve(other, 8 * PAGE);
+        assert_eq!(plan.current_at(other + 3 * PAGE), None);
+    }
+
+    #[test]
+    fn heap_pieces_hold_runs_wholly_or_not() {
+        let per = (PIECE / PAGE) as u32;
+        assert_eq!(heap_piece(0, 1, per), Some(0));
+        assert_eq!(heap_piece(per - 2, 2, per), Some(0));
+        assert_eq!(heap_piece(per - 1, 2, per), None, "across the edge");
+        assert_eq!(heap_piece(per, 5, per), Some(1));
+        assert_eq!(heap_piece(3, 0, per), None);
+        assert_eq!(heap_piece(u32::MAX, 2, per), None);
     }
 
     #[test]

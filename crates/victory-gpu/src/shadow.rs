@@ -114,10 +114,13 @@ pub(crate) struct Shadow {
     /// The last presented frame a view or a list asked for it
     /// ([`Shadow::touch`]), for [`release_idle`].
     used: AtomicU64,
-    /// mac: a view of a piece of a reservation (`crate::alias_physical`,
-    /// `VICTORY_ALIAS_PHYSICAL=gpu`): aliased, at `base` in the piece's
-    /// buffer, with `data` the title's own address.
+    /// mac: a view of a piece of a reservation or of a section's heap
+    /// (`crate::alias_physical`, `VICTORY_ALIAS_PHYSICAL=gpu`): aliased, at
+    /// `base` in the piece's or section's buffer, with `data` the title's own
+    /// address; and its claim on the heap tiles it reaches, given back when
+    /// it goes. Never given up by [`release_idle`] (it is aliased).
     view: bool,
+    hold: Option<crate::alias_physical::Hold>,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -578,6 +581,7 @@ impl Shadow {
             aliased: false,
             used: AtomicU64::new(crate::queue::presented()),
             view: false,
+            hold: None,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -613,6 +617,7 @@ impl Shadow {
             aliased: true,
             used: AtomicU64::new(crate::queue::presented()),
             view: false,
+            hold: None,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -620,19 +625,21 @@ impl Shadow {
         shadow
     }
 
-    /// mac: a view of title memory `[start, start + len)` in a piece of a
-    /// reservation (`crate::alias_physical`, I4): the piece's `buffer` from
-    /// byte `base` on, whose GPU address there is `gpu`. The piece's tiles
-    /// are the title's pages (one RAM), so it is aliased: nothing is copied
-    /// or copied back, and writes through it are only told to the other
-    /// trackers, as for an aliased region.
-    pub(crate) fn new_view(
-        buffer: ID3D12Resource,
-        gpu: u64,
-        base: u64,
-        start: u64,
-        len: u64,
-    ) -> Arc<Shadow> {
+    /// mac: a view of title memory in a piece of a reservation or in a
+    /// section's heap (`crate::alias_physical`, I4 and I4b): the buffer from
+    /// byte `base` on, whose GPU address there is `gpu`, for the view's title
+    /// range. Its bytes are the title's pages (one RAM), so it is aliased:
+    /// nothing is copied or copied back, and writes through it are only told
+    /// to the other trackers, as for an aliased region.
+    pub(crate) fn new_view(view: crate::alias_physical::View) -> Arc<Shadow> {
+        let crate::alias_physical::View {
+            buffer,
+            gpu,
+            base,
+            range,
+            hold,
+        } = view;
+        let (start, len) = (range.start as u64, range.len() as u64);
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -652,6 +659,7 @@ impl Shadow {
             aliased: true,
             used: AtomicU64::new(crate::queue::presented()),
             view: true,
+            hold: Some(hold),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -659,9 +667,15 @@ impl Shadow {
         shadow
     }
 
-    /// mac: whether this is a view of a piece of a reservation ([`Shadow::new_view`]).
+    /// mac: whether this is a view of a piece of a reservation or of a
+    /// section ([`Shadow::new_view`]).
     pub(crate) fn is_view(&self) -> bool {
         self.view
+    }
+
+    /// mac: what a view reaches its pages through (`None`: not a view).
+    pub(crate) fn view_kind(&self) -> Option<crate::alias_physical::Kind> {
+        self.hold.as_ref().map(crate::alias_physical::Hold::kind)
     }
 
     /// Where the title buffer starts in `buffer`: 0 but for runs of a shared
@@ -2415,13 +2429,7 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         // mac: in one piece of a reservation (`VICTORY_ALIAS_PHYSICAL=gpu`,
         // `crate::alias_physical`): a view of the piece, no copy.
         if let Some(view) = crate::alias_physical::view(key.0 as usize, entry.end as usize) {
-            entry.shadow = Some(Shadow::new_view(
-                view.buffer,
-                view.gpu,
-                view.base,
-                key.0,
-                len,
-            ));
+            entry.shadow = Some(Shadow::new_view(view));
             changed();
             return entry.shadow.clone();
         }
@@ -2505,21 +2513,17 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return Some(shadow.clone());
     }
     // mac: in a piece of a reservation (`VICTORY_ALIAS_PHYSICAL=gpu`): a
-    // view of the 256 MiB block holding the range, cut to the piece (fewer
-    // ranges straddle than with 4 MiB windows, and a view costs no copy).
-    if let Some(piece) = crate::alias_physical::piece_at(address as usize) {
-        const BLOCK: u64 = 256 << 20;
-        let from = (address & !(BLOCK - 1)).max(piece.start as u64);
-        let to = end.checked_next_multiple_of(BLOCK)?.min(piece.end as u64);
-        if end <= to
-            && let Some(view) = crate::alias_physical::view(from as usize, to as usize)
-        {
-            let shadow = Shadow::new_view(view.buffer, view.gpu, view.base, from, to - from);
-            LOOSE_SPAN.fetch_max(to - from, Ordering::Relaxed);
-            map.insert((from, to - from), shadow.clone());
-            changed();
-            return Some(shadow);
-        }
+    // view, no copy. With `=gpu`, of the section for a run of a section's
+    // pages (the run inside the window and its heap piece), else of the piece
+    // over the range's own pages; with `=gpu-tiles`, of the piece over the
+    // 256 MiB block holding the range, cut to the piece.
+    if let Some(view) = crate::alias_physical::window(address as usize, end as usize, window as usize) {
+        let (from, n) = (view.range.start as u64, view.range.len() as u64);
+        let shadow = Shadow::new_view(view);
+        LOOSE_SPAN.fetch_max(n, Ordering::Relaxed);
+        map.insert((from, n), shadow.clone());
+        changed();
+        return Some(shadow);
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
@@ -2722,30 +2726,47 @@ impl Arena {
     }
 }
 
-/// mac: the views of pieces (`crate::alias_physical`) over any of title
-/// memory `[from, to)` leave the registries: their piece fell back to
-/// copies, or the title reserved that memory again. New copies take their
-/// ranges at the next lookups.
-pub(crate) fn drop_views(from: u64, to: u64) {
-    let over = |s: &Shadow| s.view && s.start < to && from < s.start + s.len;
-    let mut dropped = false;
-    for entry in buffers().values_mut() {
-        if entry.shadow.as_deref().is_some_and(over) {
-            entry.shadow = None;
-            dropped = true;
+/// mac: the views (`crate::alias_physical`) over any of title memory
+/// `[from, to)`, of kind `kind` or (`None`) of either, leave the registries:
+/// their piece fell back to copies, the title reserved that memory again, or
+/// remapped a page under them. New copies or views take their ranges at the
+/// next lookups; lists holding them keep them. How many left.
+pub(crate) fn drop_views(from: u64, to: u64, kind: Option<crate::alias_physical::Kind>) -> usize {
+    let over = |s: &Shadow| {
+        s.view && s.start < to && from < s.start + s.len && (kind.is_none() || s.view_kind() == kind)
+    };
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut map = buffers();
+        let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+        for (_, entry) in map.range_mut((lowest, 0)..(to, 0)) {
+            if entry.shadow.as_deref().is_some_and(over) {
+                gone.extend(entry.shadow.take());
+            }
         }
     }
-    LOOSE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, s| {
-            let keep = !over(s);
-            dropped |= !keep;
-            keep
-        });
-    if dropped {
+    {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = from.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        let keys: Vec<(u64, u64)> = map
+            .range((lowest, 0)..(to, 0))
+            .filter(|(_, s)| over(s))
+            .map(|(&k, _)| k)
+            .collect();
+        for key in keys {
+            gone.extend(map.remove(&key));
+        }
+    }
+    if !gone.is_empty() {
         changed();
     }
+    for shadow in &gone {
+        if let Some(hold) = &shadow.hold {
+            crate::alias_physical::left(hold);
+        }
+    }
+    // The last references may go here, outside the registries' locks.
+    gone.len()
 }
 
 /// Every host copy of title memory made so far (buffers, aliases, and windows).

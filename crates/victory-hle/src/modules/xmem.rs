@@ -1506,7 +1506,7 @@ mod tests {
     /// not take.
     fn forced_heap() -> bool {
         std::env::var("VICTORY_ALIAS_PHYSICAL")
-            .is_ok_and(|v| matches!(v.trim(), "cpu" | "gpu" | "gpu-single"))
+            .is_ok_and(|v| matches!(v.trim(), "cpu" | "gpu" | "gpu-tiles" | "gpu-single"))
             || cfg!(feature = "diagnostics")
                 && std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1")
     }
