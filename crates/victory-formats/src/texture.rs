@@ -907,6 +907,72 @@ pub fn walk_changed(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(us
     }
 }
 
+/// Scans one differing block of `kept` and `fresh` 8 bytes at a time,
+/// updating `kept` in place and appending `(at + offset, len)` runs.
+/// Runs that touch the previous run pushed during the same `changed_runs`
+/// call (`runs.len() > base_runs`) are merged across internal block boundaries.
+fn scan_changed_block(
+    at: usize,
+    kept: &mut [u8],
+    fresh: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+    base_runs: usize,
+) {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let n = fresh.len();
+    let mut i = 0;
+    while i < n {
+        // Skip equal bytes, 8 at a time.
+        while i + 8 <= n {
+            let a = u64::from_le_bytes(kept[i..i + 8].try_into().unwrap());
+            let b = u64::from_le_bytes(fresh[i..i + 8].try_into().unwrap());
+            let diff = a ^ b;
+            if diff == 0 {
+                i += 8;
+            } else {
+                i += (diff.trailing_zeros() / 8) as usize;
+                break;
+            }
+        }
+        while i < n && kept[i] == fresh[i] {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let first = i;
+        i += 1;
+        // Advance through differing bytes, 8 at a time while no byte matches.
+        while i + 8 <= n {
+            let a = u64::from_le_bytes(kept[i..i + 8].try_into().unwrap());
+            let b = u64::from_le_bytes(fresh[i..i + 8].try_into().unwrap());
+            let diff = a ^ b;
+            let equal = diff.wrapping_sub(LO) & !diff & HI;
+            if equal == 0 {
+                i += 8;
+            } else {
+                i += (equal.trailing_zeros() / 8) as usize;
+                break;
+            }
+        }
+        while i < n && kept[i] != fresh[i] {
+            i += 1;
+        }
+        kept[first..i].copy_from_slice(&fresh[first..i]);
+        let run_start = at + first;
+        let run_len = i - first;
+        if runs.len() > base_runs
+            && let Some(last) = runs.last_mut()
+            && last.0 + last.1 == run_start
+        {
+            last.1 += run_len;
+        } else {
+            runs.push((run_start, run_len));
+        }
+    }
+}
+
 /// The compare core of an untracked texture refresh: the runs of bytes
 /// that differ between `kept`, the bytes the memory last compared equal,
 /// and `fresh`, a chunk of it just read (`at` the chunk's offset in the
@@ -914,26 +980,38 @@ pub fn walk_changed(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(us
 /// memory's. A chunk that compares slice-equal holds no differing byte
 /// and is not walked: nothing tracks the memory's writes under Rosetta
 /// (VIctory-macOS issue #1), so a refresh reads it whole and compares,
-/// and almost every chunk of almost every refresh is equal. The walk
-/// itself is [`walk_changed`], so the two shapes cannot drift.
+/// and almost every chunk of almost every refresh is equal. Returns the
+/// exact same runs and updated `kept` bytes as [`walk_changed`].
 pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(usize, usize)>) {
-    if *kept == *fresh {
-        // The usual case: one slice comparison, no byte walk.
-        return;
+    // Compare in 64 KiB outer chunks (matching console page size) so unchanged
+    // MiB reads take a handful of slice compares with zero double-scanning when
+    // a chunk differs, then narrow differing pages to 4 KiB blocks and scan
+    // word by word, coalescing runs across block boundaries.
+    const OUTER: usize = 65536;
+    const INNER: usize = 4096;
+    let base_runs = runs.len();
+    let n = fresh.len();
+    let mut outer = 0;
+    while outer < n {
+        let outer_end = (outer + OUTER).min(n);
+        if kept[outer..outer_end] != fresh[outer..outer_end] {
+            let mut offset = outer;
+            while offset < outer_end {
+                let end = (offset + INNER).min(outer_end);
+                if kept[offset..end] != fresh[offset..end] {
+                    scan_changed_block(
+                        at + offset,
+                        &mut kept[offset..end],
+                        &fresh[offset..end],
+                        runs,
+                        base_runs,
+                    );
+                }
+                offset = end;
+            }
+        }
+        outer = outer_end;
     }
-    // A streamed page can change in an otherwise equal MiB read. Skip
-    // equal blocks at either end before looking for individual runs. Keep
-    // the middle contiguous so a run crossing a block boundary stays one run.
-    const BLOCK: usize = 4096;
-    let mut start = 0;
-    let mut end = fresh.len();
-    while end - start >= BLOCK && kept[start..start + BLOCK] == fresh[start..start + BLOCK] {
-        start += BLOCK;
-    }
-    while end - start >= BLOCK && kept[end - BLOCK..end] == fresh[end - BLOCK..end] {
-        end -= BLOCK;
-    }
-    walk_changed(at + start, &mut kept[start..end], &fresh[start..end], runs);
 }
 
 enum Buffers<'a> {
@@ -1203,6 +1281,136 @@ mod tests {
             walk_changed(37, &mut expected, &fresh, &mut reference);
             assert_eq!(runs, reference);
             assert_eq!(kept, fresh);
+        }
+    }
+
+    #[test]
+    fn changed_runs_matches_byte_walk_across_word_lanes_blocks_and_prior_runs() {
+        // Pre-existing run ending right at `at` must not coalesce with a new run at offset 0.
+        let mut kept = vec![0u8; 8192];
+        let mut expected = kept.clone();
+        let mut fresh = kept.clone();
+        fresh[0..4096 + 13].fill(1);
+        fresh[4096 + 14..8192].fill(2);
+        let mut runs = vec![(0, 37)];
+        let mut reference = runs.clone();
+        changed_runs(37, &mut kept, &fresh, &mut runs);
+        walk_changed(37, &mut expected, &fresh, &mut reference);
+        assert_eq!(runs, reference);
+        assert_eq!(kept, fresh);
+
+        // Single differing bytes and single matching holes at every lane of an 8-byte word,
+        // plus unaligned tails and interior equal 4 KiB blocks.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..500 {
+            let len = match case {
+                0..=32 => case,
+                33..=64 => 4096 - 16 + (case - 33),
+                _ => (next() as usize % 20_000) + 1,
+            };
+            let base = vec![0x5au8; len];
+            let mut fresh = base.clone();
+            match case % 5 {
+                0 => fresh.fill(0xa5),
+                1 => {
+                    // Single matching holes inside an all-differing buffer.
+                    fresh.fill(0xa5);
+                    for _ in 0..(next() % 12) {
+                        let pos = next() as usize % len;
+                        fresh[pos] = 0x5a;
+                    }
+                }
+                2 => {
+                    // Sparse edits across multiple 4 KiB blocks.
+                    for _ in 0..(next() % 10 + 1) {
+                        let pos = next() as usize % len;
+                        let span = (next() as usize % 64 + 1).min(len - pos);
+                        fresh[pos..pos + span].fill(0x11);
+                    }
+                }
+                3 => {
+                    // Alternating byte runs exercising every word lane.
+                    for (idx, b) in fresh.iter_mut().enumerate() {
+                        if (idx / ((case % 9) + 1)) % 2 == 0 {
+                            *b ^= 0xff;
+                        }
+                    }
+                }
+                _ => {
+                    // Equal buffer.
+                }
+            }
+            let at = (next() as usize) & 0xfff;
+            let mut kept = base.clone();
+            let mut expected = base;
+            let mut runs = vec![(0, at)];
+            let mut reference = runs.clone();
+            changed_runs(at, &mut kept, &fresh, &mut runs);
+            walk_changed(at, &mut expected, &fresh, &mut reference);
+            assert_eq!(runs, reference, "case {case} len {len}");
+            assert_eq!(kept, fresh, "case {case} len {len}");
+        }
+    }
+
+    /// Compare throughput of `changed_runs` vs `walk_changed` on 1 MiB chunks:
+    /// `cargo test --release -p victory-formats changed_runs_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn changed_runs_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const CHUNK: usize = 1 << 20;
+        let base = vec![0x5au8; CHUNK];
+        let cases: &[(&str, &[(usize, usize)])] = &[
+            ("equal 1 MiB", &[]),
+            ("one 64 KiB page at middle", &[(512 << 10, 576 << 10)]),
+            (
+                "two 64 KiB pages at ends",
+                &[(0, 64 << 10), (CHUNK - (64 << 10), CHUNK)],
+            ),
+            (
+                "two 1-byte edits at ends",
+                &[(16, 17), (CHUNK - 17, CHUNK - 16)],
+            ),
+        ];
+        for &(name, edits) in cases {
+            let mut fresh = base.clone();
+            for &(from, to) in edits {
+                fresh[from..to].fill(0xa5);
+            }
+            let mut kept = base.clone();
+            let mut runs = Vec::new();
+            let iters = 200u32;
+            let mut time = |fast: bool| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    for &(from, to) in edits {
+                        kept[from..to].fill(0x5a);
+                    }
+                    runs.clear();
+                    let t0 = Instant::now();
+                    if fast {
+                        changed_runs(0, black_box(&mut kept), black_box(&fresh), &mut runs);
+                    } else {
+                        walk_changed(0, black_box(&mut kept), black_box(&fresh), &mut runs);
+                    }
+                    total += t0.elapsed();
+                }
+                total.as_secs_f64() * 1e6 / f64::from(iters)
+            };
+            let slow_us = time(false);
+            let fast_us = time(true);
+            println!(
+                "{name:<28}: walk_changed {slow_us:7.1} us, changed_runs {fast_us:6.1} us ({:.1}x)",
+                slow_us / fast_us
+            );
         }
     }
 

@@ -19,7 +19,10 @@ pub const CAPACITY: usize = 512;
 /// into [`Outputs::owners`].
 #[derive(Default)]
 pub struct Scratch {
-    order: Vec<usize>,
+    /// Packed sort keys `(((1u64 << 41) - len) << 22) | k` for `copies.len() < 2^22`.
+    order_packed: Vec<u64>,
+    /// Fallback `(len, copy_index)` when `copies.len() >= 2^22`.
+    order_wide: Vec<(u64, usize)>,
     level1: Vec<u32>,
     dwords: Vec<u32>,
 }
@@ -59,9 +62,36 @@ impl Scratch {
         null: u32,
         out: &'out mut Outputs,
     ) -> Built<'scratch, 'out> {
-        self.order.clear();
-        self.order.extend(0..copies.len());
-        self.order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
+        const PACKED_MASK: u64 = (1 << 22) - 1;
+        const LIMIT: u64 = 1 << 40;
+        let packed = copies.len() <= PACKED_MASK as usize;
+        self.order_packed.clear();
+        self.order_wide.clear();
+        if packed {
+            self.order_packed.extend(
+                copies
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, &(start, len))| {
+                        let end = start.checked_add(len)?;
+                        (len != 0 && end <= LIMIT)
+                            .then_some((((1u64 << 41) - len) << 22) | (k as u64))
+                    }),
+            );
+            self.order_packed.sort_unstable();
+        } else {
+            self.order_wide.extend(
+                copies
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, &(start, len))| {
+                        let end = start.checked_add(len)?;
+                        (len != 0 && end <= LIMIT).then_some((len, k))
+                    }),
+            );
+            self.order_wide
+                .sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        }
         self.level1.clear();
         self.level1.resize(LEVEL1, 0);
         out.blocks.clear();
@@ -71,15 +101,27 @@ impl Scratch {
         let owners = &mut out.owners;
         owners.clear();
         owners.resize(BLOCK, None);
+        self.dwords.clear();
+        self.dwords.resize(LEVEL1 + 2 * BLOCK, 0);
+        if null != 0 {
+            let (blk, _) = self.dwords[LEVEL1..].as_chunks_mut::<2>();
+            blk.fill([null, 0]);
+        }
         let mut full = false;
-        for &k in &self.order {
-            let (start, len) = copies[k];
-            let Some(end) = start.checked_add(len) else {
-                continue;
+        let len_order = if packed {
+            self.order_packed.len()
+        } else {
+            self.order_wide.len()
+        };
+        for idx in 0..len_order {
+            let k = if packed {
+                (self.order_packed[idx] & PACKED_MASK) as usize
+            } else {
+                self.order_wide[idx].1
             };
-            if len == 0 || end > 1 << 40 {
-                continue;
-            }
+            let (start, len) = copies[k];
+            let end = start + len;
+            let val = [pairs[k], start as u32];
             let (first, last) = (start >> 16, (end - 1) >> 16);
             // Larger copies come first: a copy holding the whole page takes
             // it from them; one holding part of it (its first or last page,
@@ -99,37 +141,41 @@ impl Scratch {
                     }
                     self.level1[l1] = out.blocks.len() as u32;
                     out.blocks.push(l1);
-                    owners.resize(owners.len() + BLOCK, None);
+                    let old_entries = owners.len();
+                    owners.resize(old_entries + BLOCK, None);
+                    self.dwords.resize(LEVEL1 + 2 * (old_entries + BLOCK), 0);
+                    if null != 0 {
+                        let (blk, _) = self.dwords[LEVEL1 + 2 * old_entries..].as_chunks_mut::<2>();
+                        blk.fill([null, 0]);
+                    }
                 }
                 let base = self.level1[l1] as usize * BLOCK;
-                let run =
-                    &mut owners[base + (page & 0xFFF) as usize..=base + (upto & 0xFFF) as usize];
+                let lo = base + (page & 0xFFF) as usize;
+                let hi = base + (upto & 0xFFF) as usize;
+                let run = &mut owners[lo..=hi];
+                let (drun, _) =
+                    self.dwords[LEVEL1 + 2 * lo..LEVEL1 + 2 * (hi + 1)].as_chunks_mut::<2>();
                 let (mut from, mut to) = (0, run.len());
                 if page == first && head {
-                    run[0].get_or_insert(k);
+                    if run[0].is_none() {
+                        run[0] = Some(k);
+                        drun[0] = val;
+                    }
                     from = 1;
                 }
                 if upto == last && tail && to > from {
-                    run[to - 1].get_or_insert(k);
+                    if run[to - 1].is_none() {
+                        run[to - 1] = Some(k);
+                        drun[to - 1] = val;
+                    }
                     to -= 1;
                 }
                 run[from..to].fill(Some(k));
+                drun[from..to].fill(val);
                 page = upto + 1;
             }
         }
-        // The level-1 index, then a pair and an address dword per entry,
-        // written in place: the dwords are most of what a rebuild costs.
-        let len = LEVEL1 + 2 * owners.len();
-        self.dwords.resize(len, 0);
-        let (index, entries) = self.dwords.split_at_mut(LEVEL1);
-        index.copy_from_slice(&self.level1);
-        let (entries, _) = entries.as_chunks_mut::<2>();
-        for (entry, o) in entries.iter_mut().zip(owners.iter()) {
-            *entry = match *o {
-                Some(k) => [pairs[k], copies[k].0 as u32],
-                None => [null, 0],
-            };
-        }
+        self.dwords[..LEVEL1].copy_from_slice(&self.level1);
         Built {
             dwords: &self.dwords,
             blocks: &out.blocks,
