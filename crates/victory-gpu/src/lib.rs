@@ -144,6 +144,10 @@ mod twin;
 // Windows.
 #[cfg(any(windows, test))]
 mod verify_plan;
+// mac: title ranges carved out of aliasing for withheld writes
+// (`VICTORY_WITHHELD_COPIES`); plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod carve_set;
 #[cfg(windows)]
 mod alias_verify;
 #[cfg(windows)]

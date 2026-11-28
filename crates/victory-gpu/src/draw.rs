@@ -1123,6 +1123,15 @@ impl State {
             }
             return index.map(|slot| (slot, 0));
         }
+        // mac: `VICTORY_WITHHELD_COPIES=all`: a program using title memory
+        // writes a host copy, never an alias or a view.
+        if uav
+            && list.writes_memory()
+            && crate::mac_switches::withheld_copies() == crate::mac_switches::WithheldCopies::All
+            && crate::shadow::find(address, 1).is_some_and(|s| s.is_aliased())
+        {
+            crate::shadow::carve(address, 1);
+        }
         let Some(shadow) = crate::shadow::find(address, 1) else {
             not_run("a root view outside title buffers");
             return None;

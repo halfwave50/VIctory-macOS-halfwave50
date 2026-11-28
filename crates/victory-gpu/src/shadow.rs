@@ -2165,6 +2165,45 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
         .map(|(k, _)| *k)
 }
 
+/// mac: title ranges carved out of aliasing for withheld writes
+/// (`VICTORY_WITHHELD_COPIES`, `crate::carve_set`): a lookup overlapping one
+/// is served by a host copy, never an aliased region or a view.
+static CARVED: RwLock<crate::carve_set::Carved> = RwLock::new(crate::carve_set::Carved::new());
+static ANY_CARVED: AtomicBool = AtomicBool::new(false);
+
+/// mac: whether any of `[from, to)` is carved out of aliasing.
+pub(crate) fn carved(from: u64, to: u64) -> bool {
+    ANY_CARVED.load(Ordering::Acquire) && CARVED.read().unwrap_or_else(|e| e.into_inner()).overlaps(from..to)
+}
+
+/// mac: a withheld write of `[address, address + len)` landed in title
+/// memory through an alias or a view (or, `VICTORY_WITHHELD_COPIES=all`, is
+/// about to): the innermost title buffer holding it, else its window, is
+/// carved out of aliasing for the rest of the run. Views over it leave the
+/// registries; later lookups get a host copy. Whether anything new was
+/// carved.
+pub(crate) fn carve(address: u64, len: u64) -> bool {
+    let end = address.saturating_add(len.max(1));
+    let buffer = {
+        let map = buffers_read();
+        enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end)
+            .and_then(|key| map.get(&key).map(|e| key.0..e.end))
+    };
+    let range = crate::carve_set::carve_range(address, len, buffer, loose_window_bytes());
+    if !CARVED.write().unwrap_or_else(|e| e.into_inner()).insert(range.clone()) {
+        return false;
+    }
+    ANY_CARVED.store(true, Ordering::Release);
+    drop_views(range.start, range.end, None);
+    changed();
+    true
+}
+
+/// mac: carved ranges, and their bytes (the frame line).
+pub(crate) fn carved_totals() -> (usize, u64) {
+    CARVED.read().unwrap_or_else(|e| e.into_inner()).totals()
+}
+
 /// Zero-copy title regions aliased onto host buffers (`crate::alias`), by start address.
 static ALIASED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
@@ -2446,7 +2485,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    if let Some(shadow) = find_aliased(address, end) {
+    // mac: a range carved out of aliasing (`VICTORY_WITHHELD_COPIES`) gets
+    // its title buffer's copy, or its window's.
+    if !carved(address, end)
+        && let Some(shadow) = find_aliased(address, end)
+    {
         return Some(shadow);
     }
     {
