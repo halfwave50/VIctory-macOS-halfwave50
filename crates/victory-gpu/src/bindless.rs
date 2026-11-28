@@ -125,6 +125,17 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
     }
 }
 
+fn same_seen(a: &Seen, b: &Seen) -> bool {
+    match (a, b) {
+        (Seen::Buffer(sa, aa, la, ua), Seen::Buffer(sb, ab, lb, ub)) => {
+            Arc::ptr_eq(sa, sb) && aa == ab && la == lb && ua == ub
+        }
+        (Seen::Texture(ta), Seen::Texture(tb)) => ta == tb,
+        (Seen::Left(ka), Seen::Left(kb)) => ka == kb,
+        _ => false,
+    }
+}
+
 impl Inner {
     /// One more (`add`) or one fewer slot views what `seen` reads. Whether
     /// the census's unordered ranges changed (mac: told only with
@@ -188,12 +199,220 @@ impl Inner {
         }
         unordered_changed
     }
+}
+
+/// One more (`add`) or one fewer slot views what `seen` reads, deferring hull
+/// recomputation to `dirty_hulls` so a batch updates each shadow's hull once.
+/// Takes disjoint field borrows so callers can hold `Entry` into `Inner::slots`
+/// at the same time (1 hash probe per slot, 0 clones).
+fn count_fields(
+    ranges: &mut Counts<Range, (u32, Arc<Shadow>)>,
+    textures: &mut BTreeMap<usize, u32>,
+    ends_map: &mut HashMap<(usize, bool), Ends>,
+    unordered: &mut Option<Unordered<Shadow>>,
+    seen: &Seen,
+    add: bool,
+    dirty_hulls: &mut Vec<(usize, bool)>,
+) -> bool {
+    let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
+    let mut unordered_changed = false;
+    match seen {
+        Seen::Buffer(shadow, address, len, uav) => {
+            let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
+            let e = ranges.entry_or(key, || (0, shadow.clone()));
+            let was = e.0;
+            step(&mut e.0);
+            let now = e.0;
+            if now == 0 {
+                ranges.remove(&key);
+            }
+            if (was == 0) != (now == 0) {
+                if key.3
+                    && let Some(u) = unordered
+                {
+                    if now > 0 {
+                        u.came(key, shadow);
+                    } else {
+                        u.went(&key);
+                    }
+                    unordered_changed = true;
+                }
+                let ends = ends_map
+                    .entry((key.0, key.3))
+                    .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
+                tally(&mut ends.1, key.1, now > 0);
+                tally(&mut ends.2, key.2, now > 0);
+                let hk = (key.0, key.3);
+                if !dirty_hulls.contains(&hk) {
+                    dirty_hulls.push(hk);
+                }
+            }
+        }
+        Seen::Texture(r) => {
+            let n = textures.entry(*r).or_insert(0);
+            step(n);
+            if *n == 0 {
+                textures.remove(r);
+            }
+        }
+        Seen::Left(_) => {}
+    }
+    unordered_changed
+}
+
+impl Inner {
+    fn rebuild_hulls(&mut self, dirty_hulls: Vec<(usize, bool)>) {
+        for hk in dirty_hulls {
+            let hull = self.ends.get(&hk).and_then(|(shadow, starts, ends)| {
+                let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
+                Some((shadow.clone(), from, to - from, hk.1, shadow.dirty_bit()))
+            });
+            match hull {
+                Some(hull) => {
+                    self.hulls.insert(hk, hull);
+                }
+                None => {
+                    self.ends.remove(&hk);
+                    self.hulls.remove(&hk);
+                }
+            }
+        }
+    }
+
+    fn enter_batch(&mut self, fast: &Fast<Shadow>, updates: &mut Vec<(u32, u64, Option<Seen>)>) {
+        use std::collections::hash_map::Entry;
+        let mut olds: Vec<Seen> = Vec::with_capacity(updates.len());
+        let mut dirty_hulls: Vec<(usize, bool)> = Vec::new();
+        let mut changed = false;
+
+        // Pass 1: update `slots` in one hash probe each and add all new ranges
+        // before subtracting old ones so moving ranges never hit zero mid-batch.
+        for (index, ticket, seen) in updates.drain(..) {
+            if !self.tickets.newer(index, ticket) {
+                continue;
+            }
+            match (self.slots.entry(index), seen) {
+                (Entry::Occupied(mut occ), Some(new_seen)) => {
+                    if same_seen(occ.get(), &new_seen) {
+                        continue;
+                    }
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &new_seen,
+                        true,
+                        &mut dirty_hulls,
+                    );
+                    olds.push(occ.insert(new_seen));
+                }
+                (Entry::Vacant(vac), Some(new_seen)) => {
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &new_seen,
+                        true,
+                        &mut dirty_hulls,
+                    );
+                    vac.insert(new_seen);
+                }
+                (Entry::Occupied(occ), None) => {
+                    olds.push(occ.remove());
+                }
+                (Entry::Vacant(_), None) => {}
+            }
+        }
+
+        // Pass 2: subtract replaced/cleared ranges.
+        for old in &olds {
+            changed |= count_fields(
+                &mut self.ranges,
+                &mut self.textures,
+                &mut self.ends,
+                &mut self.unordered,
+                old,
+                false,
+                &mut dirty_hulls,
+            );
+        }
+
+        // Pass 3: rebuild `hulls` once per touched `(shadow, uav)` pair.
+        self.rebuild_hulls(dirty_hulls);
+
+        if changed {
+            fast.changed();
+        }
+    }
 
     /// mac (`VICTORY_CENSUS_FAST=1`): slot `index` holds `seen`, as of the
     /// making that drew `ticket`, unless a later making of the slot is in
     /// already (`crate::census_fast::Tickets`).
     fn enter(&mut self, fast: &Fast<Shadow>, index: u32, ticket: u64, seen: Option<Seen>) {
         if !self.tickets.newer(index, ticket) {
+            return;
+        }
+        if crate::mac_switches::heap_sync_fast() {
+            use std::collections::hash_map::Entry;
+            let mut dirty_hulls = Vec::new();
+            let mut changed = false;
+            match (self.slots.entry(index), seen) {
+                (Entry::Occupied(mut occ), Some(new_seen)) => {
+                    if same_seen(occ.get(), &new_seen) {
+                        return;
+                    }
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &new_seen,
+                        true,
+                        &mut dirty_hulls,
+                    );
+                    let old = occ.insert(new_seen);
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &old,
+                        false,
+                        &mut dirty_hulls,
+                    );
+                }
+                (Entry::Vacant(vac), Some(new_seen)) => {
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &new_seen,
+                        true,
+                        &mut dirty_hulls,
+                    );
+                    vac.insert(new_seen);
+                }
+                (Entry::Occupied(occ), None) => {
+                    let old = occ.remove();
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &old,
+                        false,
+                        &mut dirty_hulls,
+                    );
+                }
+                (Entry::Vacant(_), None) => return,
+            }
+            self.rebuild_hulls(dirty_hulls);
+            if changed {
+                fast.changed();
+            }
             return;
         }
         let mut changed = false;
@@ -237,7 +456,12 @@ impl Batch<'_> {
 
     /// With no slot lock held: the updates so far, if there are a batch's.
     pub(crate) fn enter_if_full(&mut self) {
-        if self.updates.len() >= crate::census_fast::BATCH {
+        let limit = if crate::mac_switches::heap_sync_fast() {
+            2048
+        } else {
+            crate::census_fast::BATCH
+        };
+        if self.updates.len() >= limit {
             self.enter();
         }
     }
@@ -253,6 +477,10 @@ impl Batch<'_> {
             return;
         }
         let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
+        if crate::mac_switches::heap_sync_fast() {
+            inner.enter_batch(fast, &mut self.updates);
+            return;
+        }
         for (index, ticket, seen) in self.updates.drain(..) {
             inner.enter(fast, index, ticket, seen);
         }
@@ -311,8 +539,13 @@ impl Pass<'_> {
         }
         let n = updates.len();
         let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
-        for (index, ticket, seen) in updates {
-            inner.enter(fast, index, ticket, seen);
+        if crate::mac_switches::heap_sync_fast() {
+            let mut updates = updates;
+            inner.enter_batch(fast, &mut updates);
+        } else {
+            for (index, ticket, seen) in updates {
+                inner.enter(fast, index, ticket, seen);
+            }
         }
         drop(inner);
         crate::census_fast::entered(n);

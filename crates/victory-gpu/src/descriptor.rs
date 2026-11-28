@@ -347,6 +347,45 @@ fn sync(ran: Option<&dyn Fn() -> bool>) {
             }
         }
         let mut runs = runs.into_iter();
+        if told == reports::Told::No && crate::mac_switches::heap_sync_fast() {
+            const AHEAD_BATCH_PAGES: usize = 8;
+            let page_size = crate::watch::PAGE;
+            let mut batch: Vec<(u32, u32)> = Vec::new();
+            while let Some((from, to)) = runs.next() {
+                for page in (from & !(page_size - 1)..to).step_by(page_size) {
+                    let (page, end) = (page.max(from), (page + page_size).min(to));
+                    if ran.is_some_and(|ran| ran()) {
+                        if !batch.is_empty() {
+                            host.sync_pages_fast(&batch, start, step);
+                        }
+                        host.leave(std::iter::once((page, to)).chain(runs));
+                        ahead::cut();
+                        return;
+                    }
+                    if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                        continue;
+                    }
+                    let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::SyncSlots,
+                        last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                    );
+                    let (first, last) = (first as u32, last.min(u64::from(heap.desc.count)) as u32);
+                    if first < last {
+                        batch.push((first, last));
+                    }
+                    if ran.is_some() && batch.len() >= AHEAD_BATCH_PAGES {
+                        host.sync_pages_fast(&batch, start, step);
+                        batch.clear();
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                host.sync_pages_fast(&batch, start, step);
+            }
+            continue;
+        }
         while let Some((from, to)) = runs.next() {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.

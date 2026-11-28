@@ -746,6 +746,37 @@ fn spans_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// Whether descriptor heap syncs (`crate::descriptor::sync_heaps`,
+/// `crate::descriptor::host::sync_fast`) scan dirty pages in parallel with
+/// verified-block fast skips, copy staged CPU descriptors via
+/// `CopyDescriptorsSimple`, precompute `descriptor_as_data` words, skip
+/// same-buffer retirements, and update the bindless census in place. Off
+/// unless `VICTORY_HEAP_SYNC_FAST=1`.
+///
+/// mac: `VICTORY_AB=VICTORY_HEAP_SYNC_FAST` (`crate::ab`): read per heap-sync
+/// pass; both sides leave `HostHeap` and `Viewed` in the same state.
+pub(crate) fn heap_sync_fast() -> bool {
+    #[cfg(test)]
+    if tests::HEAP_SYNC_FAST_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let on = heap_sync_fast_rule(std::env::var("VICTORY_HEAP_SYNC_FAST").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_HEAP_SYNC_FAST=1: heap syncs batch dirty pages, stage buffer views for CopyDescriptorsSimple, skip same-buffer retirements, and update census slots in place"
+            );
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_HEAP_SYNC_FAST", a, |v| heap_sync_fast_rule(Some(v)))
+}
+
+fn heap_sync_fast_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// From VIctory-macOS #452 (18f33b86): whether a title copy made while a
 /// submission is prepared (not into memory shown at two addresses) makes
 /// only the pending refreshes whose queued ranges reach its window, leaving
@@ -1031,16 +1062,20 @@ mod ab_tests {
 
     #[test]
     fn on_off_switches_read_the_opposite_or_the_value_on_side_b() {
-        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_SYNC_EPOCH", "VICTORY_WIDENED_IN_PLACE"]) {
+        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_HEAP_SYNC_FAST", "VICTORY_SYNC_EPOCH", "VICTORY_WIDENED_IN_PLACE"]) {
             return;
         }
-        assert!(!flush_overlapping() && !snapshot_spans() && !sync_epoch(|| false) && !widened_in_place());
+        assert!(!flush_overlapping() && !snapshot_spans() && !heap_sync_fast() && !sync_epoch(|| false) && !widened_in_place());
         with("VICTORY_FLUSH_OVERLAPPING:10", true, || assert!(flush_overlapping()));
         with("VICTORY_FLUSH_OVERLAPPING:10", false, || assert!(!flush_overlapping(), "side A: as set"));
         with("VICTORY_FLUSH_OVERLAPPING=0:10", true, || assert!(!flush_overlapping(), "=0 on side B: off (A/A)"));
         with("VICTORY_SNAPSHOT_SPANS:10", true, || {
             assert!(snapshot_spans());
             assert!(!flush_overlapping(), "another switch keeps side A");
+        });
+        with("VICTORY_HEAP_SYNC_FAST:10", true, || {
+            assert!(heap_sync_fast());
+            assert!(!snapshot_spans(), "another switch keeps side A");
         });
         with("VICTORY_SYNC_EPOCH:10", true, || assert!(sync_epoch(|| false)));
         // A list's side, not the side now.
@@ -1476,7 +1511,7 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        AliasPhysical, WithheldCopies, alias_physical_rule, withheld_copies_rule, copy_order, epoch, heap_locks, heap_sync_pause,
+        AliasPhysical, WithheldCopies, alias_physical_rule, withheld_copies_rule, copy_order, epoch, heap_locks, heap_sync_fast_rule, heap_sync_pause,
         heap_sync_threads, key, overlapping_rule, quick, setting, spans_rule, texture_workers,
         uav_size, whole_wave_lds, writers,
     };
@@ -1593,6 +1628,37 @@ pub(crate) mod tests {
     impl Drop for SpansHere {
         fn drop(&mut self) {
             SPANS_HERE.with(|on| on.set(false));
+        }
+    }
+
+    thread_local! {
+        /// `heap_sync_fast` is on for this thread's heap syncs ([`HeapSyncFastHere`]).
+        pub(crate) static HEAP_SYNC_FAST_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) struct HeapSyncFastHere;
+
+    impl HeapSyncFastHere {
+        #[cfg_attr(not(windows), allow(dead_code))]
+        pub(crate) fn new() -> Self {
+            HEAP_SYNC_FAST_HERE.with(|on| on.set(true));
+            HeapSyncFastHere
+        }
+    }
+
+    impl Drop for HeapSyncFastHere {
+        fn drop(&mut self) {
+            HEAP_SYNC_FAST_HERE.with(|on| on.set(false));
+        }
+    }
+
+    #[test]
+    fn heap_sync_fast_is_on_only_when_asked_for() {
+        assert!(heap_sync_fast_rule(Some("1")));
+        assert!(heap_sync_fast_rule(Some(" 1 ")));
+        for off in [None, Some(""), Some("0"), Some("2"), Some("on")] {
+            assert!(!heap_sync_fast_rule(off), "{off:?}");
         }
     }
 

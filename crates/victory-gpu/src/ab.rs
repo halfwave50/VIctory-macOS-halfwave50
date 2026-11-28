@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// The switches a toggle may name, and `none`, which flips sides and
 /// changes nothing (the A/A check).
-pub(crate) const SWITCHES: [&str; 16] = [
+pub(crate) const SWITCHES: [&str; 17] = [
     "VICTORY_SYNC_EPOCH",
     "VICTORY_FLUSH_OVERLAPPING",
     "VICTORY_COPY_BACK_SPLIT",
@@ -43,6 +43,7 @@ pub(crate) const SWITCHES: [&str; 16] = [
     "VICTORY_DIRTY_ROWS",
     "VICTORY_SNAPSHOT_SPANS",
     "VICTORY_QUICK_SYNC",
+    "VICTORY_HEAP_SYNC_FAST",
     "VICTORY_PLACED_AT_ONCE",
     "VICTORY_BATCH_CLAMPS",
     "VICTORY_DISPATCH_CLAMPS",
