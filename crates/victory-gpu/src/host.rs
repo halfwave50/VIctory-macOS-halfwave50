@@ -1900,9 +1900,6 @@ impl Host {
     /// (with the queue they are of), and may be left to the host GPU
     /// without waiting for it ([`unwaited`]): whether they were.
     fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>) -> bool {
-        // (Tests: not while a test of `unwaited` has the submissions to itself.)
-        #[cfg(test)]
-        let _shared = unwaited::shared();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         // The one before, if the host GPU was not waited for, is finished
@@ -1914,6 +1911,9 @@ impl Host {
         // and it is finished at the first step that could see what it owes
         // (`beside`, `unwaited::flights`), at the latest before they go to
         // the GPU.
+        // (Tests: not while a test of `unwaited` has the submissions to itself.)
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         let (mut submitted, mut beside) = if title.is_some() && unwaited::flights::on() {
             self.submissions_beside(runs)
         } else {
