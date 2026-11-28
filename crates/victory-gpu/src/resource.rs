@@ -1668,6 +1668,14 @@ pub(crate) fn title_texture(this: This) -> Option<(texture::Layout, usize, usize
     Some((plane.layout.clone(), r.data() as usize, size))
 }
 
+/// mac (`VICTORY_DEPTH_TOUCH_LOG`, `crate::depth_touch`): dimension, width,
+/// height, format and flags of a resource of ours, as the title gave them.
+#[cfg(windows)]
+pub(crate) fn brief(this: This) -> (u32, u64, u32, u32, u32) {
+    let d = resource(this).desc;
+    (d.dimension, d.width, d.height, d.format, d.flags)
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)

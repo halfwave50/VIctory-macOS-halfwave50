@@ -403,6 +403,13 @@ pub(super) fn recorder() -> Option<&'static Recorder> {
     RECORDER.get()
 }
 
+/// mac (`VICTORY_DEPTH_TOUCH_LOG`, `crate::depth_touch`): the capture id of
+/// host object `p` (`#N` in replay reports), if the recorder is on and has
+/// seen it; never takes a new one in.
+pub(crate) fn id_of(p: usize) -> Option<u32> {
+    recorder()?.ids.get(p)
+}
+
 /// Whether the recorder is on.
 pub fn on() -> bool {
     RECORDER.get().is_some()
