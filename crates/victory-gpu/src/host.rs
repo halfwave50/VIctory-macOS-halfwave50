@@ -88,9 +88,11 @@ struct Ran {
 
 /// Submissions held off ([`Host::quiet`]).
 pub(crate) struct Quiet<'a> {
-    // Dropped in this order: the mark, then the lock.
+    // Dropped in this order: the mark, the lock, then the test lock.
     _holding: Holding,
     _held: std::sync::MutexGuard<'a, u64>,
+    #[cfg(test)]
+    _shared: unwaited::Shared,
 }
 
 pub(crate) struct Host {
@@ -1904,10 +1906,17 @@ impl Host {
             }
             return None;
         }
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // A submission the host GPU was not waited for has run too.
         self.stand();
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        Some(Quiet {
+            _holding: Holding::enter(),
+            _held: held,
+            #[cfg(test)]
+            _shared,
+        })
     }
 
     /// Runs closed lists and waits for them.
@@ -1932,6 +1941,9 @@ impl Host {
         // and it is finished at the first step that could see what it owes
         // (`beside`, `unwaited::flights`), at the latest before they go to
         // the GPU.
+        // (Tests: not while a test of `unwaited` has the submissions to itself.)
+        #[cfg(test)]
+        let _shared = unwaited::shared();
         let (mut submitted, mut beside) = if title.is_some() && unwaited::flights::on() {
             self.submissions_beside(runs)
         } else {

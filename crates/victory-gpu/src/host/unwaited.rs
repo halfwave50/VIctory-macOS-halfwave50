@@ -127,6 +127,10 @@ pub(crate) fn prewarms() -> bool {
 /// Needs our thread: with nothing else waiting, it is what finishes the
 /// submission.
 fn signals() -> bool {
+    #[cfg(test)]
+    if flights::FORCED.load(Relaxed) {
+        return on() && idler().is_some();
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     on() && *ON.get_or_init(|| {
         // mac: with flights, also with `VICTORY_ASYNC_SETTLE_ALL=1`.
@@ -269,7 +273,11 @@ fn settle_before(by: By, next: &[&HostList]) -> bool {
         return false;
     }
     let Some(host) = host() else { return false };
+    #[cfg(test)]
+    let shared = shared();
     drop(host.submissions(by, next));
+    #[cfg(test)]
+    drop(shared);
     take_done().into_iter().for_each(crate::list::recycle);
     true
 }
@@ -443,6 +451,8 @@ fn idle_event() -> Option<HANDLE> {
 /// title's next submission, which knows what runs next, comes first if it
 /// comes at once), the next a pause after the last ended.
 fn idle() {
+    #[cfg(test)]
+    tests::IS_IDLER.with(|f| f.set(true));
     // The submission rounds are paced for, and when the next one is due.
     let mut round = (0, Instant::now());
     loop {
@@ -615,6 +625,12 @@ pub(super) fn log(frames: f64) {
         early[6],
     );
 }
+
+/// Tests: taken by what waits for the submission lock ([`Host::run`],
+/// [`settle`], [`Host::quiet`]), so that it stays out while a test here has
+/// the submissions to itself.
+#[cfg(test)]
+pub(super) use tests::{Shared, shared};
 
 impl Host {
     /// The submission lock, once the submission left to the host GPU (if
@@ -1098,24 +1114,83 @@ mod tests {
     /// Our thread leaves the submission left alone while set.
     pub(super) static IDLE_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// mac: both switches on (`VICTORY_ASYNC_SUBMIT`, `VICTORY_FLIGHTS`),
-    /// and our thread held off, until dropped.
-    struct Flights;
+    /// Keeps concurrent GPU tests from settling or standing an in-flight
+    /// submission while an `unwaited::tests` test mutates the global
+    /// switches and asserts on in-flight submission counters. Normal GPU
+    /// tests take a shared read lock (no contention with each other); tests
+    /// here take the exclusive write lock.
+    static EXCLUSIVE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-    impl Flights {
-        fn on() -> Flights {
-            FORCED.store(true, Relaxed);
-            flights::FORCED.store(true, Relaxed);
-            IDLE_HELD.store(true, Relaxed);
-            Flights
+    thread_local! {
+        static OWNS_EXCLUSIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static HOLDS_SHARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static IS_IDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The shared side of [`EXCLUSIVE`], until dropped. Nothing for the test
+    /// that holds it exclusively, for our thread (which finishes what that
+    /// test leaves), and for a thread that holds it already (a submission's
+    /// dumps submit lists of their own, diagnostics): a second shared lock
+    /// would wait behind a test that waits for the first to go.
+    pub(in crate::host) struct Shared(Option<std::sync::RwLockReadGuard<'static, ()>>);
+
+    pub(in crate::host) fn shared() -> Shared {
+        if OWNS_EXCLUSIVE.with(std::cell::Cell::get)
+            || IS_IDLER.with(std::cell::Cell::get)
+            || HOLDS_SHARED.with(|h| h.replace(true))
+        {
+            return Shared(None);
+        }
+        Shared(Some(EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner())))
+    }
+
+    impl Drop for Shared {
+        fn drop(&mut self) {
+            if self.0.is_some() {
+                HOLDS_SHARED.with(|h| h.set(false));
+            }
         }
     }
 
-    impl Drop for Flights {
+    /// Exclusive access to the host submission path for tests that toggle
+    /// `FORCED`, `flights::FORCED`, or `IDLE_HELD`. Settles any in-flight
+    /// submission and resets all switches on drop, even on panic.
+    struct Exclusive(std::sync::RwLockWriteGuard<'static, ()>);
+
+    impl Exclusive {
+        fn enter(forced: bool, flights_on: bool, idle_held: bool) -> Exclusive {
+            let guard = EXCLUSIVE.write().unwrap_or_else(|e| e.into_inner());
+            OWNS_EXCLUSIVE.with(|f| f.set(true));
+            settle(By::Signal);
+            IDLE_HELD.store(idle_held, Relaxed);
+            flights::FORCED.store(flights_on, Relaxed);
+            FORCED.store(forced, Relaxed);
+            Exclusive(guard)
+        }
+    }
+
+    impl Drop for Exclusive {
         fn drop(&mut self) {
+            settle(By::Signal);
             IDLE_HELD.store(false, Relaxed);
             flights::FORCED.store(false, Relaxed);
             FORCED.store(false, Relaxed);
+            OWNS_EXCLUSIVE.with(|f| f.set(false));
+            let _ = &self.0;
+        }
+    }
+
+    /// mac: both switches on (`VICTORY_ASYNC_SUBMIT`, `VICTORY_FLIGHTS`),
+    /// and our thread held off, exclusively, until dropped.
+    struct Flights {
+        _exclusive: Exclusive,
+    }
+
+    impl Flights {
+        fn on() -> Flights {
+            Flights {
+                _exclusive: Exclusive::enter(true, true, true),
+            }
         }
     }
 
@@ -1930,14 +2005,14 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        FORCED.store(true, Relaxed);
+        let _exclusive = Exclusive::enter(true, false, false);
         let word = Box::new(AtomicU64::new(0));
         let list = std::sync::Arc::new(host.new_list().unwrap());
         list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
         list.close();
         let back = host.execute_title(1, vec![list.clone()]);
         // Left (or waited for, in a diagnostics build that captures): a
-        // Signal finishes it, if another test's submission has not.
+        // Signal finishes it, if our thread has not already.
         settle(By::Signal);
         FORCED.store(false, Relaxed);
         assert_eq!(word.load(Acquire), 7, "the bottom-of-pipe write was made");
@@ -1973,6 +2048,7 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        let _exclusive = Exclusive::enter(false, false, false);
         let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
         for (forced, split) in [(true, true), (false, true), (true, false)] {
             FORCED.store(forced, Relaxed);
