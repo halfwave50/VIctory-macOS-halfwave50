@@ -87,6 +87,7 @@ You need:
    ```bash
    tools/macos/play-main-mac.sh <the game's executable>
    ```
+   On a Mac with 24 GB, use `tools/macos/play-24gb.sh <game folder>` instead (run it once with `warmup` after it first, and after every translator change): the settings this branch was measured with, 163-164 ms a frame in the prison cell on a Mac mini M5 Pro (halfwave50/VIctory-macOS-halfwave50#8).
 
 [docs/macos.md](docs/macos.md) explains every Mac fix and problem in detail.
 
