@@ -398,6 +398,7 @@ fn create() -> windows::core::Result<Host> {
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
         crate::pipeline::note_skips();
+        crate::pipeline::no_depth_write::note();
         crate::ambient::announce();
         crate::ray_skip::announce();
         crate::texback::announce();

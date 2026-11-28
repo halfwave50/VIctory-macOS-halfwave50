@@ -1135,6 +1135,10 @@ fn read_stream(
         };
         at += size;
     }
+    // mac (`VICTORY_NO_DEPTH_WRITE`, off by default): listed pixel shaders'
+    // pipelines get no depth write.
+    #[cfg(windows)]
+    no_depth_write::apply(&shaders, &mut graphics);
     (shaders, graphics)
 }
 
@@ -1163,6 +1167,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod no_depth_write;
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod screen;

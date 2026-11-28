@@ -151,6 +151,12 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// mac (`VICTORY_NO_DEPTH_WRITE`, `super::no_depth_write`): the
+    /// depth-stencil state, to change before the pipeline is made.
+    pub(super) fn depth_mut(&mut self) -> &mut D3D12_DEPTH_STENCIL_DESC {
+        &mut self.depth
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///

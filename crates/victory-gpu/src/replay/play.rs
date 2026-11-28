@@ -423,6 +423,24 @@ impl Report {
     }
 }
 
+/// mac: a recorded pipeline's parts with no depth write, when
+/// `VICTORY_NO_DEPTH_WRITE` names its pixel shader
+/// (`crate::pipeline::no_depth_write`); `None` to make it as recorded.
+fn no_depth_write(name: &str, parts: &[wire::Part]) -> Option<Vec<wire::Part>> {
+    if !crate::pipeline::no_depth_write::replay_listed(name) {
+        return None;
+    }
+    let mut parts = parts.to_vec();
+    for part in &mut parts {
+        if let wire::Part::Plain { kind, data } = part
+            && let Some(old) = crate::pipeline::no_depth_write::zero_write_mask(*kind, &mut data.0)
+        {
+            tracing::info!(pipeline = name, old_write_mask = old, "VICTORY_NO_DEPTH_WRITE: replayed pipeline gets no depth write");
+        }
+    }
+    Some(parts)
+}
+
 /// The stages of a pipeline as the runtime names them (`[mesh 0123456789abcdef,
 /// pixel ...]`, the hashes those of the title's containers): for each of its
 /// shader parts, in order, the stage and hash, if the name has them.
@@ -1283,7 +1301,11 @@ impl Player {
                         };
                         let root = |id: u32| roots.get(&id).cloned();
                         let taken = std::cell::Cell::new(false);
-                        let mut m = super::pso::make(&device, &p.parts, root, |i| {
+                        // mac: `VICTORY_NO_DEPTH_WRITE` as in a run
+                        // (`crate::pipeline::no_depth_write`).
+                        let parts = no_depth_write(&p.name, &p.parts);
+                        let parts = parts.as_deref().unwrap_or(&p.parts);
+                        let mut m = super::pso::make(&device, parts, root, |i| {
                             let other = shaders.and_then(|dir| {
                                 shader_files(frame, p, i)
                                     .iter()
@@ -1296,7 +1318,7 @@ impl Player {
                             // Not for the root signature or the other stage
                             // recorded.
                             kept.fetch_add(1, Ordering::Relaxed);
-                            m = super::pso::make(&device, &p.parts, root, recorded);
+                            m = super::pso::make(&device, parts, root, recorded);
                         } else if taken.get() {
                             swapped.fetch_add(1, Ordering::Relaxed);
                         }
