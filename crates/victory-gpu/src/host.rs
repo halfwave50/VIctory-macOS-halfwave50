@@ -7086,6 +7086,9 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // (Not while a test of `unwaited` has one left on the GPU: the
+        // lock below is taken as a submission takes it.)
+        let _shared = super::unwaited::shared();
         let mark = host.mark().expect("the mark list");
         let list = host.new_list().unwrap();
         list.close();
@@ -7107,6 +7110,8 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // (As above: the mark armed below would run over one left.)
+        let _shared = super::unwaited::shared();
         let mark = host.mark().expect("the mark list");
         let old = host.queue();
         {
