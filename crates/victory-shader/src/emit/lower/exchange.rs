@@ -167,6 +167,21 @@ pub(super) fn want_lds(p: &Program) {
     });
 }
 
+/// What the exchanges ask of the program alone, not of a lowering's state:
+/// kept across the retries of one lowering ([`lower_pruned`]), each of which
+/// starts a new [`Lower`] and would work them out again. A phi that does not
+/// settle starts the lowering over, and one sun-shadow program the walk opens
+/// was lowered 222 times (74 retries in each of three forms), these most of
+/// each: kept, it took 23 s instead of 70 natively on an M1 Pro (286 s in a
+/// run under Wine). A retry still notes in its own [`State`] when it first
+/// asks, so it lowers as it did on its own.
+#[derive(Default)]
+pub(super) struct Kept {
+    once: std::cell::OnceCell<Vec<bool>>,
+    together: std::cell::OnceCell<together::Together>,
+    met: std::cell::OnceCell<Option<Vec<bool>>>,
+}
+
 /// The exchanges of one program.
 #[derive(Default)]
 pub(super) struct State {
@@ -219,7 +234,9 @@ impl Lower<'_> {
         if !(self.halves && self.x.mac.exchange) {
             return false;
         }
-        let once = self.exchange.once.get_or_insert_with(|| lds_order::once(p))[b];
+        let kept = self.kept;
+        let once = (self.exchange.once)
+            .get_or_insert_with(|| kept.once.get_or_init(|| lds_order::once(p)).clone())[b];
         if !once {
             WANTED.with(|w| w.borrow_mut().as_mut().map(|blocks| blocks.push(b)));
         }
@@ -386,11 +403,13 @@ impl Lower<'_> {
     /// meet and load, or none does; on a cycle they do so each round
     /// ([`Lower::exchange_again`]).
     fn exchange_together(&mut self, b: usize) -> bool {
-        let x = self.x;
+        let (x, kept) = (self.x, self.kept);
         let together = self.halves
             && x.mac.exchange
             && x.mac.walk
-            && self.exchange.together.get_or_insert_with(|| together::blocks(x)).blocks[b];
+            && (self.exchange.together)
+                .get_or_insert_with(|| kept.together.get_or_init(|| together::blocks(x)).clone())
+                .blocks[b];
         together || self.exchange_met(b)
     }
 
@@ -403,13 +422,18 @@ impl Lower<'_> {
     /// loop's body) does not change how often the block runs. Ended threads
     /// are left out: an ended half would leave its slot unwritten.
     fn exchange_met(&mut self, b: usize) -> bool {
-        let x = self.x;
+        let (x, kept) = (self.x, self.kept);
         if !(self.halves && x.mac.exchange && x.mac.walk && x.mac.whole_wave) {
             return false;
         }
         // (`together` keeps the cycles for `exchange_again`.)
-        self.exchange.together.get_or_insert_with(|| together::blocks(x));
-        let met = self.exchange.met.get_or_insert_with(|| lds_rounds::met_with(x, false));
+        (self.exchange.together)
+            .get_or_insert_with(|| kept.together.get_or_init(|| together::blocks(x)).clone());
+        let met = (self.exchange.met).get_or_insert_with(|| {
+            kept.met
+                .get_or_init(|| lds_rounds::met_with(x, false))
+                .clone()
+        });
         met.as_ref().is_some_and(|m| m[b])
     }
 

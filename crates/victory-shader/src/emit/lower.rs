@@ -224,8 +224,10 @@ pub(crate) fn lower_pruned(
     keep: Option<&KeptOutputs>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // What every retry would work out again from the program alone.
+    let kept = exchange::Kept::default();
     loop {
-        match Lower::new(parts, &bad, keep).run() {
+        match Lower::new(parts, &bad, keep, &kept).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -322,6 +324,8 @@ struct Lower<'a> {
     keep: Option<&'a KeptOutputs>,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// What the exchanges ask of `x` alone, kept across retries.
+    kept: &'a exchange::Kept,
     lane_fail: Map<Value, Why>,
     vals: Map<Value, Val>,
     floats: Map<Value, V>,
@@ -740,7 +744,12 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&'a KeptOutputs>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        keep: Option<&'a KeptOutputs>,
+        kept: &'a exchange::Kept,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -918,6 +927,7 @@ impl<'a> Lower<'a> {
             keep,
             x,
             bad,
+            kept,
             lane_fail: Map::default(),
             vals: Map::default(),
             floats: Map::default(),
@@ -10956,6 +10966,40 @@ impl<'a> Lower<'a> {
                 self.len += 1;
                 self
             }
+            /// Its conditions as a set: sorted, each once, the rest of the
+            /// array as in an empty one.
+            fn set(&self) -> Known {
+                let mut c = self.conditions;
+                c[..self.len].sort_unstable();
+                let mut set = Known {
+                    conditions: [(Bool::FALSE, false); MAX_KNOWN],
+                    len: 0,
+                };
+                for &x in &c[..self.len] {
+                    if set.len == 0 || set.conditions[set.len - 1] != x {
+                        set.conditions[set.len] = x;
+                        set.len += 1;
+                    }
+                }
+                set
+            }
+            /// Whether `sets` holds a subset of this set (one made by
+            /// [`Known::set`]): at most 2^4 lookups.
+            fn covered(&self, sets: &Set<Known>) -> bool {
+                (0..1u32 << self.len).any(|pick| {
+                    let mut sub = Known {
+                        conditions: [(Bool::FALSE, false); MAX_KNOWN],
+                        len: 0,
+                    };
+                    for (i, &x) in self.get().iter().enumerate() {
+                        if pick >> i & 1 == 1 {
+                            sub.conditions[sub.len] = x;
+                            sub.len += 1;
+                        }
+                    }
+                    sets.contains(&sub)
+                })
+            }
         }
         let none = Known {
             conditions: [(Bool::FALSE, false); MAX_KNOWN],
@@ -10964,7 +11008,8 @@ impl<'a> Lower<'a> {
         let (p, st) = (self.x.p, &self.x.st);
         let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, none)).collect();
         let mut live = Set::default();
-        let mut seen = Map::<Value, Vec<Known>>::default();
+        // Per phi, the sets of conditions it was followed with.
+        let mut seen = Map::<Value, Set<Known>>::default();
         // Whether some lane meets each set of conditions: paths into a join
         // ask again for the same sets.
         let mut meets = Map::<Known, bool>::default();
@@ -10973,14 +11018,16 @@ impl<'a> Lower<'a> {
                 continue;
             };
             let done = seen.entry(v).or_default();
-            // Known of fewer lanes than before: nothing new is live.
-            if done
-                .iter()
-                .any(|d| d.get().iter().all(|c| known.get().contains(c)))
-            {
+            // Known of fewer lanes than before (every condition of an
+            // earlier path among these): nothing new is live. Looked up by
+            // the subsets of this path's conditions, not by a pass over the
+            // earlier paths: one sun-shadow program's phis gathered
+            // thousands each, 5.9 billion comparisons a lowering.
+            let set = known.set();
+            if set.covered(done) {
                 continue;
             }
-            done.push(known);
+            done.insert(set);
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
