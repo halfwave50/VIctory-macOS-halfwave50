@@ -51,7 +51,7 @@ pub(in crate::host) static FORCED: std::sync::atomic::AtomicBool = std::sync::at
 /// the host GPU still runs (`VICTORY_FLIGHTS=1`, with `VICTORY_ASYNC_SUBMIT=1`).
 pub(crate) fn on() -> bool {
     #[cfg(test)]
-    if FORCED.load(Relaxed) {
+    if FORCED.load(Relaxed) && super::tests::ours() {
         return super::on();
     }
     static ON: OnceLock<bool> = OnceLock::new();
