@@ -1,216 +1,153 @@
-<p align="center"><img src="docs/images/banner.svg" alt="VIctory for macOS: a neon tropical sunset with palm trees, a coastal skyline and a MacBook on the shore"></p>
+# Halfwave: VIctory for Apple Silicon Macs
 
-<h1 align="center">VIctory for macOS</h1>
+<img width="1600" alt="GTA VI on an M4 Pro: player control in the prison cell at sunset, VIctory's fps line in the window title" src="https://github.com/user-attachments/assets/3ef3c9ee-b506-40e6-a2e9-7ec69acc906a" />
 
-<p align="center">
-Grand Theft Auto VI is only out on consoles. This project runs the Xbox Series build on Apple Silicon Macs, from a copy of the game that you own.<br>
-It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which does the same on Windows, and it brings that work to the Mac through Wine and Metal.
-</p>
+**Halfwave** runs the Xbox Series build of GTA VI on an Apple Silicon Mac (Wine plus Apple's D3DMetal), from a copy of the game that you own. It combines our own Mac fixes with fixes from the Windows forks, and every change is measured on a MacBook Pro M4 Pro (48 GB).
 
-<p align="center">
-<img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
-<img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="701 tests passed" src="https://img.shields.io/badge/tests-701%20passed-2ea44f">
-<img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
-</p>
+**Source code only, nothing from the game.** You need your own copy of the game.
 
-<p align="center">
-If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTRIBUTING.md">CONTRIBUTING.md</a>. Help is welcome at every level.
-</p>
+## Status (28 November 2026)
 
-> [!WARNING]
-> **A note from the maintainer.** I am a student, and I run this project with Claude on a free Claude Pro plan from Anthropic. Reviewing pull requests, answering issues and fixing bugs today used up half of my weekly Claude limit in a single day. My limit resets on Saturday, 28 November, so until then I will be slower to review, reply and merge. Thank you for your patience, and please keep sending reports and pull requests in the meantime.
->
-> If you would like to help, a sponsored Claude Pro or Max subscription or some Anthropic API credits would let me keep up with the project at its current pace. I would be very grateful for either. Please reach out on email if you can help: pragyaangaur12@gmail.com
+**It works:**
+- The game loads the world and gives player control. Saved games load, free roam included.
+- Sunlight and shadows are right, rooms have fill light, and characters and clothes draw.
+- Screen reflections reach the picture: water reflects the sky, and the steel objects in the prison cell get light. The far reflection pass runs again, without the blocks it used to draw on water.
+- The water simulation runs, so the boat's wake and spray show.
+- Cutscenes are sharp up to the black bars; the blurred band along the bars is fixed.
 
-> [!IMPORTANT]
-> **The game is not playable yet, on the Mac or anywhere else.** On testers' Macs the game starts, plays its intro and audio, shows its loading screens, and on 25 November the game world appeared on two Macs (#50). Nobody has reached gameplay yet. The loading freezes testers hit on 25 November were two deadlocks inside Wine, found by LakshanSivakumar and fixed in #72, #75 and #78. With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` the game now loads into the world without freezing on an M5 Pro and an M3 Max, and stays there for over 20 minutes. It is still far too slow to play, but getting faster: #111 cut world frames from about 4.5 seconds to 2.4 to 2.9 seconds on an M5 Pro (#50). With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1`, loading now runs at about 26 to 30 fps instead of 8 (#59, #60). VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+**Speed:**
 
-## What works today
+| Place | Series X profile | With 1920x1080 output | Series S profile, 1280x720 output |
+|---|---|---|---|
+| Prison checkpoint | 2.9–3.4 fps | 3.9 fps | |
+| Boat mission opening (cutscene on the boat) | 4.5–5.0 fps | 4.9 fps | 7.5 fps (one run) |
+| Driving the boat (play, "Follow the plane") | | 2.0 fps (median of a 9-minute play run) | |
 
-Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite passes on a MacBook with an M4 chip.
+Prison numbers are for the still view once the camera has settled; the first minute runs at 2.3–2.8 fps. On the newest launcher settings, with the far reflection pass back in, the prison runs at 2.9–3.0 fps (3.1–3.2 earlier on 28 November). The Series S profile halves the GPU's share of each frame: the game's opening runs at 4.2–4.3 fps there against 2.9 on Series X, so our own preparing work is now the larger part of the frame. The boat-opening numbers are for the cutscene that starts the mission, measured 30–90 s after the first world frame. Earlier figures of 4.7 fps (6.0 at 1920x1080) were the same cutscene. It had dropped to 4.1 fps with a wider flicker setting in the launcher; back on the narrower one it runs at 4.5–5.0 in the 28 November runs. Driving is the speed you get in play: about 2 fps. There Apple's Metal HUD shows the GPU busy for only 75–100 ms of a 500 ms frame, so most of the time goes to waiting, most likely between GPU submissions. The next speed work targets it. 3840x2160 output at render scale 0.5 (1080p inside) gives 3.2–3.4 fps in the prison. Replayed frames without the game show the GPU's own share on the Series X profile: 139 ms a frame in the prison and 159 ms at the boat, so that profile can't pass about 6–7 fps even with no CPU work; faster goals need a smaller render size.
 
-| Part | What it does | On the Mac |
-| --- | --- | --- |
-| Loader | Maps the game's executable and DLLs into one process and runs its code unchanged | Works |
-| Console runtime | Stands in for the Xbox: memory, files, saves, input, audio and network rules | Works |
-| GPU layer | Turns the console's Direct3D 12.X into desktop Direct3D 12 | Works on Metal through D3DMetal |
-| Shader recompiler | Recompiles the console GPU's shaders, checked against the hardware's results | All 69 checks pass on Metal |
-| Test suite | 711 tests across every crate | 701 passed, 0 failed, 10 ignored |
+**Not yet:**
+- Playable speed. The next goal is 5 fps, then 10 fps at 1080p.
+- Some runs fall into a slow state partway through: about a third of the runs at the prison and at the boat (25 of 84 on 28 November; about 2.2 fps in the prison's first minute). Each GPU submission then waits 3 to 4 times longer inside macOS's GPU submit call while the GPU itself is mostly idle. Slow runs show one sign: macOS takes several gigabytes of the game's GPU memory out of wired memory (3 to 13 GB, against under 1 GB in most fast runs). Kernel call stacks of a slow run show the GPU driver, inside the submit call, first freeing wired memory and then wiring what the submission needs; a fast run almost never does either. The driver's code shows when: if the memory a submission still needs wired is more than the room left under macOS's system-wide wiring limit, the driver first evicts other GPU memory, and in slow runs it runs out of memory it may evict (its kernel log says "FAILED To Free" 52 to 140 times in each slow run checked, never in a fast one). It is not general memory pressure: giving up 6.5 GB of the game's other memory didn't prevent it. None of the GPU memory settings tried so far prevents it: macOS's collector of wired GPU memory off (3 of 8 runs still slow), a fixed 30 GB floor (3 of 10), that floor without the driver's own adjustment (1 of 7), and a 40 GB limit on wired GPU memory (4 of 7). A higher system-wide wiring limit is being tested now.
+- A rare crash: in about 1 run in 27 the game's own watchdog stops it, minutes into the world (1 in 64 with zero-copy buffers off). One lead: some GPU work reads game memory that isn't mapped yet, and with zero-copy buffers its wrong results land in game memory instead of being thrown away (about 20 MB a frame in the prison cell). Not proven. Since the launcher turned on the null page (`VICTORY_NULL_PAGE=1`), none of those writes land any more at the prison or the boat; `VICTORY_WITHHELD_COPIES=1` (off, no speed cost) stays as a net for other scenes. Whether the crash is gone will take many more runs.
+- In free roam some objects flicker black for one frame. The launcher fixes the main cause: a texture slot the game rewrites keeps its old texture until the new one is ready. It is not yet checked by eye in free roam. The launcher also keeps short button taps and lets the world run closer to real time; neither is tried in play yet.
+- In one play run the controller stopped responding soon after driving began. The launcher now restarts a pad read that stops (`VICTORY_PAD_REARM=1`) and doesn't send the game's rumble to the pad, the likeliest cause; not tried with a pad yet.
+- Ray tracing waits for more speed. The game's ray-tracing structures build on the Mac (`VICTORY_BVH_BUILDER=1`, off), and the builder alone kept 5.0 fps in one boat-cutscene run, but once the rays reach all their memory (`VICTORY_POINTER_PAGES=3`) the cutscene drops to about 1.1–1.3 fps.
+- Distant trees and buildings appear 5 to 35 s late after a camera cut, so wide shots miss them. The game streams them in too slowly here.
+- Night streets and rooms look flatter than on the console, because our fill light's minimum level outweighs the lamps. The launcher now uses a lower minimum (0.1 instead of 0.3), which brings back part of the contrast. One black patch on water.
+- At 1920x1080 output the game's interface is drawn twice too large.
 
-<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 701 passed and 0 failed"></p>
-
-This is the real result of a clean run of `./setup.sh` followed by the test suite on a MacBook with an M4 chip.
-
-Getting there took a few Mac-specific fixes, and each one is explained in [docs/macos.md](docs/macos.md). Two of them fixed real bugs that would have broken the picture on screen. Texture uploads were being skipped because Wine cannot see the memory that D3DMetal maps, and Metal's `sin` and `cos` return 0 where the console GPU returns NaN.
-
-## What testers see in the game
-
-Several people who own the game have run it on their Macs and reported back in the issues. The game starts, plays its audio and runs its menus, and on current main the picture shows on Series X. Here is what they have seen so far.
-
-| Mac | What happened | Issue |
-| --- | --- | --- |
-| M5 MacBook Air | Got past the early Rosetta hang. The intro animation and the menu appeared with a local workaround that showed the game's 3840x2160 image directly, and the first scene's audio played. Without the workaround the window stays black. | #1, #15 |
-| M5 Pro | With the Series S profile the game presented 64 frames of real drawing, all of them black, and then stopped on one of the game's own checks during start-up. Packages kept one per subfolder made it stop even earlier, and VIctory now says so at start-up. | #24 |
-| M5 | At the Player prompt the game's 3840x2160 image held the picture while the 1920x1080 image sent to the window was black. | #15 |
-| M2 Max, 32 GB, Series X | On 25 and 26 November, with CrossOver 26.3 and D3DMetal 4.0 beta 3, #167, #178 and local unmerged patches (mesh output counting and linking, and an opt-out of the wave32 path), the game reached the in-world prologue cinematics and the opening credits, with `VICTORY_KEYS` passing the prompts. In one earlier run the gameplay HUD appeared on screen; that player control responds has not been verified. Compiler disconnects fell to 0 and one mesh-size rejection remained. Heavy frames took about 2 to 10 s. Some runs ended in the game's heartbeat check, at different times in the world, and others reached a 30-minute cap. In the two runs that held A for 30 s during the opening cinematic, the picture went almost empty, which the runs without that hold did not do. | #28 |
-| M2 Pro, 32 GB, Series X | On 25 and 26 November the game reached the world, the opening credits and the prologue's first gameplay prompt ("Move around / Move the camera"), and the camera followed input from the keyboard stand-in pad, at about 2 s per world frame. One run lasted almost 35 minutes before the game's watchdog stopped it. On main `b6dd0b1` with fault tracking the prologue yard drew recognisably (fence, guard tower, sky, figures), where a day earlier it was red and neon smears. Lighting is still broken and some layers are stale. | #50, #131 |
-| M4, 16 GB | The game reached the world with its HUD (the minimap and the street panel) and the opening credits at 1280x720, at about 2.4 to 3.6 s per frame and 1,000 to 2,000 draws per frame. Turning on the atomic lock rounds (#257) took a world frame from 2.9 s to 0.88 s. | #240 |
-| M4 Pro | The same build with only `VICTORY_ATOMIC_LOCK_ROUNDS` changed took a world frame from 5.29 s to 0.71 s and stopped the GPU resets (32 or more queue recoveries before, none after). That is why the rounds are now on by default under Wine (#307). | #240 |
-| M5 Pro, 24 GB, Series X | On 25 November, with the store patch and fault tracking on, the account picker, the setup screens and the legal notices ran at 25 to 30 fps. About three minutes in, the game reached the "Vice City, two years ago" title card at 2 to 5 seconds per frame and stayed alive there. | #65 |
-| M5 Pro, Series X | On 25 November, with no variables set, the game ran its intro and loading at 25 to 30 fps, then its draw count jumped to 3,000 to 3,900 per frame, which suggests it was drawing the world, though the screen stayed grey at 0.1 fps. A later run with `VICTORY_PATCH_MASKED=all` only went on into the world and drew a dark city skyline, still at 0.1 fps. After the freeze fixes, plain main with `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` loaded into the world with up to 5,400 draws per frame and no freeze, at 0.2 fps. With #111 (fewer memory mappings under Wine's one memory lock) world frames fell from 4.5 s to about 2.4 to 2.9 s while it copied 57 to 83 GB of memory per frame. With the store patch and fault tracking on, copies stayed under a few MB per frame through loading, and it froze about three minutes in. That freeze led to #63. | #50 |
-| M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. In a later run the game world appeared on screen before the game's own watchdog stopped it, with frames taking up to 28 seconds, most of it copying memory. With the store patch from #59 and #60 and fault tracking on, loading ran at 26 fps instead of 8 and copies fell from 158.7 MB to under 1 MB per frame, until a freeze about three minutes in. After the freeze fixes, plain main stayed in the world for over 20 minutes without freezing, at 0.1 to 0.2 fps, with far fewer shader compiler crashes (37 against about 150). With today's speed changes frames there were 14% faster, and a later run stayed in the world for 11 minutes before the game's own timing checks gave up at about 12 seconds per frame. | #50 |
-
-<p align="center"><img loading="lazy" src="https://github.com/user-attachments/assets/02bc86ef-2b66-4b39-91de-4d8d398833d6" width="480" alt="The prologue yard of the game on an M2 Pro under VIctory"><br><sub>The prologue yard on cocobailey's M2 Pro on main <code>b6dd0b1</code>, 26 November 2026 (#50).</sub></p>
-
-<p align="center">More screenshots and videos from testers are in <a href="docs/gallery.md">docs/gallery.md</a>.</p>
-
-The black screen from #15 is solved: VIctory now shows the larger of the images the game presents, and `VICTORY_PRESENT_COMPOSITE=1` also draws the Series S overlay on top. Loading used to crawl because VIctory copied all of the game's memory on every submission, since tracking which pages changed hangs Rosetta on the game's AVX stores. #59 and #60 rewrite those 1,234 stores at load time so tracking can run. The loading freeze is fixed: Wine's file metadata calls from our shader cache (#72, #75) and write guards that reached the process heap (#78) caused two deadlocks. The open problems now are the game's speed in the world (about 2 to 3 seconds per frame on most Macs, and under 1 second with the atomic lock rounds from #257, which are now the default under Wine; the time is split between preparing copies, the GPU, copying back and memory protection changes), lighting that is still broken in the world (#15) and crashes in Apple's shader compiler while the game builds its world shaders.
+Recent changes: [WHATS-NEW.md](WHATS-NEW.md).
 
 ## How it works
 
-<p align="center"><img src="docs/images/stack.svg" width="720" alt="The layers between the game and the Mac: the game's code, VIctory, CrossOver Wine and D3DMetal, Rosetta 2 and Metal, and the Apple Silicon Mac at the bottom"></p>
+| Part | What it does | Status |
+|---|---|---|
+| Loader | VIctory's PE loader maps the game's Xbox Series executable into a Windows x64 process under Wine, which runs on Apple Silicon through Rosetta 2 | ✅ |
+| Console runtime | VIctory's HLE layer stands in for the console's system libraries (`xgameruntime`, `d3d12_xs`) | ✅ |
+| GPU layer | Turns the console's D3D12 calls, descriptors and command lists into PC D3D12, which Apple's D3DMetal runs on Metal | ✅ world, sunlight, shadows, reflections · 🟡 ray tracing off by default |
+| Shader recompiler | Recompiles the console GPU's RDNA 2 shaders to HLSL and DXIL; D3DMetal turns DXIL into Metal | ✅ all 69 shader checks pass on Metal |
+| Textures | Detiles the console's tiled textures for the Mac GPU | ✅ |
+| Speed | | 🟡 2 fps driving, 2.9–3.4 in the prison cell, up to 5.0 in cutscenes (7.5 on the Series S profile at 720p; M4 Pro); the goal is 5 fps, then 10 at 1080p |
 
-The Xbox Series version of the game is x86-64 code, like a Windows program. VIctory loads that code and supplies everything the console would have supplied. On a Mac, VIctory itself runs as a Windows program:
+Tests: `cargo test --workspace` runs the loader, HLE and shader tests; [docs/macos.md](docs/macos.md) has the results under Wine.
 
-- **Rosetta 2** runs the x86-64 code, including the AVX2 instructions that the game uses.
-- **CrossOver Wine** provides Windows. The setup builds it from the source that CodeWeavers publishes, because Apple's D3DMetal only works with that branch of Wine.
-- **D3DMetal**, from Apple's Game Porting Toolkit, turns Direct3D 12 into Metal.
+## Tested on
 
-## Set it up in three steps
+| Mac | Memory | Speed | Note | When (UTC) | Build |
+|---|---|---|---|---|---|
+| MacBook Pro M4 Pro | 48 GB | 2.9–3.0 fps prison, 4.5–4.7 boat opening cutscene (Series X); 4.2–4.3 game opening on Series S at 1280x720; 2.0 driving the boat at 1080p (27 Nov) | Our test Mac | 28 Nov 12:31 | [e251a78](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/e251a78bab28) |
+| MacBook Pro M5 Pro | 24 GB | 4.1 fps prison cell (243 ms median; 4K output, scale 0.5, render targets sized by the scale, `VICTORY_ALIAS_BUFFERS=0`); 3.9 fps (259 ms) on f230de6 | "the new code is about 6% faster in the cell"; six switches on top gave nothing ([1](https://github.com/pragyaangaur/VIctory-macOS/issues/455#issuecomment-7206500809), [2](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1#issuecomment-7231869693), [3](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1#issuecomment-7237639152)) | 28 Nov 10:03 | main-mac 5493962 + local patch |
+| MacBook Air M5 | 16 GB | 1.9 fps at the start (Series S), slowing to 0.25 fps over a 20-minute run | "The best result I've seen on my 16 GB M5 MacBook Air" ([report](https://github.com/pragyaangaur/VIctory-macOS/issues/455)) | 27 Nov 01:24 | 8616bd6 + memory marks (#456) |
+| MacBook Pro M2 Pro | 32 GB | 1.3 fps prison cell (2.7 fps at 1080p); 1.4 fps prologue yard (0.7 upstream) | "The picture is very close to your screenshot"; no world stall in 10 runs ([1](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1#issuecomment-7207381523), [2](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1#issuecomment-7208668352)) | 27 Nov 03:03 | main-mac + upstream #445 |
+| Mac mini M5 Pro (Mac17,16) | 24 GB | 6.1 fps prison cell (163 ms median; 1080p output, scale 0.5); 5.1 fps (195 ms) before their picks; 4.1 fps (242 ms) on 27 Nov | Upstream picks, guard work and flights on; "21 minutes in the cell on the final build, with no panic and no crash" ([PR #8](https://github.com/halfwave50/VIctory-macOS-halfwave50/pull/8), [PR #2](https://github.com/halfwave50/VIctory-macOS-halfwave50/pull/2)) | 28 Nov 03:46 | public main-mac cbf96d2 + 54 commits (PR #8) |
+| MacBook Pro M5 Pro | 64 GB | 2.85 fps prison cell (~350 ms, release build); 2.2 fps while recording | Opening cell to the guard with player control; "a backlit player goes near-black" ([clip](https://github.com/pragyaangaur/VIctory-macOS/issues/513#issuecomment-7212488761)) | 27 Nov 07:27 | their integration branch (main d2b4889 + patches) |
+| M4 (model not given) | 16 GB | 1.1–1.4 fps prison cell (750–880 ms, GPU-bound; Series S, 720p output) | Inmates whole; with level 8 "0 dropped mesh pairs from the intro to the cell", haze gone with `estimate:0.7` + `VICTORY_AMBIENT_AIR=1.5` ([1](https://github.com/pragyaangaur/VIctory-macOS/issues/455#issuecomment-7214957684), [2](https://github.com/pragyaangaur/VIctory-macOS/issues/455#issuecomment-7220336191)) | 27 Nov 14:06 | current main + our mesh row merge levels 3–8 |
+| MacBook Pro M5 Pro | 48 GB | 1.9 fps scripted opening (529 ms median, 342 ms GPU; Series X, warm run) | Port of our mesh row merge: all four ground pairs link, "no dropped mesh draws" ([comment](https://github.com/pragyaangaur/VIctory-macOS/issues/455#issuecomment-7221435422)) | 27 Nov 14:57 | main a31fcca1 + #578 |
+| MacBook Pro M4 Pro (Mac16,8) | 48 GB | 3.3 fps prison cell, standing (299 ms average, 288 ms median, 109 ms GPU; Series X, 720p output); 3.4 on 4396e31b, 3.0 on d1609d9 | "Speed: no change from 4396e31b9e72 here"; pop-in still there ([comment](https://github.com/pragyaangaur/VIctory-macOS/issues/131#issuecomment-7236556742)) | 28 Nov 08:23 | main cade9e0 |
+| M5 (model not given) | 16 GB | 2.7 fps (369 ms median, 113 ms GPU; Series S, native 720p) with `VICTORY_LOOP_ENTRY_EXIT=1`; 1.8 fps (559 ms) without | Strand hair pass `CS_VisHair` no longer spins to the loop cap, "with the same picture" ([comment](https://github.com/pragyaangaur/VIctory-macOS/issues/131#issuecomment-7225530964)) | 27 Nov 18:28 | upstream PR #610 |
+| MacBook Pro M1 Max | 32 GB | 1.0 fps prologue cell (1,044 ms average; Series X, 1080p output) | World draws with upstream #514 (`VICTORY_BARRIER_AFTER_CAP=1`); white flashes, grey skin, an occasional crash ([clip](https://github.com/pragyaangaur/VIctory-macOS/issues/513#issuecomment-7225964806)) | 27 Nov 18:52 | main 2bb3ae9 + upstream #499, #500, #514 |
+| MacBook Pro M1 Pro | 16 GB | 0.6–0.9 fps prologue cell (1.1–1.6 s a frame; Series S, 720p output) with upstream #445; 3.3–4.5 s without | #445 ends the GPU aborts (~25 a minute to 0), "hair drawn in both" ([issue #7](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/7)) | 27 Nov 23:23 | main-mac 38a6dff + upstream #445 |
+| MacBook Pro M1 Pro (MacBookPro18,1) | 16 GB | 0.70–0.85 fps prison cell (1.2–1.5 s a frame; Series S, 1080p output, `VICTORY_ALIAS_BUFFERS=0`); `VICTORY_PATCH_WIDE` and `caffeinate` make no difference, 0.20 fps was a slow-mode run | Four runs on one binary ([comment](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1#issuecomment-7238706281)) | 28 Nov 11:40 | main-mac 5493962 + picks + 18 upstream PRs |
+| M5 Pro (model not given) | 48 GB | 3.1 fps prison room, standing (318 ms, 163 ms GPU; Series X, 720p output) with `VICTORY_LOOP_ENTRY_EXIT=1`; 2.4 fps (409 ms) without | GPU time per pipeline: hair pass `CS_VisHair` 74 ms a frame, "nothing stands out" after the next one ([comment](https://github.com/pragyaangaur/VIctory-macOS/issues/131#issuecomment-7230563868)) | 27 Nov 23:59 | main d1609d9 + upstream #646 (diagnostics) |
+| M5 Max (model not given) | 48 GB | 5.0 fps prologue (200–213 ms median; Series X, 1080p output, scale 0.5) with `VICTORY_ALIAS_BUFFERS=1` + flights; 4.2–4.4 fps (225–241 ms) with `VICTORY_ALIAS_BUFFERS=0` | "Keeping zero-copy buffers with flights was about 11% faster"; no null-read crash in 7 runs ([comment](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1#issuecomment-7243212785)) | 28 Nov 17:41 | main-mac 9f8a9b6 + PR #8 settings |
+| Mac Studio M3 Ultra | 512 GB | 2.95 fps opening sequence (Series S, FSR 1280x720 to 1920x1080) | Local changes on top; the XEN fork ran 8.1 fps in the prison on the same Mac ([issue #15](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/15)) | 28 Nov 18:00 | main-mac 834f816 + local changes |
 
-You need an Apple Silicon Mac (M1 or newer) on macOS 15 Sequoia or newer, [Homebrew](https://brew.sh), and about 15 GB of free space.
+Tried it on your Mac? Post your Mac, memory and fps in [issue #1](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1) and we'll add a row.
 
-**1. Get the code.**
+<img width="1608" alt="Four scenes on an M4 Pro: beach at sunset, boat in daylight, night street, apartment" src="https://github.com/user-attachments/assets/c89e61c0-9552-4217-b547-7fa180598d32" />
 
-```bash
-git clone https://github.com/pragyaangaur/VIctory-macOS.git
-cd VIctory-macOS
-```
+More pictures, questions and results from other Macs: [issue #1](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1).
 
-**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it. Use version 4.0 beta 3 or newer: every tester who has reached the game world used it, and the D3DMetal 3.0 that CrossOver bundles cannot keep compiled pipelines (#30). One tester with 4.0 beta 3 still stops at an early start-up check of the game, so the version is not the whole story there (#24).
+## Mac efforts
 
-**3. Run the setup.**
+Public GTA VI efforts for Apple Silicon that we know of. Each status is that project's own claim, taken from its README and issues; checked daily, last on 28 Nov 2026.
 
-```bash
-./setup.sh
-```
+| Project | Approach | Status, as stated | Speed, as reported |
+|---|---|---|---|
+| [VIctory for macOS](https://github.com/pragyaangaur/VIctory-macOS) | VIctory + Wine + D3DMetal | The world draws on testers' Macs, up to the prologue's first gameplay prompt; not playable yet | About 330 ms a frame (3.0 fps) in the prison cell on an M4 Pro, 48 GB (Series X, 720p output); 165–180 ms at 1280x720 on an M4 with 16 GB ([#131](https://github.com/pragyaangaur/VIctory-macOS/issues/131)) |
+| [64bitMango/VIctory-macOS](https://github.com/64bitMango/VIctory-macOS) | VIctory + Wine + D3DMetal | A fork of VIctory for macOS with more speed work; not playable yet | About 201–209 ms a frame (4.8–5 fps) on an M5 Pro, Series S profile with the PC upscaler |
+| [Native-Victory-macOS](https://github.com/LakshanSivakumar/Native-Victory-macOS) | Native: no Wine, straight to Metal | Menus at 30 fps natively; the prologue runs into the world without crashing; the world reaches the window but far too dark, with broken geometry | About 1 fps in the world (Mac not named) |
+| [gta-vi-macos-first-scene](https://github.com/AEMONET-Dev/gta-vi-macos-first-scene) | VIctory + Wine + D3DMetal: renderer branches, experiment notes and frame-time data | The first scene shows recognisable people and streets (Series S profile) | Median 2.7 s between frames on an M5 Max, diagnostics on (snapshot of 25 Nov) |
+| [MetVL](https://github.com/cloverfield11/MetVL) | Native: VIctory's loader under Rosetta 2, own Metal window | The game's code runs and presents frames; Direct3D 12 to Metal translation not started yet | None reported for the world |
+| Halfwave (this project) | VIctory + Wine + D3DMetal | Player control, lit world, saves load | About 2 fps driving and 2.9–3.4 fps in the prison cell on an M4 Pro (more in "Tested on") |
 
-The setup installs what it needs with Homebrew. It then builds the x86_64 libraries and CrossOver Wine, adds D3DMetal from the toolkit, and builds VIctory. The first run takes about an hour, almost all of it spent building Wine. If anything stops it, fix what it says and run it again, because finished steps are skipped.
+Know another one? Tell us in [issue #1](https://github.com/halfwave50/VIctory-macOS-halfwave50/issues/1).
 
-When it says **Setup finished**, you can check that VIctory starts:
+## Try it
 
-```bash
-tools/macos/victory.sh --version
-```
+You need:
+- An Apple Silicon Mac. Confirmed working with 16 GB (MacBook Air M5) and up; see "Tested on".
+- macOS 15 or newer.
+- [Homebrew](https://brew.sh).
+- About 15 GB of free space.
 
-Once `game_dir` in `victory.toml` points at your copy of the game (below), `tools/macos/victory.sh config` checks your paths too.
+1. Get the code:
+   ```bash
+   git clone https://github.com/halfwave50/VIctory-macOS-halfwave50.git
+   cd VIctory-macOS-halfwave50
+   ```
+2. Download Apple's **Game Porting Toolkit**, version 4.0 beta 3 or newer, from [Apple's developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit). A free Apple account works. Leave the `.dmg` in Downloads, unopened.
+3. Build everything:
+   ```bash
+   ./setup.sh
+   ```
+   The first run takes about an hour. If it stops, fix what it says and run it again.
+4. Point `game_dir` in `victory.toml` at your game folder. Every package's files go directly in that folder.
+5. Start the game with our settings:
+   ```bash
+   tools/macos/play-main-mac.sh <the game's executable>
+   ```
 
-## Running the game
+[docs/macos.md](docs/macos.md) explains every Mac fix and problem in detail.
 
-Put your own copy of the Xbox Series build in a folder, set `game_dir` in `victory.toml` to that folder, and start it. Every package's files must sit directly in that folder, so `appdata0.rpf` is at `<game_dir>/appdata0.rpf` and not in an `appdata0` subfolder. With one subfolder per package the title asserts early at `+0x2237178`, and `victory` now stops before that and says which file is misplaced (#24).
+## Main fixes
 
-```bash
-tools/macos/victory.sh run --execute <the game's executable>
-```
+| Problem | Fix | Commit |
+|---|---|---|
+| No direct sunlight | Packed 16-bit textures that D3DMetal can't store to are kept as R8G8B8A8 (from Belobug's fork) | [010f0f9](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/010f0f9b9d6a) |
+| Characters and clothes missing | Mesh pipelines that were just over Metal's limit now fit | [df9aab4](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/df9aab472803), [f1f590a](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/f1f590a93234) |
+| Black bands in sunlight | The tile-list programs run exactly | [e566e1d](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/e566e1d14b7e) |
+| Dark rooms | Estimated fill light with a minimum level (`VICTORY_AMBIENT=estimate`) | [9158460](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/915846063859) |
+| Blocky shadow edges | One shadow program gets its image size (`VICTORY_UAV_SIZE_LEVEL0`) | in `play-main-mac.sh` |
+| Slow buffer copies | Many of the game's buffers are shared with the GPU instead of copied every frame (`VICTORY_ALIAS_BUFFERS=1`) | [f517ed2](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/f517ed2f43e1) |
+| Threads waiting on one lock | The list of what each shader resource slot reads is updated in batches, once per barrier (`VICTORY_CENSUS_FAST=1`); about 20% faster in the prison cell | [bee1f89](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/bee1f89ba2e2) |
+| No screen reflections | The game writes its reflection image through one texture and reads it through a second view of the same memory; that view now uses the written texture (`VICTORY_PLACED_TWIN=1`), with a minimum reflection level of 0.15 | [5b2830a](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/5b2830a7bb1f) |
+| Objects black for one frame | When the game moves a texture and rewrites its shader slot, the slot no longer stays empty until a shader has read it: it keeps its old texture until the new one is ready (`VICTORY_PLACED_AT_ONCE=keep`) | [f298867](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/f298867beb74), [c4a2248](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/c4a2248b3cfb) |
+| No wake or spray on water | A water-simulation program that reads raw descriptor data as numbers now translates, so the simulation gets its time step (`VICTORY_DESCRIPTOR_AS_DATA=1`, from ScarlettMac) | [e6b84a0](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/e6b84a002e3e) |
+| Blocks on water in far reflections | The programs that sort and count rays work across the console's 64-lane wave instead of as two 32-lane halves that raced each other, so the far reflection pass runs again (`VICTORY_HALVES_WHOLE_WAVE=1`) | [8320ecd](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/8320ecdb98d7), [e6418b1](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/e6418b13cee9), [392cd27](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/392cd27f8082) |
+| Blurred band along the cutscene bars | The program that fills the black bars wrote the nearest depth into the bar rows, and the depth-of-field pass spread that as blur into the picture. That one program no longer writes depth (`VICTORY_NO_DEPTH_WRITE=edc1cad8ffb79bc9`) | in `play-main-mac.sh` |
 
-For now this gets as far as VIctory does on Windows, as the note at the top explains.
+Merged into [VIctory for macOS](https://github.com/pragyaangaur/VIctory-macOS): the sunlight fix ([#478](https://github.com/pragyaangaur/VIctory-macOS/pull/478)) and the shadow-edge fix ([#488](https://github.com/pragyaangaur/VIctory-macOS/pull/488)).
 
-Set `VICTORY_WINDOW_SECONDARY=1` to open the game window on the only non-primary
-display. This requires two extended displays. If VIctory cannot select a single
-secondary display, it leaves the game window hidden. With more than one extra display,
-`VICTORY_WINDOW_SECONDARY=x,y` picks the one that holds that desktop point instead.
-`VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
-can further limit the window size without changing the render target.
+## Develop or fork it
 
-## Running the tests
+[DEVELOPING.md](DEVELOPING.md) covers how the work is done: one fix per commit with its source named, new code behind switches, measuring, and the asset rule. AI coding tools can start from [AGENTS.md](AGENTS.md).
 
-These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.
+## Credits and licence
 
-```bash
-cargo test --workspace
-```
+This builds on:
+- [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
+- [VIctory for macOS](https://github.com/pragyaangaur/VIctory-macOS) by pragyaangaur and its contributors. Its own README has more on how it works, testing and debugging switches.
+- The forks by hyphennn, Belobug, DexNom, myokex, avatarmanz, 64bitMango, darkworldhm, trustno1-coder and paveledits (ScarlettMac)
 
-```bash
-WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
-```
-
-## Help test on your Mac
-
-The project needs test results from as many Macs as possible. The [Mac test fleet](docs/fleet.md) runs both test suites on your Mac and reports the counts to this repository. It uses only the project's own tests, never a game. Paste this into an AI coding agent on your Mac, such as Claude Code, Codex or Cursor:
-
-```text
-Read https://raw.githubusercontent.com/pragyaangaur/VIctory-macOS/main/docs/fleet-join.md and follow it to help test VIctory on my Mac. Ask me once before installing or posting anything, then keep going until I say stop.
-```
-
-Please read [docs/fleet-legal.md](docs/fleet-legal.md) first. You can also run the fleet by hand with `tools/fleet/fleet.sh`.
-
-## Debugging switches
-
-These need a diagnostics build (`VICTORY_DIAGNOSTICS=1 tools/macos/victory.sh ...`) and are for chasing problems, not for playing.
-
-A diagnostics build also logs one bounded line per submission that refreshes title memory: the total range count and bytes, then the eight largest ranges' title start/length and host GPU address. It logs no memory contents. A batch combines requests from several lists, view heaps and page tables, so a range is not attributed to an individual descriptor or view.
-
-| Variable | What it does |
-| --- | --- |
-| `VICTORY_STACKS=<seconds>,...` | Prints every thread's stack at those times after start. |
-| `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
-| `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
-| `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
-
-### Every variable
-
-The on/off switches below (`...=1`) are off when unset or set to `0`.
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_KEYS=menu:Enter` | presses Enter every 3 s from the first start screen on, never again after the first frame of more than 50 draws, 10 s after the last start screen's pipeline rise, or 180 s after the first start screen; `menu:Enter:<seconds>:<draws>` sets the spacing and the draws; mixes with timed entries |
-| `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash. Works in every build, not only a diagnostics one, and logs one line with the number of hashes at start |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
-| `VICTORY_TRACE_READS=<hash>,...` | in listed capture frames, every view a pipeline with a listed shader reads through a table: the view (a texture with the resource id the target dumps use), a buffer's first 3,072 bytes as title memory holds them and as the host copy does after the list, and with `VICTORY_DUMP_TARGETS` each texture's values after its submission (logged, not saved) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-## Where things are
-
-| Path | What it holds |
-| --- | --- |
-| `setup.sh` | The one-step setup |
-| `tools/macos/` | The Wine build, the library build, the launcher and the test runner |
-| `tools/fleet/` | The Mac test fleet: the worker, the issue queue and its tests ([docs/fleet.md](docs/fleet.md)) |
-| `docs/macos.md` | The full story of the port, the problems found and how each was fixed |
-| `crates/` | VIctory's runtime: loader, console runtime, GPU layer, shader recompiler and formats |
-| `docs/architecture.md` | How VIctory itself is put together |
-
-## Acknowledgement
-
-This project is built on top of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak. The loader, the console runtime, the GPU layer and the shader recompiler all come from VIctory, and its full history is kept in this repository. This project adds the macOS side: the Mac build, the Wine and D3DMetal setup, and the fixes that the Mac needed. VIctory is licensed under GPL-3.0, so this project is too.
-
-Thanks also go to CodeWeavers for publishing CrossOver's source, to the Wine project, and to Apple for the Game Porting Toolkit.
-
-## Legal
-
-This project is not affiliated with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft or Apple. Grand Theft Auto is a trademark of Take-Two Interactive. This repository contains no game files, keys or code from the game, and it never will. It only runs a copy that you own. D3DMetal is not included, and each user downloads it from Apple under Apple's terms.
-
-The code is licensed under the [GNU General Public License v3.0](LICENSE).
+The licence is GPL-3.0 ([LICENSE](LICENSE)).
