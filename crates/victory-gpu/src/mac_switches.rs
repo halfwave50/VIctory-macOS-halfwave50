@@ -1132,11 +1132,36 @@ pub(crate) enum AliasPhysical {
     /// section heap): the heap backing alone, with the counts; the GPU still
     /// reads the pages through host copies.
     Cpu,
+    /// `gpu`: `cpu`, and one reserved buffer per piece of each placeholder
+    /// reservation, tiled from the heaps as the title maps its pages
+    /// (`crate::alias_physical`).
+    Gpu,
+}
+
+impl AliasPhysical {
+    /// Whether the title's sections get heaps.
+    pub(crate) fn heaps(self) -> bool {
+        matches!(self, AliasPhysical::Cpu | AliasPhysical::Gpu)
+    }
+
+    /// Whether the GPU reads the pages through the reservations' pieces.
+    pub(crate) fn gpu(self) -> bool {
+        matches!(self, AliasPhysical::Gpu)
+    }
+
+    /// The switch as written.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            AliasPhysical::Off => "VICTORY_ALIAS_PHYSICAL unset",
+            AliasPhysical::Count => "VICTORY_ALIAS_PHYSICAL=count",
+            AliasPhysical::Cpu => "VICTORY_ALIAS_PHYSICAL=cpu",
+            AliasPhysical::Gpu => "VICTORY_ALIAS_PHYSICAL=gpu",
+        }
+    }
 }
 
 /// [`AliasPhysical`], read once (at the title's first `xmem` call that asks).
-/// `1`, the GPU side too, is not built yet: it and any other value give the
-/// counts alone, with a warning.
+/// Any other value gives the counts alone, with a warning.
 pub(crate) fn alias_physical() -> AliasPhysical {
     static RULE: OnceLock<AliasPhysical> = OnceLock::new();
     *RULE.get_or_init(|| {
@@ -1144,7 +1169,7 @@ pub(crate) fn alias_physical() -> AliasPhysical {
         let (rule, known) = alias_physical_rule(value.as_deref());
         if !known {
             tracing::warn!(
-                "VICTORY_ALIAS_PHYSICAL={}: only =cpu and =count are built so far; stage 2's counts alone",
+                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu and gpu; stage 2's counts alone",
                 value.as_deref().unwrap_or_default()
             );
         }
@@ -1163,6 +1188,7 @@ fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
         None | Some("" | "0") => (AliasPhysical::Off, true),
         Some("count") => (AliasPhysical::Count, true),
         Some("cpu") => (AliasPhysical::Cpu, true),
+        Some("gpu") => (AliasPhysical::Gpu, true),
         Some(_) => (AliasPhysical::Count, false),
     }
 }
@@ -1259,6 +1285,9 @@ pub(crate) mod tests {
 
     #[test]
     fn alias_physical_counts_only_when_set() {
+        assert!(AliasPhysical::Gpu.heaps() && AliasPhysical::Gpu.gpu());
+        assert!(AliasPhysical::Cpu.heaps() && !AliasPhysical::Cpu.gpu());
+        assert!(!AliasPhysical::Count.heaps() && !AliasPhysical::Off.heaps());
         for off in [None, Some(""), Some("0")] {
             assert_eq!(
                 alias_physical_rule(off),
@@ -1271,12 +1300,12 @@ pub(crate) mod tests {
             (" count ", AliasPhysical::Count),
             ("cpu", AliasPhysical::Cpu),
             (" cpu ", AliasPhysical::Cpu),
+            ("gpu", AliasPhysical::Gpu),
         ] {
             assert_eq!(alias_physical_rule(Some(value)), (rule, true), "{value:?}");
         }
-        // Any other value (the GPU side, `=1`, is not built): the counts,
-        // with a warning.
-        for other in [Some("1"), Some("gpu"), Some("CPU"), Some("yes")] {
+        // Any other value: the counts, with a warning.
+        for other in [Some("1"), Some("GPU"), Some("CPU"), Some("yes")] {
             assert_eq!(
                 alias_physical_rule(other),
                 (AliasPhysical::Count, false),

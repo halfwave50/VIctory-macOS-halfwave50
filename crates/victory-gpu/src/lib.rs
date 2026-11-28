@@ -31,6 +31,9 @@ mod ambient_estimate_set;
 mod ambient_set;
 #[cfg(windows)]
 mod alias;
+// mac: stage 2's GPU side (`VICTORY_ALIAS_PHYSICAL=gpu`).
+#[cfg(windows)]
+mod alias_physical;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod alias_plan;
@@ -179,6 +182,15 @@ pub use physical_runs::{
     shown_delta as physical_shown_delta, tally_call as physical_tally_call,
     view_remap_retried as physical_view_remap_retried,
 };
+// mac: stage 2's GPU side (`notes/alias-physical-design.md`, I3b).
+#[cfg(windows)]
+pub use alias_physical::{
+    flush_now as alias_physical_flush_now, mapped as alias_physical_mapped,
+    reserved as alias_physical_reserved, tile_at as alias_physical_tile_at,
+    unmapped as alias_physical_unmapped,
+};
+#[cfg(windows)]
+pub use physical_runs::gpu_mode as physical_gpu_mode;
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

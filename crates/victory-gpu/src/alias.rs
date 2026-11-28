@@ -615,6 +615,10 @@ pub struct PhysicalHeap {
     /// mac: made by [`physical_heap`], so counted in stage 2's line until
     /// dropped (the probes make their own).
     counted: bool,
+    /// mac: with `VICTORY_ALIAS_PHYSICAL=gpu`, its number among the heaps the
+    /// reservations' pieces are tiled from (`crate::alias_physical`); its
+    /// last tile, past the section's pages, is then the sink.
+    id: Option<u32>,
 }
 
 impl PhysicalHeap {
@@ -672,7 +676,14 @@ impl PhysicalHeap {
             address: address as usize,
             len,
             counted: false,
+            id: None,
         })
+    }
+
+    /// mac: its number among the heaps the reservations' pieces are tiled
+    /// from (`VICTORY_ALIAS_PHYSICAL=gpu`), if it is one.
+    pub fn id(&self) -> Option<u32> {
+        self.id
     }
 
     /// The CPU view, valid for the lifetime of this heap.
@@ -711,28 +722,33 @@ impl Drop for PhysicalHeap {
     fn drop(&mut self) {
         // SAFETY: unmapped once, while the placed buffer still owns the view.
         unsafe { self.backing.Unmap(0, None) };
+        if let Some(id) = self.id {
+            crate::alias_physical::heap_dropped(id);
+        }
         if self.counted {
-            crate::physical_runs::heap_freed(self.len);
+            // The section's bytes, without the sink tile `=gpu` adds.
+            crate::physical_runs::heap_freed(self.len - if self.id.is_some() { PAGE } else { 0 });
         }
     }
 }
 
 /// mac: whether the title's physical sections get heaps
-/// (`VICTORY_ALIAS_PHYSICAL=cpu`, or VIctory-macOS #275's diagnostics trial
+/// (`VICTORY_ALIAS_PHYSICAL=cpu`, `gpu` or `gpu-single`, or VIctory-macOS #275's diagnostics trial
 /// `VICTORY_PHYSICAL_TILES=1`), asked once, at the title's first physical
 /// allocation. The switch needs the aliasing on ([`enabled`]: Rosetta, the
 /// copy-order split, no flights; `notes/alias-physical-design.md`). Both need
 /// the remap probe ([`supported`]), which makes the host device if nothing
 /// has yet: a heap needs it, whatever came first.
-fn physical_on() -> bool {
+pub(crate) fn physical_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let asked = crate::mac_switches::alias_physical() == crate::mac_switches::AliasPhysical::Cpu;
+        let mode = crate::mac_switches::alias_physical();
+        let asked = mode.heaps();
         let trial = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_PHYSICAL_TILES");
         if !asked && !trial {
             return false;
         }
-        let name = if asked { "VICTORY_ALIAS_PHYSICAL=cpu" } else { "VICTORY_PHYSICAL_TILES=1" };
+        let name = if asked { mode.name() } else { "VICTORY_PHYSICAL_TILES=1" };
         let refused = if asked && !enabled() {
             Some(
                 "it needs VICTORY_ALIAS_BUFFERS on (Rosetta, VICTORY_COPY_ORDER=split, no VICTORY_FLIGHTS), which is off \
@@ -751,8 +767,13 @@ fn physical_on() -> bool {
         tracing::info!(
             "{name}: each of the title's physical-page allocations is backed by a CPU-visible D3D12 heap, and every \
              title view of its pages is remapped onto it (mach_vm_remap, VIctory-macOS #275); DirectStorage writes \
-             go to the heap; the GPU still reads the pages through host copies (stage 2's heap backing alone); a \
-             view that cannot be remapped fails the title's map; counters at the end of the physical pages line"
+             go to the heap; {}; a view that cannot be remapped fails the title's map; counters at the end of the \
+             physical pages line",
+            if mode.gpu() {
+                "the GPU reads them through reserved buffers tiled from the heaps (stage 2's GPU side)"
+            } else {
+                "the GPU still reads the pages through host copies (stage 2's heap backing alone)"
+            }
         );
         true
     })
@@ -767,9 +788,19 @@ pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
     }
     let host = host()?;
     let started = std::time::Instant::now();
-    match PhysicalHeap::new(&host.device, len) {
+    // mac: with the GPU side (`=gpu`), one more tile past the pages: the sink
+    // the pieces' unmapped tiles show (`crate::alias_physical`).
+    let gpu = crate::alias_physical::on();
+    match PhysicalHeap::new(&host.device, len + if gpu { PAGE } else { 0 }) {
         Ok(mut heap) => {
             heap.counted = true;
+            if gpu {
+                heap.id = Some(crate::alias_physical::heap_made(
+                    &heap._heap,
+                    len,
+                    heap.address + len,
+                ));
+            }
             let [sections, bytes] = crate::physical_runs::heap_made(len);
             tracing::info!(
                 mb = len >> 20,

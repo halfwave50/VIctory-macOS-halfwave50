@@ -194,6 +194,10 @@ pub extern "system" fn XMemVirtualAlloc(
     // mapped into, and their sizes.
     if placeholder && !at.is_null() && victory_gpu::physical_counts() {
         victory_gpu::physical_reserved(at as usize, size);
+        // mac: stage 2's GPU side (`=gpu`): the reservation's pieces.
+        if victory_gpu::physical_gpu_mode() {
+            victory_gpu::alias_physical_reserved(at as usize, size);
+        }
     }
     if base.is_null() {
         tracing::debug!(
@@ -1061,6 +1065,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // mac: `VICTORY_PHYSICAL_RUNS` counts what refreshes copy from runs of a section's pages.
     victory_gpu::physical_mapped(base, len, Arc::as_ptr(&slice.section) as usize, slice.index);
+    // mac: stage 2's GPU side (`=gpu`): the tiles the view's pages are.
+    if victory_gpu::physical_gpu_mode() {
+        let heap = slice
+            .section
+            .shared
+            .as_ref()
+            .and_then(victory_gpu::PhysicalHeap::id);
+        victory_gpu::alias_physical_mapped(base, len, heap, slice.index as u32);
+    }
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1225,6 +1238,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::physical_unmapped(at);
+        // mac: stage 2's GPU side (`=gpu`); the remnants are mapped again below.
+        if victory_gpu::physical_gpu_mode() {
+            victory_gpu::alias_physical_unmapped(at, size);
+        }
         // mac: stage 2's counts of pages at two or more addresses, if kept.
         let (counting, mut twice) = (victory_gpu::physical_counts(), [0; 2]);
         for k in 0..size / PAGE {
@@ -1488,7 +1505,8 @@ mod tests {
     /// it needs): then its sections must be heap-backed, or the switch did
     /// not take.
     fn forced_heap() -> bool {
-        std::env::var("VICTORY_ALIAS_PHYSICAL").is_ok_and(|v| v.trim() == "cpu")
+        std::env::var("VICTORY_ALIAS_PHYSICAL")
+            .is_ok_and(|v| matches!(v.trim(), "cpu" | "gpu" | "gpu-single"))
             || cfg!(feature = "diagnostics")
                 && std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1")
     }
@@ -1808,6 +1826,91 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// mac: with `VICTORY_ALIAS_PHYSICAL=gpu` (and its prerequisites, under
+    /// Wine on Rosetta), xmem's reservations, maps, page-mapping copies and
+    /// unmaps reach the reservations' pieces: after a flush each title
+    /// address's tile shows its page's heap tile, an unmapped one the sink,
+    /// and an unmap's remnants keep theirs.
+    #[test]
+    fn maps_reach_the_reservations_pieces() {
+        if !victory_gpu::physical_gpu_mode() {
+            eprintln!("VICTORY_ALIAS_PHYSICAL=gpu unset: nothing to check");
+            return;
+        }
+        let pages = allocate(3);
+        let id = physical().pages[&pages[0]]
+            .section
+            .shared
+            .as_ref()
+            .and_then(victory_gpu::PhysicalHeap::id);
+        let id = id.expect("a heap of the pieces' (the GPU side on)");
+        let index = |p: usize| physical().pages[&p].index as u32;
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, k: usize| p as usize + k * PAGE;
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        // The GPU's page-mapping copy: page 2 at `b` too.
+        assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
+        assert!(victory_gpu::alias_physical_flush_now());
+        for k in 0..3 {
+            assert_eq!(
+                victory_gpu::alias_physical_tile_at(at(a, k)),
+                Some((id, index(pages[k]))),
+                "page {k}"
+            );
+        }
+        assert_eq!(
+            victory_gpu::alias_physical_tile_at(at(b, 0)),
+            Some((id, index(pages[2])))
+        );
+        assert_eq!(
+            victory_gpu::alias_physical_tile_at(at(b, 1)),
+            None,
+            "never mapped"
+        );
+        // The middle page unmapped: its tile goes to the sink; the view's
+        // remnants, mapped again, keep theirs.
+        assert_eq!(
+            XMemMapPhysicalPages(at(a, 1) as *mut c_void, 1, std::ptr::null()),
+            at(a, 1) as *mut c_void
+        );
+        assert!(victory_gpu::alias_physical_flush_now());
+        assert_eq!(victory_gpu::alias_physical_tile_at(at(a, 1)), None);
+        assert_eq!(
+            victory_gpu::alias_physical_tile_at(at(a, 0)),
+            Some((id, index(pages[0])))
+        );
+        assert_eq!(
+            victory_gpu::alias_physical_tile_at(at(a, 2)),
+            Some((id, index(pages[2])))
+        );
+        // Swapped pages over mapped ones: nulled, then mapped (unmap then map).
+        let swapped = [pages[2], pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(a, 3, swapped.as_ptr()), a);
+        assert!(victory_gpu::alias_physical_flush_now());
+        for k in 0..3 {
+            assert_eq!(
+                victory_gpu::alias_physical_tile_at(at(a, k)),
+                Some((id, index(swapped[k]))),
+                "swapped {k}"
+            );
+        }
+        for p in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(p, 3, std::ptr::null()), p);
+        }
+        assert!(victory_gpu::alias_physical_flush_now());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// mac: stage 2's counts read what each address shows in xmem's own

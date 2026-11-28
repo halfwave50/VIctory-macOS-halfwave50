@@ -143,6 +143,14 @@ pub fn counting() -> bool {
     crate::mac_switches::alias_physical() != crate::mac_switches::AliasPhysical::Off
 }
 
+/// Whether `VICTORY_ALIAS_PHYSICAL` asks for the GPU side (`=gpu`,
+/// `=gpu-single`): `xmem` then tells `crate::alias_physical` its
+/// reservations, maps and unmaps. Read once; after that one load and a branch.
+#[inline]
+pub fn gpu_mode() -> bool {
+    crate::mac_switches::alias_physical().gpu()
+}
+
 /// The largest piece of a reservation one reserved buffer covers in stage 2
 /// (`crate::tile_plan::PIECE`: 4 GiB less one tile).
 pub(crate) const PIECE: usize = crate::tile_plan::PIECE;
@@ -301,6 +309,14 @@ pub(crate) fn backing_on() {
     BACKING_ON.store(true, Relaxed);
 }
 
+/// mac: whether stage 2's GPU side is on (`crate::alias_physical`, I3b): its
+/// counts end the line.
+static GPU_ON: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn gpu_on() {
+    GPU_ON.store(true, Relaxed);
+}
+
 /// A section's heap of `len` bytes was made: heap-backed sections now, and
 /// their bytes.
 pub(crate) fn heap_made(len: usize) -> [i64; 2] {
@@ -355,13 +371,15 @@ fn reservations(all: &[(usize, usize)]) -> Reservations {
 /// Stage 2's line, per frame over `frames` frames: `window` the page counts
 /// since the last line, `total` since the start, `now` views, pages at two
 /// or more addresses, addresses past the first, sections and their bytes;
-/// `backing` [`BACKING`] while `VICTORY_ALIAS_PHYSICAL` is on.
+/// `backing` [`BACKING`] while `VICTORY_ALIAS_PHYSICAL` is on; `gpu` the GPU
+/// side's (`crate::alias_physical::take_counts`) while it is on.
 fn stage2_line(
     window: [u64; 4],
     total: [u64; 4],
     now: [i64; 5],
     r: &Reservations,
     backing: Option<[i64; 5]>,
+    gpu: Option<[u64; 7]>,
     frames: f64,
 ) -> String {
     let [fresh, remapped, unmapped, again] = window.map(|n| n as f64 / frames.max(1.0));
@@ -388,6 +406,17 @@ fn stage2_line(
             "; VICTORY_ALIAS_PHYSICAL=cpu: {heaps} sections heap-backed {:.2} GB, {refused} heaps refused, {retried} \
              view remaps retried, {failed} failed",
             bytes as f64 / 1e9
+        )
+    }) + &gpu.map_or(String::new(), |[fresh, remapped, sunk, calls, us, made, fallen]| {
+        let f = |n: u64| n as f64 / frames.max(1.0);
+        format!(
+            "; GPU side: {made} pieces ({fallen} fell back to copies); per frame {:.1} tiles mapped fresh, {:.1} \
+             nulled and mapped again, {:.1} to the sink, in {:.1} UpdateTileMappings, {:.2} ms",
+            f(fresh),
+            f(remapped),
+            f(sunk),
+            f(calls),
+            f(us) / 1e3
         )
     })
 }
@@ -416,7 +445,16 @@ fn stage2_log(frames: f64) {
     let backing = BACKING_ON
         .load(Relaxed)
         .then(|| BACKING.each_ref().map(|n| n.load(Relaxed)));
-    tracing::info!("{}", stage2_line(window, total, now, &r, backing, frames));
+    #[cfg(windows)]
+    let gpu = GPU_ON
+        .load(Relaxed)
+        .then(crate::alias_physical::take_counts);
+    #[cfg(not(windows))]
+    let gpu = None;
+    tracing::info!(
+        "{}",
+        stage2_line(window, total, now, &r, backing, gpu, frames)
+    );
 }
 
 #[cfg(test)]
@@ -553,6 +591,7 @@ mod tests {
             [12, 3, 4, 1, 6_550_000_000],
             &r,
             None,
+            None,
             10.0,
         );
         assert!(line.starts_with("physical pages, per frame: 20.0 pages mapped where none was, 2.0 mapped over another page, 1.0 unmapped, 0.4 mapped again"), "{line}");
@@ -565,7 +604,7 @@ mod tests {
         assert!(line.ends_with("; 1 sections 6.55 GB"), "{line}");
         // No frames (a flip of `VICTORY_AB` can end a window early): per frame as one.
         assert!(
-            stage2_line([3, 0, 0, 0], [3, 0, 0, 0], [0; 5], &r, None, 0.0)
+            stage2_line([3, 0, 0, 0], [3, 0, 0, 0], [0; 5], &r, None, None, 0.0)
                 .contains(": 3.0 pages mapped")
         );
         // `VICTORY_ALIAS_PHYSICAL=cpu`: the heap backing's counts, at the end.
@@ -575,6 +614,7 @@ mod tests {
             [0; 5],
             &r,
             Some([1, 6_550_000_000, 0, 2, 0]),
+            None,
             1.0,
         );
         assert!(
@@ -583,6 +623,23 @@ mod tests {
                  2 view remaps retried, 0 failed"
             ),
             "{on}"
+        );
+        // `=gpu`: the GPU side's, after them.
+        let gpu = stage2_line(
+            [0; 4],
+            [0; 4],
+            [0; 5],
+            &r,
+            Some([1, 0, 0, 0, 0]),
+            Some([1000, 50, 20, 30, 4_000, 17, 1]),
+            10.0,
+        );
+        assert!(
+            gpu.ends_with(
+                "; GPU side: 17 pieces (1 fell back to copies); per frame 100.0 tiles mapped fresh, 5.0 nulled and \
+                 mapped again, 2.0 to the sink, in 3.0 UpdateTileMappings, 0.40 ms"
+            ),
+            "{gpu}"
         );
     }
 

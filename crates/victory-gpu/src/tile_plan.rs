@@ -15,17 +15,21 @@
 //! with the ranges joined: consecutive tiles over consecutive heap tiles, or
 //! over one heap tile (the sink, or one page shown at many addresses).
 //!
-//! No null mappings: an unmapped tile is pointed at the sink, a zeroed tile
-//! (a null mapping of 64 tiles left one mapped, `notes/tile-probe.md`). A
-//! tile never mapped is left as its buffer was made ([`Never::Untouched`]),
-//! so that the first map of a tile is a fresh mapping, about 0.1 µs a tile
-//! against 3 to 7 for a tile mapped already; [`Never::Sink`] points those at
-//! the sink too, at a piece's first flush.
+//! A tile that shows a mapping and changes is first nulled ([`Flush::clears`],
+//! one null `UpdateTileMappings` a piece, before its updates), then mapped:
+//! mapping a tile mapped already costs 10 to 13 µs on D3DMetal's queue
+//! thread, a null 0.8 and a fresh map 1.1 (probes 7 and 8). An unmapped tile
+//! is then pointed at the sink, a zeroed tile, so a null that does not take
+//! (probe 1's 64 tiles after remaps) is overwritten. A tile never mapped is
+//! left as its buffer was made ([`Never::Untouched`]: such tiles read zero,
+//! probe 7); [`Never::Sink`] points those at the sink too, at a piece's first
+//! flush.
 //!
 //! Plain std, so its tests run everywhere; the D3D12 side (I3b) makes the
 //! buffers and turns [`Update`]s into `UpdateTileMappings`.
 
-// Used from I3b on (the flush in `Host::run`); its tests run now.
+// `crate::alias_physical` uses it on Windows (I3b); `Never::Sink` and parts of
+// `Flush` are for tests and the counts.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -74,11 +78,14 @@ pub(crate) struct Update {
     pub(crate) ranges: Vec<TileRange>,
 }
 
-/// A flush: its updates, and its tiles by what they showed before: never
-/// mapped and now a heap tile (`fresh`), a heap tile or the sink and now
-/// another heap tile (`remapped`), and pointed at the sink (`sunk`).
+/// A flush: per piece, the ranges of tiles to null first `(start, count)`
+/// (every tile that showed a mapping and changes); its updates; and its
+/// tiles by what they showed before: never mapped and now a heap tile
+/// (`fresh`), a heap tile or the sink and now another heap tile
+/// (`remapped`), and pointed at the sink (`sunk`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flush {
+    pub(crate) clears: Vec<(usize, Vec<(u32, u32)>)>,
     pub(crate) updates: Vec<Update>,
     pub(crate) fresh: usize,
     pub(crate) remapped: usize,
@@ -208,6 +215,21 @@ impl Plan {
         (to <= range.end).then(|| (id, (from - range.start) as u32))
     }
 
+    /// The pieces `[at, at + len)` reaches.
+    pub(crate) fn pieces_of(&self, at: usize, len: usize) -> Vec<usize> {
+        let (first_page, pages) = (at / PAGE, len / PAGE);
+        let mut out: Vec<usize> = Vec::new();
+        for k in 0..pages {
+            let page_at = (first_page + k) * PAGE;
+            if let Some((id, _)) = self.locate(page_at, page_at + PAGE)
+                && out.last() != Some(&id)
+            {
+                out.push(id);
+            }
+        }
+        out
+    }
+
     /// `xmem` mapped `[at, at + len)` (whole pages) to the heap tiles from
     /// `first` on, one a page. The tiles of no reservation's piece are not
     /// recorded: their number is returned.
@@ -253,6 +275,16 @@ impl Plan {
         outside
     }
 
+    /// The heap tile that tile `tile` of piece `id` shows as flushed (`None`: the
+    /// sink, or never mapped).
+    pub(crate) fn shows(&self, id: usize, tile: u32) -> Option<HeapTile> {
+        let piece = self.pieces.get(id)?;
+        match piece.now.get(&tile).copied().or(piece.floor)? {
+            Now::Heap(t) => Some(t),
+            Now::Sink => None,
+        }
+    }
+
     /// Tiles with a change waiting.
     pub(crate) fn pending(&self) -> usize {
         self.dirty
@@ -270,8 +302,10 @@ impl Plan {
             let never = self.never;
             let piece = &mut self.pieces[id];
             let pending = std::mem::take(&mut piece.pending);
-            // Tiles to change, in order: (tile, what it shows now).
+            // Tiles to change, in order: (tile, what it shows now); and the
+            // tiles to null first.
             let mut set: Vec<(TileRange, u32)> = Vec::new();
+            let mut clear: Vec<u32> = Vec::new();
             let fill = piece.new && never == Never::Sink;
             let mut gap_from = 0u32;
             for (&tile, &change) in &pending {
@@ -286,6 +320,7 @@ impl Plan {
                     Change::Map(to) => {
                         set.push((range(tile, 1, to.tile, false), to.heap));
                         if shown.is_some() {
+                            clear.push(tile);
                             out.remapped += 1;
                         } else {
                             out.fresh += 1;
@@ -300,6 +335,7 @@ impl Plan {
                         }
                     }
                     Change::Unmap => {
+                        clear.push(tile);
                         set.push((range(tile, 1, sink.tile, false), sink.heap));
                         out.sunk += 1;
                         if piece.floor == Some(Now::Sink) {
@@ -322,6 +358,17 @@ impl Plan {
                 piece.now.retain(|_, now| *now != Now::Sink);
             }
             piece.new = false;
+            // The nulls, consecutive tiles joined.
+            let mut nulls: Vec<(u32, u32)> = Vec::new();
+            for tile in clear {
+                match nulls.last_mut() {
+                    Some((start, count)) if *start + *count == tile => *count += 1,
+                    _ => nulls.push((tile, 1)),
+                }
+            }
+            if !nulls.is_empty() {
+                out.clears.push((id, nulls));
+            }
             // One update per heap, ranges joined.
             let mut by_heap: BTreeMap<u32, Vec<TileRange>> = BTreeMap::new();
             for (r, heap) in set {
@@ -443,6 +490,8 @@ mod tests {
             Some((2, (9 * GIB - 1 - 2 * PIECE) as u32))
         );
         assert_eq!(plan.locate(0x1084_0000 + 64, 0x1084_0100), Some((6, 64)));
+        assert_eq!(plan.pieces_of(A + PIECE - PAGE, 2 * PAGE), vec![0, 1]);
+        assert_eq!(plan.pieces_of(A + 9 * GIB, PAGE), Vec::<usize>::new());
         // Past the end, before the start, empty.
         assert_eq!(plan.locate(A + 9 * GIB, A + 9 * GIB + 1), None);
         assert_eq!(plan.locate(A - 1, A + 1), None);
@@ -503,11 +552,14 @@ mod tests {
         plan.flush(SINK);
         plan.unmap(A + 2 * PAGE, 4 * PAGE);
         let flush = plan.flush(SINK);
+        // Nulled first, then pointed at the sink.
+        assert_eq!(flush.clears, vec![(0, vec![(2, 4)])]);
         assert_eq!(ranges(&flush), vec![(0, 0, vec![r(2, 4, SINK.tile, true)])]);
         assert_eq!((flush.fresh, flush.remapped, flush.sunk), (0, 0, 4));
         // Unmapped again, or never mapped: nothing (no null mapping ever).
         plan.unmap(A, PAGE * 64);
         let flush = plan.flush(SINK);
+        assert_eq!(flush.clears, vec![(0, vec![(0, 2), (6, 2)])]);
         assert_eq!(
             ranges(&flush),
             vec![(
@@ -518,9 +570,10 @@ mod tests {
         );
         plan.unmap(A, PAGE * 64);
         assert_eq!(plan.flush(SINK), Flush::default());
-        // A page mapped over the sink is a remap.
+        // A page mapped over the sink is a remap: nulled, then mapped.
         plan.map(A + 3 * PAGE, PAGE, heap(7));
         let flush = plan.flush(SINK);
+        assert_eq!(flush.clears, vec![(0, vec![(3, 1)])]);
         assert_eq!(ranges(&flush), vec![(0, 0, vec![r(3, 1, 7, false)])]);
         assert_eq!((flush.fresh, flush.remapped), (0, 1));
     }
@@ -546,11 +599,13 @@ mod tests {
             )]
         );
         assert_eq!((flush.fresh, flush.remapped, flush.sunk), (2, 0, 62));
+        assert!(flush.clears.is_empty(), "nothing showed a mapping");
         // From then on the sink is what a tile shows: a map over it is a
         // remap, an unmap of it asks nothing.
         plan.map(A, PAGE, heap(9));
         plan.unmap(A + 30 * PAGE, PAGE);
         let flush = plan.flush(SINK);
+        assert_eq!(flush.clears, vec![(0, vec![(0, 1)])]);
         assert_eq!(ranges(&flush), vec![(0, 0, vec![r(0, 1, 9, false)])]);
         assert_eq!((flush.fresh, flush.remapped, flush.sunk), (0, 1, 0));
         // A whole piece with no change at its first flush: one range.
@@ -636,6 +691,7 @@ mod tests {
         // Unmapped at one: the other still shows it.
         plan.unmap(A + PAGE, PAGE);
         let flush = plan.flush(SINK);
+        assert_eq!(flush.clears, vec![(0, vec![(1, 1)])]);
         assert_eq!(
             ranges(&flush),
             vec![(0, 0, vec![r(1, 1, SINK.tile, false)])]
@@ -658,13 +714,16 @@ mod tests {
         plan.map(A, 7 * PAGE, heap(100));
         plan.map(A + 8 * PAGE, 8 * PAGE, heap(108));
         let flush = plan.flush(SINK);
+        assert_eq!(flush.clears, vec![(0, vec![(7, 1)])]);
         assert_eq!(
             ranges(&flush),
             vec![(0, 0, vec![r(7, 1, SINK.tile, false)])]
         );
-        // Another page over a mapped one: a remap.
+        // Another page over a mapped one: a remap, nulled first (unmap then
+        // map: about 2 µs a tile against 10 to 13; probe 8).
         plan.map(A + 3 * PAGE, PAGE, heap(9));
         let flush = plan.flush(SINK);
+        assert_eq!(flush.clears, vec![(0, vec![(3, 1)])]);
         assert_eq!(ranges(&flush), vec![(0, 0, vec![r(3, 1, 9, false)])]);
         assert_eq!((flush.fresh, flush.remapped, flush.sunk), (0, 1, 0));
     }
@@ -764,6 +823,19 @@ mod tests {
                     continue;
                 }
                 let flush = plan.flush(SINK);
+                // The nulls first: every nulled tile is mapped again below.
+                let mut nulled: BTreeSet<(usize, u32)> = BTreeSet::new();
+                for (piece, ranges) in &flush.clears {
+                    for &(start, count) in ranges {
+                        for t in start..start + count {
+                            assert!(
+                                shown.remove(&(*piece, t)).is_some(),
+                                "{never:?}: a null of a tile showing nothing"
+                            );
+                            nulled.insert((*piece, t));
+                        }
+                    }
+                }
                 let mut tiles = 0;
                 for update in &flush.updates {
                     let mut end = 0;
@@ -783,6 +855,7 @@ mod tests {
                                     r.heap_start + i
                                 },
                             };
+                            nulled.remove(&(update.piece, r.start + i));
                             let before = shown.insert((update.piece, r.start + i), to);
                             assert_ne!(
                                 before,
@@ -798,6 +871,7 @@ mod tests {
                     flush.fresh + flush.remapped + flush.sunk,
                     "{never:?}"
                 );
+                assert!(nulled.is_empty(), "{never:?}: tiles left null: {nulled:?}");
                 for (&page, &want) in &asked {
                     let (piece, offset) = plan.locate(page, page + 1).expect("in a piece");
                     let now = shown.get(&(piece, offset / PAGE as u32)).copied();
