@@ -1163,7 +1163,8 @@ mod tests {
 
     /// Exclusive access to the host submission path for tests that toggle
     /// `FORCED`, `flights::FORCED`, or `IDLE_HELD`. Settles any in-flight
-    /// submission and resets all switches on drop, even on panic.
+    /// submission and resets all switches on drop, even on panic: memory a
+    /// test's submission writes is declared before this, to outlive it.
     struct Exclusive(std::sync::RwLockWriteGuard<'static, ()>);
 
     impl Exclusive {
@@ -1180,12 +1181,23 @@ mod tests {
 
     impl Drop for Exclusive {
         fn drop(&mut self) {
-            settle(By::Signal);
+            // What the test left is finished before another test runs, and
+            // the switches are off again whatever that does. A panic from
+            // it (its lists' work for after runs here) goes on after
+            // them, but not in a test that failed already: one that left
+            // this drop while the first unwinds would abort the whole
+            // test binary.
+            let settled = std::panic::catch_unwind(|| settle(By::Signal));
             IDLE_HELD.store(false, Relaxed);
             flights::FORCED.store(false, Relaxed);
             FORCED.store(false, Relaxed);
             OWNS_EXCLUSIVE.with(|f| f.set(false));
             let _ = &self.0;
+            if let Err(panic) = settled
+                && !std::thread::panicking()
+            {
+                std::panic::resume_unwind(panic);
+            }
         }
     }
 
@@ -1218,10 +1230,11 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        // (Before the guard: written by what the guard's drop finishes.)
+        let word = Box::new(AtomicU64::new(0));
         let flights = Flights::on();
         settle(By::Signal);
         let order = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let word = Box::new(AtomicU64::new(0));
         let at = word.as_ptr() as u64;
         let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
         for (i, list) in lists.iter().enumerate() {
@@ -1270,10 +1283,10 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        let word = Box::new(AtomicU64::new(0));
         let flights = Flights::on();
         settle(By::Signal);
         let order = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let word = Box::new(AtomicU64::new(0));
         let at = word.as_ptr() as usize;
         for reads_the_word in [false, true] {
             order.lock().unwrap().clear();
@@ -2014,8 +2027,8 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let _exclusive = Exclusive::enter(true, false, false);
         let word = Box::new(AtomicU64::new(0));
+        let _exclusive = Exclusive::enter(true, false, false);
         let list = std::sync::Arc::new(host.new_list().unwrap());
         list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
         list.close();
