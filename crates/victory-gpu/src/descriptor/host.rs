@@ -17,7 +17,7 @@ use super::{VIEW_TAG, View, ViewPin, view_at, views_current_into, views_forgot};
 use crate::host::host;
 
 mod quick;
-mod sync_fast;
+pub(crate) mod sync_fast;
 #[cfg(test)]
 mod split_tests;
 

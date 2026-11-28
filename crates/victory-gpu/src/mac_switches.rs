@@ -756,10 +756,6 @@ fn spans_rule(value: Option<&str>) -> bool {
 /// mac: `VICTORY_AB=VICTORY_HEAP_SYNC_FAST` (`crate::ab`): read per heap-sync
 /// pass; both sides leave `HostHeap` and `Viewed` in the same state.
 pub(crate) fn heap_sync_fast() -> bool {
-    #[cfg(test)]
-    if tests::HEAP_SYNC_FAST_HERE.with(std::cell::Cell::get) {
-        return true;
-    }
     static ON: OnceLock<bool> = OnceLock::new();
     let a = *ON.get_or_init(|| {
         let on = heap_sync_fast_rule(std::env::var("VICTORY_HEAP_SYNC_FAST").ok().as_deref());
@@ -1628,28 +1624,6 @@ pub(crate) mod tests {
     impl Drop for SpansHere {
         fn drop(&mut self) {
             SPANS_HERE.with(|on| on.set(false));
-        }
-    }
-
-    thread_local! {
-        /// `heap_sync_fast` is on for this thread's heap syncs ([`HeapSyncFastHere`]).
-        pub(crate) static HEAP_SYNC_FAST_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) struct HeapSyncFastHere;
-
-    impl HeapSyncFastHere {
-        #[cfg_attr(not(windows), allow(dead_code))]
-        pub(crate) fn new() -> Self {
-            HEAP_SYNC_FAST_HERE.with(|on| on.set(true));
-            HeapSyncFastHere
-        }
-    }
-
-    impl Drop for HeapSyncFastHere {
-        fn drop(&mut self) {
-            HEAP_SYNC_FAST_HERE.with(|on| on.set(false));
         }
     }
 
