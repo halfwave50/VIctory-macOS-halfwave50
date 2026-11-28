@@ -255,10 +255,6 @@ impl Module {
         self.ty(TypeDef::Func(ret, params))
     }
 
-    fn is_void(&self, t: Ty) -> bool {
-        self.types[t.0 as usize] == TypeDef::Void
-    }
-
     fn constant(&mut self, ty: Ty, c: Const) -> V {
         // The key is built once and only copied on a miss: a hit (the common
         // case) must not clone an aggregate's fields.
@@ -569,7 +565,7 @@ impl Module {
     /// pass, not one pass per merge.
     fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
-        let mut work: Vec<u32> = Vec::new();
+        let mut work: Vec<u32> = Vec::with_capacity(self.insts.len().min(4096));
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
             if let V::Inst(i) = v
                 && !live[i as usize]
@@ -807,7 +803,15 @@ impl Module {
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
     /// refuses them).
+    #[cfg(test)]
     fn kept(&self, plan: &Plan) -> ((Vec<u32>, u32), (Vec<u32>, u32)) {
+        let k = self.kept_and_ids(plan, None);
+        ((k.globals, k.global_count), (k.funcs, k.func_count))
+    }
+
+    /// Computes kept globals/functions and, in the same single pass over live
+    /// instructions, 0-based instruction value offsets (`ids`, skipping void).
+    fn kept_and_ids(&self, plan: &Plan, void_ty: Option<Ty>) -> KeptIds {
         let mut called = vec![false; self.funcs.len()];
         let mut read = vec![false; self.globals.len()];
         for m in &self.mds {
@@ -815,17 +819,52 @@ impl Module {
                 read[*g as usize] = true;
             }
         }
-        for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
-                let op = &self.insts[i as usize].op;
-                if let Op::Call(f, _) = *op {
-                    called[f as usize] = true;
-                }
-                for_each_operand(op, |v| {
-                    if let V::Global(g) = v {
-                        read[g as usize] = true;
+        let scan_globals = self
+            .globals
+            .iter()
+            .zip(&read)
+            .any(|(g, &r)| g.init.is_some() && !r);
+        let mut ids = vec![u32::MAX; self.insts.len()];
+        let mut next = 0u32;
+        let insts = &self.insts;
+        if scan_globals {
+            for &b_idx in &plan.layout {
+                let b = &self.blocks[b_idx];
+                for &i in b.phis.iter().chain(&b.body) {
+                    if !plan.live[i as usize] {
+                        continue;
                     }
-                });
+                    let inst = &insts[i as usize];
+                    if Some(inst.ty) != void_ty {
+                        ids[i as usize] = next;
+                        next += 1;
+                    }
+                    if let Op::Call(f, _) = inst.op {
+                        called[f as usize] = true;
+                    }
+                    for_each_operand(&inst.op, |v| {
+                        if let V::Global(g) = v {
+                            read[g as usize] = true;
+                        }
+                    });
+                }
+            }
+        } else {
+            for &b_idx in &plan.layout {
+                let b = &self.blocks[b_idx];
+                for &i in b.phis.iter().chain(&b.body) {
+                    if !plan.live[i as usize] {
+                        continue;
+                    }
+                    let inst = &insts[i as usize];
+                    if Some(inst.ty) != void_ty {
+                        ids[i as usize] = next;
+                        next += 1;
+                    }
+                    if let Op::Call(f, _) = inst.op {
+                        called[f as usize] = true;
+                    }
+                }
             }
         }
         let number = |keep: &mut dyn Iterator<Item = bool>| {
@@ -838,9 +877,22 @@ impl Module {
                 .collect();
             (ids, n)
         };
-        let globals = number(&mut self.globals.iter().zip(&read).map(|(g, &r)| g.init.is_none() || r));
-        let funcs = number(&mut self.funcs.iter().zip(&called).map(|(f, &c)| f.body || c));
-        (globals, funcs)
+        let (globals, global_count) = number(
+            &mut self
+                .globals
+                .iter()
+                .zip(&read)
+                .map(|(g, &r)| g.init.is_none() || r),
+        );
+        let (funcs, func_count) =
+            number(&mut self.funcs.iter().zip(&called).map(|(f, &c)| f.body || c));
+        KeptIds {
+            globals,
+            global_count,
+            funcs,
+            func_count,
+            inst_ids: ids,
+        }
     }
 
     /// What [`Module::write`] writes: the instructions ([`Module::live`]),
@@ -859,10 +911,13 @@ impl Module {
     /// target twice (the target's phis have one entry per predecessor).
     fn plan(&self) -> Plan {
         let live = self.live();
-        let succs = |b: usize| successors(self.term(b));
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
+        let n_blocks = self.blocks.len();
+        let terms: Vec<Option<Term>> = (0..n_blocks).map(|b| self.term(b)).collect();
+        let succs = |b: usize| successors(terms[b]);
+        let mut seen = vec![false; n_blocks];
+        let mut post = Vec::with_capacity(n_blocks);
+        let mut stack = Vec::with_capacity(n_blocks.min(256));
+        stack.push((0usize, 0usize));
         seen[0] = true;
         while let Some(top) = stack.last_mut() {
             let (b, k) = *top;
@@ -880,14 +935,18 @@ impl Module {
             }
         }
         post.reverse();
-        let mut pos = vec![u64::MAX; self.blocks.len()];
+        let mut pos = vec![u64::MAX; n_blocks];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
         }
-        let mut preds = vec![Vec::new(); self.blocks.len()];
+        let mut pred_count = vec![0u32; n_blocks];
+        let mut first_pred = vec![0usize; n_blocks];
         for &b in &post {
             for &s in succs(b).iter() {
-                preds[s].push(b);
+                if pred_count[s] == 0 {
+                    first_pred[s] = b;
+                }
+                pred_count[s] += 1;
             }
         }
         let mut plan = Plan {
@@ -895,40 +954,75 @@ impl Module {
             seen,
             layout: Vec::new(),
             pos: Vec::new(),
-            fold: vec![None; self.blocks.len()],
+            fold: vec![None; n_blocks],
+            terms,
+            target_pos: Vec::new(),
+            src_pos: Vec::new(),
+            succ_to: Vec::new(),
         };
         for &b in &post {
             let blk = &self.blocks[b];
-            let empty = b != 0 && blk.phis.iter().chain(&blk.body).all(|&i| !plan.live[i as usize]);
-            if let (Some(Term::Br(h)), true, [p]) = (self.term(b), empty, &preds[b][..])
+            let empty = b != 0
+                && blk
+                    .phis
+                    .iter()
+                    .chain(&blk.body)
+                    .all(|&i| !plan.live[i as usize]);
+            if let Some(Term::Br(h)) = plan.terms[b]
+                && empty
+                && pred_count[b] == 1
                 && plan.to(h) != b
             {
-                plan.fold[b] = Some((*p, h));
+                let p = first_pred[b];
+                plan.fold[b] = Some((p, h));
                 let (from, at) = (plan.src(b), plan.to(h));
-                let critical = succs(from).len() > 1 && preds[at].len() > 1 && pos[h] > pos[b];
-                if critical || succs(from).iter().filter(|&&s| plan.to(s) == at).count() != 1 {
+                let from_succs = successors(plan.terms[from]);
+                let critical = from_succs.len() > 1 && pred_count[at] > 1 && pos[h] > pos[b];
+                if critical
+                    || from_succs.iter().filter(|&&s| plan.to(s) == at).count() != 1
+                {
                     plan.fold[b] = None;
                 }
             }
         }
-        plan.layout = post.into_iter().filter(|&b| plan.fold[b].is_none()).collect();
-        plan.pos = vec![u64::MAX; self.blocks.len()];
+        plan.layout = post
+            .into_iter()
+            .filter(|&b| plan.fold[b].is_none())
+            .collect();
+        pos.fill(u64::MAX);
         for (n, &b) in plan.layout.iter().enumerate() {
-            plan.pos[b] = n as u64;
+            pos[b] = n as u64;
         }
+        plan.pos = pos;
+        plan.target_pos = (0..n_blocks).map(|b| plan.pos[plan.to(b)]).collect();
+        plan.src_pos = (0..n_blocks).map(|b| plan.pos[plan.src(b)]).collect();
+        plan.succ_to = (0..n_blocks)
+            .map(|b| {
+                if !plan.seen[b] {
+                    return [u32::MAX, u32::MAX];
+                }
+                let s = successors(plan.terms[b]);
+                let s0 = s.first().map_or(u32::MAX, |&t| plan.to(t) as u32);
+                let s1 = s.get(1).map_or(u32::MAX, |&t| plan.to(t) as u32);
+                [s0, s1]
+            })
+            .collect();
         plan
     }
 
     pub fn write(&self) -> Vec<u8> {
         let plan = self.plan();
         let (live, layout) = (&plan.live, &plan.layout);
-        let term_of = |b: usize| self.term(b);
-        let target = |t: usize| plan.pos[plan.to(t)];
-        let from = |b: usize| plan.pos[plan.src(b)];
+        let void_ty = self.type_ids.get(&TypeDef::Void).copied().map(Ty);
+        let KeptIds {
+            globals: kept_globals,
+            global_count: g_n,
+            funcs: kept,
+            func_count: n,
+            inst_ids,
+        } = self.kept_and_ids(&plan, void_ty);
 
-        let ((kept_globals, g_n), (kept, n)) = self.kept(&plan);
-
-        let mut w = Writer::default();
+        let mut w = Writer::with_capacity(self.insts.len() * 12 + 1024);
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
@@ -1059,27 +1153,16 @@ impl Module {
         }
         w.exit();
 
-        // Instruction value ids, in layout order.
         let base = funcs + self.consts.len() as u32;
-        let mut ids = vec![u32::MAX; self.insts.len()];
-        let mut next = base;
-        for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
-                if !self.is_void(self.insts[i as usize].ty) {
-                    ids[i as usize] = next;
-                    next += 1;
-                }
-            }
-        }
         let abs = |v: V| -> u32 {
             match v {
                 V::Global(i) => kept_globals[i as usize],
                 V::Func(i) => globals + kept[i as usize],
                 V::Const(i) => funcs + i,
                 V::Inst(i) => {
-                    let id = ids[i as usize];
+                    let id = inst_ids[i as usize];
                     assert_ne!(id, u32::MAX, "use of a void value");
-                    id
+                    base + id
                 }
             }
         };
@@ -1148,7 +1231,67 @@ impl Module {
         let mut r: Vec<u64> = Vec::new();
         for &x in layout {
             let b = &self.blocks[x];
-            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
+            if !b.phis.is_empty() {
+                let mut cached_pair: Option<(usize, usize, bool, bool, u64, u64)> = None;
+                for &i in &b.phis {
+                    if !live[i as usize] {
+                        continue;
+                    }
+                    let inst = &self.insts[i as usize];
+                    if let Op::Phi(incoming) = &inst.op {
+                        if let &[(v0, b0), (v1, b1)] = incoming.as_slice() {
+                            let (e0, e1, s0, s1) = match cached_pair {
+                                Some((cb0, cb1, ce0, ce1, cs0, cs1)) if cb0 == b0 && cb1 == b1 => {
+                                    (ce0, ce1, cs0, cs1)
+                                }
+                                _ => {
+                                    let e0 = plan.edge_fast(b0, x);
+                                    let e1 = plan.edge_fast(b1, x);
+                                    let s0 = plan.src_pos[b0];
+                                    let s1 = plan.src_pos[b1];
+                                    cached_pair = Some((b0, b1, e0, e1, s0, s1));
+                                    (e0, e1, s0, s1)
+                                }
+                            };
+                            let ty = u64::from(inst.ty.0);
+                            match (e0, e1) {
+                                (true, true) => w.record_phi2(
+                                    ty,
+                                    signed(i64::from(inst_id) - i64::from(abs(v0))),
+                                    s0,
+                                    signed(i64::from(inst_id) - i64::from(abs(v1))),
+                                    s1,
+                                ),
+                                (true, false) => w.record(
+                                    16,
+                                    &[ty, signed(i64::from(inst_id) - i64::from(abs(v0))), s0],
+                                ),
+                                (false, true) => w.record(
+                                    16,
+                                    &[ty, signed(i64::from(inst_id) - i64::from(abs(v1))), s1],
+                                ),
+                                (false, false) => w.record(16, &[ty]),
+                            }
+                        } else {
+                            r.clear();
+                            r.push(u64::from(inst.ty.0));
+                            for &(v, pb) in incoming.iter().filter(|&&(_, pb)| plan.edge_fast(pb, x))
+                            {
+                                r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
+                                r.push(plan.src_pos[pb]);
+                            }
+                            w.record(16, &r);
+                        }
+                    }
+                    if Some(inst.ty) != void_ty {
+                        inst_id += 1;
+                    }
+                }
+            }
+            for &i in &b.body {
+                if !live[i as usize] {
+                    continue;
+                }
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
@@ -1171,9 +1314,9 @@ impl Module {
                     Op::Phi(incoming) => {
                         r.clear();
                         r.push(u64::from(inst.ty.0));
-                        for &(v, b) in incoming.iter().filter(|&&(_, b)| plan.edge(self, b, x)) {
+                        for &(v, pb) in incoming.iter().filter(|&&(_, pb)| plan.edge_fast(pb, x)) {
                             r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
-                            r.push(from(b));
+                            r.push(plan.src_pos[pb]);
                         }
                         w.record(16, &r);
                     }
@@ -1194,17 +1337,24 @@ impl Module {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
                     }
                 }
-                if !self.is_void(inst.ty) {
+                if Some(inst.ty) != void_ty {
                     inst_id += 1;
                 }
             }
-            match term_of(x).expect("unterminated block") {
+            match plan.terms[x].expect("unterminated block") {
                 Term::Ret => w.record(10, &[]),
-                Term::Br(t) => w.record(11, &[target(t)]),
+                Term::Br(t) => w.record(11, &[plan.target_pos[t]]),
                 Term::CondBr(c, t, f) => {
                     let a = abs(c);
                     assert!(a < inst_id);
-                    w.record(11, &[target(t), target(f), u64::from(inst_id - a)]);
+                    w.record(
+                        11,
+                        &[
+                            plan.target_pos[t],
+                            plan.target_pos[f],
+                            u64::from(inst_id - a),
+                        ],
+                    );
                 }
             }
         }
@@ -1237,6 +1387,15 @@ pub struct Uses {
     pub int64: bool,
 }
 
+/// Kept globals/functions and 0-based live instruction offsets computed in one pass.
+struct KeptIds {
+    globals: Vec<u32>,
+    global_count: u32,
+    funcs: Vec<u32>,
+    func_count: u32,
+    inst_ids: Vec<u32>,
+}
+
 /// What [`Module::write`] writes ([`Module::plan`]).
 struct Plan {
     /// Per instruction: written.
@@ -1249,6 +1408,14 @@ struct Plan {
     pos: Vec<u64>,
     /// Per folded block: its one predecessor and its target.
     fold: Vec<Option<(usize, usize)>>,
+    /// Per block: resolved terminator (constant branches folded).
+    terms: Vec<Option<Term>>,
+    /// Per block: layout position of `to(b)`.
+    target_pos: Vec<u64>,
+    /// Per block: layout position of `src(b)`.
+    src_pos: Vec<u64>,
+    /// Per block: resolved target block indices of up to 2 successors (`u32::MAX` if absent/unseen).
+    succ_to: Vec<[u32; 2]>,
 }
 
 impl Plan {
@@ -1268,11 +1435,22 @@ impl Plan {
         b
     }
 
+    /// Whether a phi of block `x` keeps its entry from block `b` (O(1) lookup).
+    #[inline(always)]
+    fn edge_fast(&self, b: usize, x: usize) -> bool {
+        let [s0, s1] = self.succ_to[b];
+        let x = x as u32;
+        s0 == x || s1 == x
+    }
+
     /// Whether a phi of block `x` keeps its entry from block `b`: the edge
     /// is still there (not a constant branch's other edge, not from a block
     /// left out).
+    #[cfg(test)]
     fn edge(&self, m: &Module, b: usize, x: usize) -> bool {
-        self.seen[b] && successors(m.term(b)).iter().any(|&s| self.to(s) == x)
+        let slow = self.seen[b] && successors(m.term(b)).iter().any(|&s| self.to(s) == x);
+        debug_assert_eq!(slow, self.edge_fast(b, x));
+        slow
     }
 }
 
@@ -1332,30 +1510,75 @@ fn signed(v: i64) -> u64 {
     }
 }
 
-/// The bitstream: little-endian 32-bit words filled from bit 0.
-#[derive(Default)]
+/// The bitstream: little-endian 32-bit words filled from bit 0, written
+/// directly into the output byte vector so [`Writer::finish`] needs no copy.
 struct Writer {
-    words: Vec<u32>,
+    bytes: Vec<u8>,
     cur: u64,
     bits: u32,
-    /// Per open block: abbreviation width, index of its length word.
+    cur_width: u32,
+    /// Per open block: abbreviation width, byte offset after its length word.
     stack: Vec<(u32, usize)>,
 }
 
+impl Default for Writer {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
+#[inline(always)]
+fn push_bits(bytes: &mut Vec<u8>, cur: &mut u64, bits: &mut u32, v: u64, width: u32) {
+    *cur |= v << *bits;
+    *bits += width;
+    if *bits >= 32 {
+        bytes.extend_from_slice(&(*cur as u32).to_le_bytes());
+        *cur >>= 32;
+        *bits -= 32;
+    }
+}
+
+#[inline(always)]
+fn push_vbr6(bytes: &mut Vec<u8>, cur: &mut u64, bits: &mut u32, mut v: u64) {
+    if v < 32 {
+        push_bits(bytes, cur, bits, v, 6);
+    } else if v < 1024 {
+        let enc = (v & 31) | 32 | ((v >> 5) << 6);
+        push_bits(bytes, cur, bits, enc, 12);
+    } else if v < 32768 {
+        let enc = (v & 31) | 32 | (((v >> 5) & 31 | 32) << 6) | ((v >> 10) << 12);
+        push_bits(bytes, cur, bits, enc, 18);
+    } else if v < 1_048_576 {
+        let enc = (v & 31)
+            | 32
+            | (((v >> 5) & 31 | 32) << 6)
+            | (((v >> 10) & 31 | 32) << 12)
+            | ((v >> 15) << 18);
+        push_bits(bytes, cur, bits, enc, 24);
+    } else {
+        while v >= 32 {
+            push_bits(bytes, cur, bits, (v & 31) | 32, 6);
+            v >>= 5;
+        }
+        push_bits(bytes, cur, bits, v, 6);
+    }
+}
+
 impl Writer {
-    fn width(&self) -> u32 {
-        self.stack.last().map_or(2, |b| b.0)
+    fn with_capacity(bytes_cap: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes_cap),
+            cur: 0,
+            bits: 0,
+            cur_width: 2,
+            stack: Vec::with_capacity(4),
+        }
     }
 
+    #[inline(always)]
     fn emit(&mut self, v: u64, width: u32) {
         debug_assert!(width == 64 || v >> width == 0);
-        self.cur |= v << self.bits;
-        self.bits += width;
-        while self.bits >= 32 {
-            self.words.push(self.cur as u32);
-            self.cur >>= 32;
-            self.bits -= 32;
-        }
+        push_bits(&mut self.bytes, &mut self.cur, &mut self.bits, v, width);
     }
 
     fn vbr(&mut self, mut v: u64, width: u32) {
@@ -1369,7 +1592,8 @@ impl Writer {
 
     fn align(&mut self) {
         if self.bits > 0 {
-            self.words.push(self.cur as u32);
+            self.bytes
+                .extend_from_slice(&(self.cur as u32).to_le_bytes());
             self.cur = 0;
             self.bits = 0;
         }
@@ -1382,34 +1606,73 @@ impl Writer {
     }
 
     fn enter(&mut self, id: u64, width: u32) {
-        self.emit(1, self.width()); // ENTER_SUBBLOCK
+        self.emit(1, self.cur_width); // ENTER_SUBBLOCK
         self.vbr(id, 8);
         self.vbr(u64::from(width), 4);
         self.align();
-        self.words.push(0);
-        self.stack.push((width, self.words.len()));
+        self.bytes.extend_from_slice(&0u32.to_le_bytes());
+        self.stack.push((width, self.bytes.len()));
+        self.cur_width = width;
     }
 
     fn exit(&mut self) {
-        self.emit(0, self.width()); // END_BLOCK
+        self.emit(0, self.cur_width); // END_BLOCK
         self.align();
         let (_, start) = self.stack.pop().expect("open block");
-        self.words[start - 1] = (self.words.len() - start) as u32;
+        let words = ((self.bytes.len() - start) / 4) as u32;
+        self.bytes[start - 4..start].copy_from_slice(&words.to_le_bytes());
+        self.cur_width = self.stack.last().map_or(2, |b| b.0);
+    }
+
+    /// Fast path for a 2-predecessor PHI record (`code = 16`, `ops.len() = 5`)
+    /// inside `FUNCTION_BLOCK` (`cur_width == 4`).
+    #[inline(always)]
+    fn record_phi2(&mut self, ty: u64, v0: u64, b0: u64, v1: u64, b1: u64) {
+        let bytes = &mut self.bytes;
+        let mut cur = self.cur;
+        let mut bits = self.bits;
+        // Header: abbrev=3 (4b) | code=16 (6b) | n=5 (6b) = 16 bits.
+        const HDR: u64 = 3 | (16 << 4) | (5 << 10);
+        if ty < 32 {
+            push_bits(bytes, &mut cur, &mut bits, HDR | (ty << 16), 22);
+        } else {
+            push_bits(bytes, &mut cur, &mut bits, HDR, 16);
+            push_vbr6(bytes, &mut cur, &mut bits, ty);
+        }
+        push_vbr6(bytes, &mut cur, &mut bits, v0);
+        push_vbr6(bytes, &mut cur, &mut bits, b0);
+        push_vbr6(bytes, &mut cur, &mut bits, v1);
+        push_vbr6(bytes, &mut cur, &mut bits, b1);
+        self.cur = cur;
+        self.bits = bits;
     }
 
     /// An unabbreviated record.
+    #[inline]
     fn record(&mut self, code: u64, ops: &[u64]) {
-        self.emit(3, self.width());
-        self.vbr(code, 6);
-        self.vbr(ops.len() as u64, 6);
-        for &o in ops {
-            self.vbr(o, 6);
+        let bytes = &mut self.bytes;
+        let mut cur = self.cur;
+        let mut bits = self.bits;
+        let width = self.cur_width;
+        let n = ops.len() as u64;
+        if code < 32 && n < 32 {
+            let hdr = 3u64 | (code << width) | (n << (width + 6));
+            push_bits(bytes, &mut cur, &mut bits, hdr, width + 12);
+        } else {
+            push_bits(bytes, &mut cur, &mut bits, 3, width);
+            push_vbr6(bytes, &mut cur, &mut bits, code);
+            push_vbr6(bytes, &mut cur, &mut bits, n);
         }
+        for &o in ops {
+            push_vbr6(bytes, &mut cur, &mut bits, o);
+        }
+        self.cur = cur;
+        self.bits = bits;
     }
 
     fn finish(mut self) -> Vec<u8> {
         self.align();
-        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        self.bytes
     }
 }
 
