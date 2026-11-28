@@ -1195,12 +1195,9 @@ impl Shadow {
         start: usize,
         end: usize,
     ) -> (crate::watch::Runs, Vec<usize>) {
-        const BLOCK: usize = 4096;
         let mut writes: crate::watch::Runs = Vec::new();
         let mut taken = Vec::new();
         let mut title = Vec::new();
-        let mut blocks_changed = 0u64;
-        let mut blocks_compared = 0u64;
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -1226,22 +1223,15 @@ impl Shadow {
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
-            blocks_compared += (to.div_ceil(BLOCK) - from / BLOCK) as u64;
-            let before = saved.as_deref().map(|b| &b[from - page..to - page]);
-            let mut page_blocks_changed = 0u64;
-            for blk in from / BLOCK..to.div_ceil(BLOCK) {
-                let a = (blk * BLOCK).max(from) - from;
-                let b = ((blk + 1) * BLOCK).min(to) - from;
-                let blk_differs = match before {
-                    // The title's bytes are the copy's from before: what differs
-                    // is the shaders'.
-                    None => host[a..b] != title[a..b],
-                    Some(old) => merge_writeback(&mut title[a..b], &mut host[a..b], &old[a..b]),
-                };
-                page_blocks_changed += u64::from(blk_differs);
-            }
-            let differs = page_blocks_changed > 0;
-            blocks_changed += page_blocks_changed;
+            let differs = match &saved {
+                // The title's bytes are the copy's from before: what differs
+                // is the shaders'.
+                None => *host != title[..],
+                Some(before) => {
+                    let before = &before[from - page..to - page];
+                    merge_writeback(&mut title, host, before)
+                }
+            };
             if differs {
                 match writes.last_mut() {
                     Some((_, end)) if *end == from => *end = to,
@@ -1256,7 +1246,6 @@ impl Shadow {
                 taken.push(page / PAGE);
             }
         }
-        record_marked_blocks(blocks_changed, blocks_compared);
         (writes, taken)
     }
 
@@ -1978,8 +1967,10 @@ thread_local! {
 /// mac: of [`copy_back_marks`] since the last frame line: marked pages of
 /// host copies compared with title memory, marked pages of aliased copies
 /// (told to the other trackers, nothing to compare), bytes written back
-/// from the compared pages, the calls' microseconds, 4 KiB blocks changed,
-/// and 4 KiB blocks compared.
+/// from the compared pages, the calls' microseconds, and with
+/// `VICTORY_COPY_BACK_SPANS=1` only (`copy_back_fast`) 4 KiB blocks written
+/// back and 4 KiB blocks compared: the default path compares a page whole,
+/// stopping at its first difference, as before.
 static MARKED_BACK: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 pub(super) fn record_marked_blocks(blocks_changed: u64, blocks_compared: u64) {
@@ -2006,16 +1997,24 @@ impl Drop for MarkedClock {
     }
 }
 
+/// The line's text as before, with `VICTORY_COPY_BACK_SPANS`'s block
+/// counts at its end (when the switch is on, or counted in the window).
 pub(super) fn format_marked_back_line(
     [compared, aliased, bytes, us, blocks_changed, blocks_compared]: [f64; 6],
     spans: bool,
 ) -> String {
+    let blocks = if spans || blocks_compared > 0.0 {
+        format!(
+            ", 4 KiB blocks {blocks_changed:.0} written back of {blocks_compared:.0} compared (VICTORY_COPY_BACK_SPANS)"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "; marked pages copied back: {compared:.0} compared ({blocks_changed:.0} 4 KiB blocks changed of {blocks_compared:.0} blocks compared), \
-         {:.1} MB written back from them, {aliased:.0} more in aliased memory told only, in {:.1} ms{}",
+        "; marked pages copied back: {compared:.0} compared, {:.1} MB written back from them, {aliased:.0} more in \
+         aliased memory told only, in {:.1} ms{blocks}",
         bytes / 1e6,
-        us / 1e3,
-        if spans { " (VICTORY_COPY_BACK_SPANS)" } else { "" }
+        us / 1e3
     )
 }
 

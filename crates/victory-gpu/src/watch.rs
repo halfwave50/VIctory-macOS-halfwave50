@@ -1572,7 +1572,8 @@ impl Tracked {
     /// wrote while unarmed (`MarkedKept`) under one hold of `changed` and
     /// `saved`, keeping `pages` armed until [`Tracked::unarm_marked`] right
     /// before writeback so a title fault racing the scan still saves pre-fault
-    /// bytes.
+    /// bytes. A page omitted so is unarmed here, as the default path
+    /// (`Shadow::marked_pages`) unarms every page before it looks at it.
     pub(crate) fn prepare_marked(
         &self,
         pages: &[usize],
@@ -1596,6 +1597,9 @@ impl Tracked {
                 let idx = page / PAGE;
                 let before = saved.bytes.remove(&idx);
                 if before.is_none() && changed.contains(&idx) {
+                    if saved.armed(idx) {
+                        saved.unarmed.insert(idx);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         kept += 1;
@@ -1619,7 +1623,9 @@ impl Tracked {
 
     /// Unarms `planned` right before writeback so our own writes do not save
     /// them again, and omits from `taken` any page that took a title fault
-    /// after it was scanned so it stays changed for the next refresh.
+    /// after [`Tracked::prepare_marked`] (its bytes saved since; the scan
+    /// reads them without taking them, [`Tracked::saved_now`]) so it stays
+    /// changed for the next refresh.
     pub(crate) fn unarm_marked(&self, planned: &[MarkedPage], taken: &mut Vec<usize>) {
         if planned.is_empty() {
             return;
@@ -1638,6 +1644,20 @@ impl Tracked {
         if !late_faulted.is_empty() {
             taken.retain(|p| !late_faulted.contains(p));
         }
+    }
+}
+
+impl Tracked {
+    /// [`Tracked::saved`] without taking them: the bytes stay for
+    /// [`Tracked::unarm_marked`], which keeps such a page changed.
+    pub(crate) fn saved_now(&self, page: usize) -> Option<Box<[u8]>> {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.get(&page).cloned()
+    }
+
+    /// Whether page `page` (a page number) is armed (tests).
+    #[cfg(test)]
+    pub(crate) fn armed_now(&self, page: usize) -> bool {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed(page)
     }
 }
 

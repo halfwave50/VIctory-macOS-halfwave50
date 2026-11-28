@@ -41,8 +41,10 @@ fn with_scan_buf<R>(need: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
 impl Shadow {
     /// `Shadow::copy_back_or_not` with word-scanned three-way merge and
     /// coalesced span writes, reading, writing, and re-guarding one 64 KiB
-    /// piece at a time so concurrent title writes outside the GPU spans are
-    /// never cleared from the changed set without reaching the shadow.
+    /// piece at a time. A title write outside the GPU spans can be cleared
+    /// from the changed set without reaching the shadow only if it lands in
+    /// one piece's gap between its read and its `taken`, as on the default
+    /// path, whose gap is the whole range.
     pub(super) fn copy_back_or_not_spans(&self, address: usize, len: usize, back: bool) -> usize {
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,8 +236,12 @@ impl Shadow {
                 let n = item.to - item.from;
                 if crate::host::read_into(item.from as *const u8, &mut buf[..n]) {
                     blocks_compared += (item.to.div_ceil(BLOCK) - item.from / BLOCK) as u64;
+                    // A fault since `prepare_marked`, while the page was read
+                    // or before: its bytes from before, read and left for
+                    // `unarm_marked`, which then keeps the page changed (the
+                    // title's write may be newer than what was read).
                     let late_saved = if item.saved.is_none() && !t.clean() {
-                        t.saved(item.page / PAGE)
+                        t.saved_now(item.page / PAGE)
                     } else {
                         None
                     };
@@ -254,6 +260,7 @@ impl Shadow {
         (writes, taken, blocks_compared)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn scan_one_marked(
         &self,

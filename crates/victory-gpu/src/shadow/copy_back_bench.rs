@@ -96,15 +96,38 @@ fn mapped_placeholder_views(section_pages: usize, slots: &[usize]) -> usize {
     }
 }
 
+/// The line's text is as before without the switch (the default path counts
+/// no blocks), and the switch's 4 KiB block counts come at its end.
 #[test]
-fn marked_back_line_includes_4kib_blocks_changed_of_compared() {
-    let line_off = format_marked_back_line([2033.0, 4.0, 12_300_000.0, 14_200.0, 2980.0, 32528.0], false);
+fn marked_back_line_keeps_its_text_and_ends_with_the_spans_blocks() {
+    let line_off = format_marked_back_line([2033.0, 4.0, 12_300_000.0, 14_200.0, 0.0, 0.0], false);
     assert_eq!(
         line_off,
-        "; marked pages copied back: 2033 compared (2980 4 KiB blocks changed of 32528 blocks compared), 12.3 MB written back from them, 4 more in aliased memory told only, in 14.2 ms"
+        "; marked pages copied back: 2033 compared, 12.3 MB written back from them, 4 more in aliased memory told only, in 14.2 ms"
     );
     let line_on = format_marked_back_line([2033.0, 0.0, 12_300_000.0, 14_200.0, 2980.0, 32528.0], true);
-    assert!(line_on.ends_with(" (VICTORY_COPY_BACK_SPANS)"));
+    assert_eq!(
+        line_on,
+        "; marked pages copied back: 2033 compared, 12.3 MB written back from them, 0 more in aliased memory told only, in 14.2 ms, 4 KiB blocks 2980 written back of 32528 compared (VICTORY_COPY_BACK_SPANS)"
+    );
+}
+
+/// Pages `[0, n_pages)` from `base` whose `armed` state is set (tests).
+fn page_armed_flags(copy: &Shadow, base: usize, n_pages: usize) -> Vec<bool> {
+    let t = copy.tracked.as_ref().expect("a tracked copy");
+    (0..n_pages).map(|p| t.armed_now(base / PAGE + p)).collect()
+}
+
+/// The 4 KiB blocks of `[start, end)` whose bytes differ between `a` and `b`
+/// (both from `base`).
+fn blocks_differing(a: &[u8], b: &[u8], base: usize, start: usize, end: usize) -> u64 {
+    const BLOCK: usize = 4096;
+    (start / BLOCK..end.div_ceil(BLOCK))
+        .filter(|&blk| {
+            let (from, to) = ((blk * BLOCK).max(start) - base, ((blk + 1) * BLOCK).min(end) - base);
+            a[from..to] != b[from..to]
+        })
+        .count() as u64
 }
 
 /// Differential check on real D3D12 + Wine memory: runs the default path and
@@ -113,8 +136,11 @@ fn marked_back_line_includes_4kib_blocks_changed_of_compared() {
 /// concurrent CPU + GPU writes, CPU-only armed pages, strided GPU writes, and
 /// full-page GPU writes) and compares EVERY byte of every guest page, EVERY
 /// byte of the `Shadow` host buffer, per-page `VirtualQuery` protection state,
-/// per-page `Tracked::changed` flags, `Shadow::clean()`, and 4 KiB block
-/// counts after both marked and snapshot copy-backs.
+/// per-page `Tracked::changed` and armed flags (a page the title wrote before
+/// it was armed is kept and unarmed on both sides), `Shadow::clean()`, and the
+/// switch's 4 KiB block counts against the blocks whose bytes the copy-back
+/// changed (the default path counts none) after both marked and snapshot
+/// copy-backs.
 #[test]
 fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
@@ -129,8 +155,11 @@ fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
         marked_shadow: Vec<u8>,
         marked_prot: Vec<u32>,
         marked_changed: Vec<bool>,
+        marked_armed: Vec<bool>,
         marked_clean: bool,
         marked_blocks: (u64, u64),
+        marked_blocks_differing: u64,
+        marked_blocks_of_compared_pages: u64,
         marked_split: Option<bool>,
         snap_guest: Vec<u8>,
         snap_shadow: Vec<u8>,
@@ -161,13 +190,15 @@ fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
                 *b = (i.wrapping_mul(31) ^ (i >> 9) ^ 0x23) as u8;
             }
         }
-        copy.update(start, len);
-        copy.writing(start, len, true);
-
         let write_cpu = |off: usize, val: u8| {
             // SAFETY: owned pool allocation.
             unsafe { ((base + off) as *mut u8).write_volatile(val) };
         };
+        copy.update(start, len);
+        // 0) Page 5, written before it is armed: changed with no bytes saved,
+        //    so kept (and unarmed) by both paths.
+        write_cpu(5 * PAGE + 3000, 0x66);
+        copy.writing(start, len, true);
 
         // 1) Partial first & last pages: GPU writes near edges.
         copy.write_host(start as u64, &[0xa1, 0xa2, 0xa3]);
@@ -210,9 +241,12 @@ fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
         let _ = take_last_marked_blocks();
         MARKED_SPLIT.with(|s| s.set(None));
         let pages: Vec<usize> = (0..n_pages).map(|i| base + i * PAGE).collect();
+        // SAFETY: owned pool allocation.
+        let guest_before = unsafe { std::slice::from_raw_parts(base as *const u8, n_pages * PAGE).to_vec() };
         let marked_written = copy.copy_back_marked(&pages);
         let marked_blocks = take_last_marked_blocks();
         let marked_split = MARKED_SPLIT.with(std::cell::Cell::get);
+        let marked_armed = page_armed_flags(&copy, base, n_pages);
 
         // Second call finds all whole pages synced; partial end pages match too.
         assert_eq!(copy.copy_back_marked(&pages), 0, "spans_on={spans_on}");
@@ -225,6 +259,15 @@ fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
         let marked_prot = page_protections(base, n_pages);
         let marked_changed = page_changed_flags(&copy, base, n_pages);
         let marked_clean = copy.clean();
+        let marked_blocks_differing = blocks_differing(&guest_before, &marked_guest, base, start, end);
+        // Every page but the kept pages 3 and 5 is compared.
+        let marked_blocks_of_compared_pages: u64 = (0..n_pages)
+            .filter(|&p| p != 3 && p != 5)
+            .map(|p| {
+                let (from, to) = ((base + p * PAGE).max(start), (base + (p + 1) * PAGE).min(end));
+                (to.div_ceil(4096) - from / 4096) as u64
+            })
+            .sum();
 
         // Clear the armed snapshot from above, sync whole range, then exercise
         // snapshot `copy_back` across multiple pages (CPU-only, GPU-only,
@@ -255,8 +298,11 @@ fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
             marked_shadow,
             marked_prot,
             marked_changed,
+            marked_armed,
             marked_clean,
             marked_blocks,
+            marked_blocks_differing,
+            marked_blocks_of_compared_pages,
             marked_split,
             snap_guest,
             snap_shadow,
@@ -281,9 +327,16 @@ fn copy_back_spans_matches_default_across_marked_and_snapshot_cases() {
     assert_eq!(spn.snap_written, 12 + 24);
     assert_eq!(def.snap_written, 2 * PAGE);
 
-    // Exact whole-page byte-for-byte, shadow, guard, changed-set, and 4 KiB block parity.
-    assert_eq!(spn.marked_blocks, def.marked_blocks, "4 KiB block counts must match");
+    // The default path counts no blocks (a page compared whole, as before);
+    // the switch's count is the blocks whose bytes the copy-back changed, of
+    // the blocks of every page it compared (all but the kept pages 3 and 5).
+    assert_eq!(def.marked_blocks, (0, 0), "the default path counts no blocks");
+    assert_eq!(spn.marked_blocks_differing, def.marked_blocks_differing);
+    assert_eq!(spn.marked_blocks.0, spn.marked_blocks_differing, "4 KiB blocks written back");
+    assert_eq!(spn.marked_blocks.1, spn.marked_blocks_of_compared_pages, "4 KiB blocks compared");
     assert!(spn.marked_blocks.0 > 0 && spn.marked_blocks.0 < spn.marked_blocks.1);
+    assert_eq!(spn.marked_armed, def.marked_armed, "armed pages after copy_back_marked");
+    assert!(!spn.marked_armed[5], "the kept page is unarmed");
     assert_eq!(spn.marked_guest, def.marked_guest, "every guest byte after copy_back_marked");
     assert_eq!(spn.marked_shadow, def.marked_shadow, "every shadow byte after copy_back_marked");
     assert_eq!(spn.marked_prot, def.marked_prot, "every page protection after copy_back_marked");
@@ -576,8 +629,12 @@ fn one_view_per_page_guards_one_view_per_call_and_matches_whole_pages() {
 /// 1) Deterministically writes to an already-completed piece AND a not-yet-read
 ///    piece mid-snapshot, proving neither title write is lost from the shadow.
 /// 2) Hammers non-GPU atomic counters from a background title thread across
-///    repeated marked and snapshot copy-backs, proving zero lost CPU or GPU
-///    writes and exact whole-page convergence after `Shadow::update`.
+///    repeated marked and snapshot copy-backs: no GPU write is lost, and the
+///    copy converges whole after `Shadow::update`. The title's last sweep
+///    marks every page changed again, so a title write lost on the way (one
+///    landing on an open page between a copy-back's read and its re-guard) is
+///    not seen here: `probe_title_writes_lost_between_a_copy_backs_read_and_its_reguard`
+///    counts those on both paths.
 #[test]
 fn concurrent_title_thread_writes_during_copy_back_are_never_lost() {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
@@ -742,6 +799,104 @@ fn concurrent_title_thread_writes_during_copy_back_are_never_lost() {
     }
 }
 
+/// A probe, not a pass/fail test: the title thread of
+/// `concurrent_title_thread_writes_during_copy_back_are_never_lost` part 2,
+/// on the default path and with `VICTORY_COPY_BACK_SPANS=1`, checked after
+/// each copy-back while it still writes: a page must be changed (its next
+/// refresh brings the title's word) or its copy must hold the title's word.
+/// Prints the pages found neither, per path and per call. Both paths show
+/// some. As we read the code: a page the title has written is open, later
+/// writes to it raise no fault, and the copy-back re-guards it (clearing
+/// `changed`) only after it read the page, so a write between the two is
+/// in title memory but not in the copy, until the title writes the page
+/// again.
+#[test]
+#[ignore = "probe: counts title writes lost between a copy-back's read and its re-guard on both paths"]
+fn probe_title_writes_lost_between_a_copy_backs_read_and_its_reguard() {
+    let Some(host) = host() else {
+        return;
+    };
+    let _quiet = host.quiet();
+    for spans in [false, true] {
+        let _pin = spans.then(CopyBackSpansHere::new);
+        let n_pages = 32;
+        let base = watch_tests::pool(n_pages);
+        let len = n_pages * PAGE;
+        let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+        // SAFETY: live D3D12 buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, base as u64, len as u64);
+        {
+            let _w = crate::watch::writing(base, len);
+            // SAFETY: owned pool allocation zeroed before atomic accesses.
+            unsafe { (base as *mut u8).write_bytes(0, len) };
+        }
+        copy.update(base, len);
+        let pages: Vec<usize> = (0..n_pages).map(|k| base + k * PAGE).collect();
+        let tracked = copy.tracked.as_ref().expect("a tracked copy");
+        // Pages neither changed nor holding the title's word in the copy;
+        // changed is read before and after the words, as a write to a
+        // guarded page faults (and marks it changed) before it lands.
+        let lost = || {
+            (0..n_pages)
+                .filter(|&p| {
+                    let page = base / PAGE + p;
+                    let before = tracked.changed(page);
+                    // SAFETY: the writer's word, read atomically.
+                    let title = unsafe { &*((base + p * PAGE + 8192) as *const AtomicU64) }.load(Ordering::Acquire);
+                    // SAFETY: inside the copy's mapping, read while no copy-back runs.
+                    let copied = unsafe { (copy.data.add(p * PAGE + 8192) as *const u64).read_volatile() };
+                    !before && !tracked.changed(page) && copied != title
+                })
+                .count()
+        };
+        let stop = AtomicBool::new(false);
+        let (mut after_marked, mut after_its_end, mut after_snapshot) = (0usize, 0usize, 0usize);
+        const ROUNDS: u8 = 48;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut seq = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    seq += 1;
+                    for p in 0..n_pages {
+                        // SAFETY: 8-byte aligned offset 8192 outside GPU spans.
+                        let slot = unsafe { &*((base + p * PAGE + 8192) as *const AtomicU64) };
+                        slot.store(seq, Ordering::Release);
+                    }
+                }
+            });
+            for round in 1..=ROUNDS {
+                copy.writing(base, len, true);
+                copy.update(base, len);
+                for p in 0..n_pages {
+                    copy.write_host((base + p * PAGE) as u64, &[0x80 | (round & 0x3f); 64]);
+                }
+                copy.copy_back_marked(&pages);
+                after_marked += lost();
+                // Ends the marked submission: no snapshot was kept for it.
+                copy.copy_back(base, len);
+                after_its_end += lost();
+                copy.update(base, len);
+                copy.writing(base, len, false);
+                for p in 0..n_pages {
+                    copy.write_host((base + p * PAGE + 128) as u64, &[0x40 | (round & 0x3f); 64]);
+                }
+                copy.copy_back(base, len);
+                after_snapshot += lost();
+            }
+            stop.store(true, Ordering::Release);
+        });
+        eprintln!(
+            "{}: pages found lost, of {} looked at each: after `copy_back_marked` {after_marked}, after the `copy_back` that ends its submission {after_its_end}, after a snapshot `copy_back` {after_snapshot}",
+            if spans { "VICTORY_COPY_BACK_SPANS=1" } else { "default" },
+            n_pages * usize::from(ROUNDS),
+        );
+        crate::watch::title_memory_remapped(base, len);
+        drop(copy);
+        watch_tests::free(base);
+    }
+}
+
 #[test]
 #[ignore = "benchmarks 2,033 marked pages on a 174 MiB D3D12 shadow buffer (serial vs serial)"]
 fn world_marked_and_snapshot_copy_back() {
@@ -836,7 +991,7 @@ fn world_marked_and_snapshot_copy_back() {
         let d_med = default_us[default_us.len() / 2];
         let s_med = spans_us[spans_us.len() / 2];
         eprintln!(
-            "[{scenario}] ({} 4 KiB blocks changed of {} blocks compared, serial)\n  default: median {:>6} us ({:.2} ms), {:.2} MB written\n  spans:   median {:>6} us ({:.2} ms), {:.2} MB written  ({:.2}x faster, {:+.1}%)",
+            "[{scenario}] ({} 4 KiB blocks written back of {} compared on the spans side, serial)\n  default: median {:>6} us ({:.2} ms), {:.2} MB written\n  spans:   median {:>6} us ({:.2} ms), {:.2} MB written  ({:.2}x faster, {:+.1}%)",
             blocks_pair.0,
             blocks_pair.1,
             d_med,
