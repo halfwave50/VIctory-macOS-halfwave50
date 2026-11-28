@@ -228,6 +228,21 @@ pub(crate) fn on() -> bool {
             );
             return false;
         }
+        // It counts on `Host::run` finishing each submission before it
+        // prepares the next: then a CPU wait drops the GPU's lines of every
+        // range between them. With flights a page shown at two addresses,
+        // two pieces, would read stale across submissions (probes 5 and 8;
+        // `notes/alias-physical-design.md` §3, stage 3's job). The aliasing,
+        // and with it the heap backing, may be on with flights since
+        // `VICTORY_FLIGHTS_WITH=alias`; this side stays off.
+        if crate::host::unwaited::flights::on() {
+            tracing::warn!(
+                "{}: the GPU side stays off: VICTORY_FLIGHTS is on, and pages shown at two addresses would read stale \
+                 across submissions (stage 3); the heap backing stays",
+                mode.name()
+            );
+            return false;
+        }
         match start_check() {
             Ok(()) => {
                 crate::physical_runs::gpu_on();
