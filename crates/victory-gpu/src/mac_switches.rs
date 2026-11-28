@@ -1134,19 +1134,25 @@ pub(crate) enum AliasPhysical {
     Cpu,
     /// `gpu`: `cpu`, and one reserved buffer per piece of each placeholder
     /// reservation, tiled from the heaps as the title maps its pages
-    /// (`crate::alias_physical`).
+    /// (`crate::alias_physical`); title buffers in one piece are views of it.
     Gpu,
+    /// `gpu-single`: `gpu`, but a range with a page shown at two or more
+    /// addresses keeps its copy (`notes/alias-physical-design.md` §3).
+    GpuSingle,
 }
 
 impl AliasPhysical {
     /// Whether the title's sections get heaps.
     pub(crate) fn heaps(self) -> bool {
-        matches!(self, AliasPhysical::Cpu | AliasPhysical::Gpu)
+        matches!(
+            self,
+            AliasPhysical::Cpu | AliasPhysical::Gpu | AliasPhysical::GpuSingle
+        )
     }
 
     /// Whether the GPU reads the pages through the reservations' pieces.
     pub(crate) fn gpu(self) -> bool {
-        matches!(self, AliasPhysical::Gpu)
+        matches!(self, AliasPhysical::Gpu | AliasPhysical::GpuSingle)
     }
 
     /// The switch as written.
@@ -1156,6 +1162,7 @@ impl AliasPhysical {
             AliasPhysical::Count => "VICTORY_ALIAS_PHYSICAL=count",
             AliasPhysical::Cpu => "VICTORY_ALIAS_PHYSICAL=cpu",
             AliasPhysical::Gpu => "VICTORY_ALIAS_PHYSICAL=gpu",
+            AliasPhysical::GpuSingle => "VICTORY_ALIAS_PHYSICAL=gpu-single",
         }
     }
 }
@@ -1169,7 +1176,7 @@ pub(crate) fn alias_physical() -> AliasPhysical {
         let (rule, known) = alias_physical_rule(value.as_deref());
         if !known {
             tracing::warn!(
-                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu and gpu; stage 2's counts alone",
+                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu, gpu and gpu-single; stage 2's counts alone",
                 value.as_deref().unwrap_or_default()
             );
         }
@@ -1189,6 +1196,7 @@ fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
         Some("count") => (AliasPhysical::Count, true),
         Some("cpu") => (AliasPhysical::Cpu, true),
         Some("gpu") => (AliasPhysical::Gpu, true),
+        Some("gpu-single") => (AliasPhysical::GpuSingle, true),
         Some(_) => (AliasPhysical::Count, false),
     }
 }
@@ -1301,6 +1309,7 @@ pub(crate) mod tests {
             ("cpu", AliasPhysical::Cpu),
             (" cpu ", AliasPhysical::Cpu),
             ("gpu", AliasPhysical::Gpu),
+            ("gpu-single", AliasPhysical::GpuSingle),
         ] {
             assert_eq!(alias_physical_rule(Some(value)), (rule, true), "{value:?}");
         }

@@ -138,6 +138,9 @@ pub(crate) struct Plan {
     pieces: Vec<Piece>,
     /// Pieces with changes since the last flush.
     dirty: BTreeSet<usize>,
+    /// How many tiles show each heap tile, as flushed: a page at two or
+    /// more addresses is a heap tile shown twice or more.
+    refs: HashMap<HeapTile, u32>,
 }
 
 impl Plan {
@@ -147,6 +150,7 @@ impl Plan {
             reservations: BTreeMap::new(),
             pieces: Vec::new(),
             dirty: BTreeSet::new(),
+            refs: HashMap::new(),
         }
     }
 
@@ -168,6 +172,11 @@ impl Plan {
                 let piece = &mut self.pieces[id];
                 piece.gone = true;
                 piece.pending.clear();
+                for now in piece.now.values() {
+                    if let Now::Heap(t) = now {
+                        unref(&mut self.refs, *t);
+                    }
+                }
                 piece.now.clear();
                 self.dirty.remove(&id);
                 dropped.push(id);
@@ -285,6 +294,18 @@ impl Plan {
         }
     }
 
+    /// Whether one of the `n` tiles of piece `id` from `first` on shows a
+    /// heap tile another tile shows too, as flushed: a page at two or more
+    /// addresses (`notes/alias-physical-design.md` §3).
+    pub(crate) fn shared(&self, id: usize, first: u32, n: u32) -> bool {
+        let Some(piece) = self.pieces.get(id) else {
+            return false;
+        };
+        (first..first.saturating_add(n)).any(|t| {
+            matches!(piece.now.get(&t), Some(Now::Heap(h)) if self.refs.get(h).is_some_and(|&n| n >= 2))
+        })
+    }
+
     /// Tiles with a change waiting.
     pub(crate) fn pending(&self) -> usize {
         self.dirty
@@ -300,6 +321,7 @@ impl Plan {
         let mut out = Flush::default();
         for id in std::mem::take(&mut self.dirty) {
             let never = self.never;
+            let refs = &mut self.refs;
             let piece = &mut self.pieces[id];
             let pending = std::mem::take(&mut piece.pending);
             // Tiles to change, in order: (tile, what it shows now); and the
@@ -325,6 +347,10 @@ impl Plan {
                         } else {
                             out.fresh += 1;
                         }
+                        if let Some(Now::Heap(old)) = shown {
+                            unref(refs, old);
+                        }
+                        *refs.entry(to).or_default() += 1;
                         piece.now.insert(tile, Now::Heap(to));
                     }
                     // Never mapped (left so, or filled below), or the sink already.
@@ -335,6 +361,9 @@ impl Plan {
                         }
                     }
                     Change::Unmap => {
+                        if let Some(Now::Heap(old)) = shown {
+                            unref(refs, old);
+                        }
                         clear.push(tile);
                         set.push((range(tile, 1, sink.tile, false), sink.heap));
                         out.sunk += 1;
@@ -389,6 +418,16 @@ impl Plan {
                 }));
         }
         out
+    }
+}
+
+/// One tile fewer shows heap tile `t`.
+fn unref(refs: &mut HashMap<HeapTile, u32>, t: HeapTile) {
+    if let Some(n) = refs.get_mut(&t) {
+        *n -= 1;
+        if *n == 0 {
+            refs.remove(&t);
+        }
     }
 }
 
@@ -688,6 +727,9 @@ mod tests {
                 (1, 0, vec![r(5, 1, 77, false)])
             ]
         );
+        assert!(plan.shared(0, 0, 4), "a page at two addresses");
+        assert!(plan.shared(1, 5, 1));
+        assert!(!plan.shared(0, 2, 2), "tiles of no shared page");
         // Unmapped at one: the other still shows it.
         plan.unmap(A + PAGE, PAGE);
         let flush = plan.flush(SINK);
@@ -697,6 +739,7 @@ mod tests {
             vec![(0, 0, vec![r(1, 1, SINK.tile, false)])]
         );
         assert_eq!(plan.pieces[1].now.get(&5), Some(&Now::Heap(heap(77))));
+        assert!(!plan.shared(1, 5, 1), "at one address again");
     }
 
     #[test]
@@ -872,6 +915,12 @@ mod tests {
                     "{never:?}"
                 );
                 assert!(nulled.is_empty(), "{never:?}: tiles left null: {nulled:?}");
+                // The references per heap tile are what the buffers show.
+                let mut refs: HashMap<HeapTile, u32> = HashMap::new();
+                for t in shown.values().filter(|&&t| t != SINK) {
+                    *refs.entry(*t).or_default() += 1;
+                }
+                assert_eq!(refs, plan.refs, "{never:?}: references per heap tile");
                 for (&page, &want) in &asked {
                     let (piece, offset) = plan.locate(page, page + 1).expect("in a piece");
                     let now = shown.get(&(piece, offset / PAGE as u32)).copied();

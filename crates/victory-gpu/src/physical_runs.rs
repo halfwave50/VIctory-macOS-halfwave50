@@ -379,7 +379,7 @@ fn stage2_line(
     now: [i64; 5],
     r: &Reservations,
     backing: Option<[i64; 5]>,
-    gpu: Option<[u64; 7]>,
+    gpu: Option<[u64; 10]>,
     frames: f64,
 ) -> String {
     let [fresh, remapped, unmapped, again] = window.map(|n| n as f64 / frames.max(1.0));
@@ -407,11 +407,12 @@ fn stage2_line(
              view remaps retried, {failed} failed",
             bytes as f64 / 1e9
         )
-    }) + &gpu.map_or(String::new(), |[fresh, remapped, sunk, calls, us, made, fallen]| {
+    }) + &gpu.map_or(String::new(), |[fresh, remapped, sunk, calls, us, made, fallen, views, shared, kept]| {
         let f = |n: u64| n as f64 / frames.max(1.0);
         format!(
-            "; GPU side: {made} pieces ({fallen} fell back to copies); per frame {:.1} tiles mapped fresh, {:.1} \
-             nulled and mapped again, {:.1} to the sink, in {:.1} UpdateTileMappings, {:.2} ms",
+            "; GPU side: {made} pieces ({fallen} fell back to copies), {views} views made ({shared} with a page at \
+             two or more addresses), {kept} copies kept for ranges in pieces; per frame {:.1} tiles mapped fresh, \
+             {:.1} nulled and mapped again, {:.1} to the sink, in {:.1} UpdateTileMappings, {:.2} ms",
             f(fresh),
             f(remapped),
             f(sunk),
@@ -631,12 +632,13 @@ mod tests {
             [0; 5],
             &r,
             Some([1, 0, 0, 0, 0]),
-            Some([1000, 50, 20, 30, 4_000, 17, 1]),
+            Some([1000, 50, 20, 30, 4_000, 17, 1, 900, 300, 12]),
             10.0,
         );
         assert!(
             gpu.ends_with(
-                "; GPU side: 17 pieces (1 fell back to copies); per frame 100.0 tiles mapped fresh, 5.0 nulled and \
+                "; GPU side: 17 pieces (1 fell back to copies), 900 views made (300 with a page at two or more \
+                 addresses), 12 copies kept for ranges in pieces; per frame 100.0 tiles mapped fresh, 5.0 nulled and \
                  mapped again, 2.0 to the sink, in 3.0 UpdateTileMappings, 0.40 ms"
             ),
             "{gpu}"

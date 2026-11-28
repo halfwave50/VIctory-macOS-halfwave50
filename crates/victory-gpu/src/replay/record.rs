@@ -884,6 +884,17 @@ pub(crate) fn from_env(device: &ID3D12Device) {
     let Some(settings) = Settings::from_env() else {
         return;
     };
+    // mac: the recording does not capture reserved buffers or their tile
+    // mappings (`CreateReservedResource`, `UpdateTileMappings`), which stage
+    // 2's GPU side reads title memory through.
+    if crate::mac_switches::alias_physical().gpu() {
+        tracing::warn!(
+            "frame recorder refused: {} reads title memory through reserved buffers and tile mappings, which it \
+             does not capture",
+            crate::mac_switches::alias_physical().name()
+        );
+        return;
+    }
     match start(settings, device) {
         Ok(folder) => tracing::info!(folder = %folder.display(), "frame recorder on"),
         Err(e) => tracing::warn!(error = %e, "frame recorder not started"),

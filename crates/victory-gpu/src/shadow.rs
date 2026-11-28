@@ -114,6 +114,10 @@ pub(crate) struct Shadow {
     /// The last presented frame a view or a list asked for it
     /// ([`Shadow::touch`]), for [`release_idle`].
     used: AtomicU64,
+    /// mac: a view of a piece of a reservation (`crate::alias_physical`,
+    /// `VICTORY_ALIAS_PHYSICAL=gpu`): aliased, at `base` in the piece's
+    /// buffer, with `data` the title's own address.
+    view: bool,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -573,6 +577,7 @@ impl Shadow {
             slice,
             aliased: false,
             used: AtomicU64::new(crate::queue::presented()),
+            view: false,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -607,11 +612,62 @@ impl Shadow {
             slice: None,
             aliased: true,
             used: AtomicU64::new(crate::queue::presented()),
+            view: false,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// mac: a view of title memory `[start, start + len)` in a piece of a
+    /// reservation (`crate::alias_physical`, I4): the piece's `buffer` from
+    /// byte `base` on, whose GPU address there is `gpu`. The piece's tiles
+    /// are the title's pages (one RAM), so it is aliased: nothing is copied
+    /// or copied back, and writes through it are only told to the other
+    /// trackers, as for an aliased region.
+    pub(crate) fn new_view(
+        buffer: ID3D12Resource,
+        gpu: u64,
+        base: u64,
+        start: u64,
+        len: u64,
+    ) -> Arc<Shadow> {
+        let marks = marks().take(pages(start, len));
+        let shadow = Arc::new(Shadow {
+            buffer,
+            data: start as *mut u8,
+            gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks,
+            widened: Mutex::default(),
+            widened_source: Mutex::default(),
+            has_widened: AtomicBool::new(false),
+            base,
+            slice: None,
+            aliased: true,
+            used: AtomicU64::new(crate::queue::presented()),
+            view: true,
+        });
+        if let Some(base) = marks {
+            self::marks().owners.insert(base, Arc::downgrade(&shadow));
+        }
+        shadow
+    }
+
+    /// mac: whether this is a view of a piece of a reservation ([`Shadow::new_view`]).
+    pub(crate) fn is_view(&self) -> bool {
+        self.view
+    }
+
+    /// Where the title buffer starts in `buffer`: 0 but for runs of a shared
+    /// buffer and views of a piece. Views of the buffer start there.
+    pub(crate) fn base(&self) -> u64 {
+        self.base
     }
 
     /// Whether the title's memory is this copy's own (`crate::alias`): it is
@@ -621,9 +677,12 @@ impl Shadow {
     }
 
     /// Where title address `address` is in the copy's mapping.
+    ///
+    /// mac: from `data`, which is where the copy starts (a run's start in a
+    /// shared buffer, the title's address in a view), without `base`.
     pub(crate) fn host_ptr(&self, address: u64) -> *mut u8 {
         // SAFETY: the caller asks about an address inside the copy.
-        unsafe { self.data.add(self.offset(address) as usize) }
+        unsafe { self.data.add((address - self.start) as usize) }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -2353,6 +2412,19 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        // mac: in one piece of a reservation (`VICTORY_ALIAS_PHYSICAL=gpu`,
+        // `crate::alias_physical`): a view of the piece, no copy.
+        if let Some(view) = crate::alias_physical::view(key.0 as usize, entry.end as usize) {
+            entry.shadow = Some(Shadow::new_view(
+                view.buffer,
+                view.gpu,
+                view.base,
+                key.0,
+                len,
+            ));
+            changed();
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -2431,6 +2503,23 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
+    }
+    // mac: in a piece of a reservation (`VICTORY_ALIAS_PHYSICAL=gpu`): a
+    // view of the 256 MiB block holding the range, cut to the piece (fewer
+    // ranges straddle than with 4 MiB windows, and a view costs no copy).
+    if let Some(piece) = crate::alias_physical::piece_at(address as usize) {
+        const BLOCK: u64 = 256 << 20;
+        let from = (address & !(BLOCK - 1)).max(piece.start as u64);
+        let to = end.checked_next_multiple_of(BLOCK)?.min(piece.end as u64);
+        if end <= to
+            && let Some(view) = crate::alias_physical::view(from as usize, to as usize)
+        {
+            let shadow = Shadow::new_view(view.buffer, view.gpu, view.base, from, to - from);
+            LOOSE_SPAN.fetch_max(to - from, Ordering::Relaxed);
+            map.insert((from, to - from), shadow.clone());
+            changed();
+            return Some(shadow);
+        }
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
@@ -2630,6 +2719,32 @@ impl Arena {
             n += m;
         }
         free.insert(at, n);
+    }
+}
+
+/// mac: the views of pieces (`crate::alias_physical`) over any of title
+/// memory `[from, to)` leave the registries: their piece fell back to
+/// copies, or the title reserved that memory again. New copies take their
+/// ranges at the next lookups.
+pub(crate) fn drop_views(from: u64, to: u64) {
+    let over = |s: &Shadow| s.view && s.start < to && from < s.start + s.len;
+    let mut dropped = false;
+    for entry in buffers().values_mut() {
+        if entry.shadow.as_deref().is_some_and(over) {
+            entry.shadow = None;
+            dropped = true;
+        }
+    }
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, s| {
+            let keep = !over(s);
+            dropped |= !keep;
+            keep
+        });
+    if dropped {
+        changed();
     }
 }
 

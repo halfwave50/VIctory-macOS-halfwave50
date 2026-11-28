@@ -335,7 +335,10 @@ pub(crate) fn learn(missed: &[Missed]) {
         // against the budget. The window or buffer a new copy would take is
         // known only once made: a copy past the budget is made, and stays
         // (views may take it), but nothing more is made after it.
-        if made.is_some() {
+        // mac: a view of a piece of a reservation (`VICTORY_ALIAS_PHYSICAL=gpu`)
+        // copies nothing, and is no part of the budget.
+        let view = made.is_some_and(|at| crate::alias_physical::piece_at(at as usize).is_some());
+        if made.is_some() && !view {
             let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
             if held.1 >= budget() {
                 drop(held);
@@ -344,7 +347,7 @@ pub(crate) fn learn(missed: &[Missed]) {
             }
         }
         let copy = made.and_then(|at| crate::shadow::find(at, 1));
-        if let Some(c) = &copy {
+        if let Some(c) = copy.as_ref().filter(|c| !c.is_view()) {
             let (start, len) = c.range();
             let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
             if !admit(&mut held, start, len, budget()) {

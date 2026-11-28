@@ -1114,7 +1114,9 @@ impl State {
             not_run("a root view outside title buffers");
             return None;
         };
-        let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
+        // mac: from where the copy starts in its buffer (a view of a piece
+        // of a reservation starts at its `base` there, `crate::alias_physical`).
+        let Some(offset) = u32::try_from(shadow.offset(address) - shadow.base()).ok() else {
             not_run("a root view 4 GiB or more into its copy");
             return None;
         };
@@ -1153,7 +1155,13 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        host.raw_view_at(
+            index,
+            Some(&shadow.buffer),
+            shadow.base(),
+            shadow.range().1 & !3,
+            uav,
+        );
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }

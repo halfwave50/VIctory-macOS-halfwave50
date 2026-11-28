@@ -17,8 +17,7 @@
 //! heap, written on the CPU and copied out on the GPU, and the other way. If
 //! it fails, the GPU side stays off (the heap backing stays).
 //!
-//! Views of the pieces are for `crate::shadow` (increment I4): [`view`];
-//! nothing reads through them yet but the tests.
+//! Views of the pieces are for `crate::shadow` (increment I4): [`view`].
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -79,8 +78,10 @@ fn state() -> MutexGuard<'static, State> {
 
 /// Since the last physical pages line: tiles mapped fresh, nulled and
 /// mapped again, pointed at the sink; `UpdateTileMappings` calls; their
-/// microseconds. Since the start: pieces made, pieces fallen back.
-static COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// microseconds. Since the start: pieces made, pieces fallen back; views
+/// made (I4), those with a page at two or more addresses, and copies kept
+/// for ranges in a piece (across its end, a fallen piece, `gpu-single`).
+static COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Whether the GPU side is on: `VICTORY_ALIAS_PHYSICAL=gpu` (or
 /// `gpu-single`), the heap backing on (`crate::alias::physical_on`), and the
@@ -171,6 +172,9 @@ pub fn reserved(at: usize, len: usize) {
     let Some(host) = crate::host::host() else {
         return;
     };
+    // Views made over the memory before (the title released it through the
+    // host) are stale.
+    crate::shadow::drop_views(at as u64, at.saturating_add(len) as u64);
     let mut st = state();
     let made = st.plan.reserve(at, len);
     for id in made.dropped {
@@ -213,6 +217,7 @@ pub fn mapped(at: usize, len: usize, heap: Option<u32>, first: u32) {
         return;
     }
     let mut st = state();
+    let mut fell = Vec::new();
     match heap.filter(|&h| st.heaps.get(h as usize).is_some_and(Option::is_some)) {
         Some(heap) => {
             st.plan.map(at, len, HeapTile { heap, tile: first });
@@ -220,6 +225,7 @@ pub fn mapped(at: usize, len: usize, heap: Option<u32>, first: u32) {
         None => {
             for id in st.plan.pieces_of(at, len) {
                 if st.fallen.insert(id) {
+                    fell.extend(st.plan.piece(id));
                     COUNTS[6].fetch_add(1, Relaxed);
                     tracing::warn!(
                         at = format_args!("{at:#x}"),
@@ -231,6 +237,11 @@ pub fn mapped(at: usize, len: usize, heap: Option<u32>, first: u32) {
                 }
             }
         }
+    }
+    drop(st);
+    // Its views leave the registries; new copies take their ranges.
+    for range in fell {
+        crate::shadow::drop_views(range.start as u64, range.end as u64);
     }
 }
 
@@ -363,30 +374,53 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue) {
     COUNTS[4].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
 }
 
-/// A view of title memory in a piece: the piece's buffer, the GPU address
-/// of the range's first byte, and its offset in the buffer.
-// I4's `crate::shadow` is its user (and reads `buffer` and `base`).
-#[allow(dead_code)]
+/// A view of title memory in a piece (I4): the piece's buffer, the GPU
+/// address of the range's first byte, and its offset in the buffer.
 pub(crate) struct PieceView {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) gpu: u64,
     pub(crate) base: u64,
 }
 
-/// The piece title memory `[from, to)` lies in wholly, if it has a buffer
-/// and has not fallen back: a view of it (for I4's `crate::shadow`, and the
-/// tests).
-#[cfg_attr(not(test), allow(dead_code))]
+/// The view title memory `[from, to)` gets (I4, `crate::shadow`): when it
+/// lies wholly in one piece that has a buffer and has not fallen back, and
+/// (`gpu-single`) has no page shown at two or more addresses as last
+/// flushed. Counted: views made, those with such pages, and ranges in a
+/// piece that keep copies.
 pub(crate) fn view(from: usize, to: usize) -> Option<PieceView> {
     if !on() || to <= from {
         return None;
     }
     let st = state();
-    let (id, offset) = st.plan.locate(from, to)?;
+    // A range that starts in no piece is not ours to count.
+    st.plan.locate(from, from + 1)?;
+    let kept = || {
+        COUNTS[9].fetch_add(1, Relaxed);
+        None
+    };
+    let Some((id, offset)) = st.plan.locate(from, to) else {
+        return kept();
+    };
     if st.fallen.contains(&id) {
-        return None;
+        return kept();
     }
-    let piece = st.pieces.get(id)?.as_ref()?;
+    let Some(piece) = st.pieces.get(id).and_then(Option::as_ref) else {
+        return kept();
+    };
+    let (first, last) = (
+        offset / PAGE as u32,
+        (offset as usize + (to - from)).div_ceil(PAGE) as u32,
+    );
+    let shared = st.plan.shared(id, first, last - first);
+    if shared
+        && crate::mac_switches::alias_physical() == crate::mac_switches::AliasPhysical::GpuSingle
+    {
+        return kept();
+    }
+    COUNTS[7].fetch_add(1, Relaxed);
+    if shared {
+        COUNTS[8].fetch_add(1, Relaxed);
+    }
     Some(PieceView {
         buffer: piece.buffer.clone(),
         gpu: piece.gpu + u64::from(offset),
@@ -394,11 +428,26 @@ pub(crate) fn view(from: usize, to: usize) -> Option<PieceView> {
     })
 }
 
+/// The piece title address `at` is in, if it has a buffer and has not
+/// fallen back: its title range (for windows cut to it, `crate::shadow`).
+pub(crate) fn piece_at(at: usize) -> Option<std::ops::Range<usize>> {
+    if !on() {
+        return None;
+    }
+    let st = state();
+    let (id, _) = st.plan.locate(at, at + 1)?;
+    if st.fallen.contains(&id) || st.pieces.get(id).is_none_or(Option::is_none) {
+        return None;
+    }
+    st.plan.piece(id)
+}
+
 /// For the physical pages line, since its last: tiles mapped fresh, nulled
-/// and mapped again, pointed at the sink, calls, microseconds; and pieces
-/// made and fallen back since the start.
-pub(crate) fn take_counts() -> [u64; 7] {
-    let mut out = [0; 7];
+/// and mapped again, pointed at the sink, calls, microseconds; and since the
+/// start: pieces made and fallen back, views made, those with a page at two
+/// or more addresses, copies kept for ranges in a piece.
+pub(crate) fn take_counts() -> [u64; 10] {
+    let mut out = [0; 10];
     for (i, n) in COUNTS.iter().enumerate() {
         out[i] = if i < 5 {
             n.swap(0, Relaxed)
@@ -915,5 +964,248 @@ void main(uint3 id : SV_DispatchThreadID)
         );
         // SAFETY: querying device health.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Reads `bytes` of `buffer` from `offset` with a GPU copy.
+    fn read_back(rig: &Rig, buffer: &ID3D12Resource, offset: u64, bytes: usize) -> Vec<u32> {
+        let back = rig
+            .committed(
+                D3D12_HEAP_TYPE_READBACK,
+                bytes,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )
+            .expect("a readback buffer");
+        // SAFETY: live buffers, ranges inside them.
+        rig.run(flush, |list| unsafe {
+            list.CopyBufferRegion(&back, 0, buffer, offset, bytes as u64)
+        })
+        .expect("the copy ran");
+        // SAFETY: the readback buffer's mapping of `bytes`.
+        unsafe {
+            std::slice::from_raw_parts(mapped_bytes(&back).unwrap().cast::<u32>(), bytes / 4)
+                .to_vec()
+        }
+    }
+
+    /// A title buffer (`crate::shadow::register`) in a piece of a
+    /// reservation, and a range outside buffers there, are views of the
+    /// piece, not copies: aliased, clean, at their offset in the piece's
+    /// buffer, and the GPU reads the title's bytes through them, by a copy
+    /// and by a descriptor-table view that starts at the view's base (as
+    /// root views and title memory's page-table pairs now do).
+    #[test]
+    fn a_range_in_a_reservation_is_a_view() {
+        if !on() {
+            eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here");
+            return;
+        }
+        let host = crate::host::host().expect("a host device");
+        let heap = crate::alias::physical_heap(4 * PAGE).expect("a heap");
+        let t = Title::new(4);
+        t.show(&heap, 1, 2);
+        t.show(&heap, 2, 0);
+        t.fill(1, 0x4444);
+        t.fill(2, 0x5555);
+        let (start, len) = (t.page(1) as u64, 2 * PAGE as u64);
+        crate::shadow::register(0xa1_0001, start, len);
+        let s = crate::shadow::find(start + 64, 128).expect("a view");
+        assert!(s.is_view() && s.is_aliased(), "a view, aliased");
+        assert!(s.clean(), "nothing to refresh");
+        assert_eq!(s.update(start as usize, len as usize), 0, "nothing copied");
+        assert_eq!(s.range(), (start, len));
+        assert_eq!(s.base(), PAGE as u64, "page 1 of the piece");
+        assert_eq!(
+            s.offset(start + 64),
+            PAGE as u64 + 64,
+            "from the buffer's start"
+        );
+        assert_eq!(s.gpu(start + 64), gpu_at(t.page(1)) + 64);
+        let rig = Rig::new(&host.device).expect("a queue");
+        let words = read_back(&rig, &s.buffer, s.offset(start), 2 * PAGE);
+        assert!(
+            words[..WORDS]
+                .iter()
+                .enumerate()
+                .all(|(i, &w)| w == word(i, 0x4444)),
+            "page 1 through the view"
+        );
+        assert!(
+            words[WORDS..]
+                .iter()
+                .enumerate()
+                .all(|(i, &w)| w == word(i, 0x5555)),
+            "page 2 through the view"
+        );
+        // A table view from the view's base, read at `address - start`.
+        t.show(&heap, 3, 3);
+        // SAFETY: plain creation of a heap of ours.
+        let views: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        }
+        .expect("a view heap");
+        let out = view(t.page(3), t.page(3) + PAGE).expect("page 3 in the piece");
+        // SAFETY: slots of our heap, views of live buffers.
+        unsafe {
+            let cpu = views.GetCPUDescriptorHandleForHeapStart();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: s.base() / 4,
+                        NumElements: (len / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            host.device
+                .CreateShaderResourceView(&s.buffer, Some(&srv), cpu);
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: out.base / 4,
+                        NumElements: WORDS as u32,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            host.device.CreateUnorderedAccessView(
+                &out.buffer,
+                None,
+                Some(&uav),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu.ptr + step,
+                },
+            );
+        }
+        // The shader reads word `i` of the view's second page: `address - start` is a page.
+        let constants = [WORDS as u32, 7, 0, 0];
+        let shifted = "ByteAddressBuffer src : register(t0);\nRWByteAddressBuffer dst : register(u0);\n\
+            cbuffer Params : register(b0) { uint words; uint add; uint pad0; uint pad1; };\n\
+            [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
+            uint i = id.x; if (i >= words) return; dst.Store(i * 4, src.Load(65536 + i * 4) + add); }\n";
+        let table = crate::compute::pipeline(
+            shifted,
+            s!("alias_physical test (table, page 2)"),
+            0,
+            &[
+                Param::Table(&[crate::compute::srv(0, 1), crate::compute::uav(0, 1)]),
+                Param::Constants {
+                    register: 0,
+                    count: 4,
+                },
+            ],
+        )
+        .expect("a pipeline");
+        rig.run(flush, |list| {
+            // SAFETY: live pipeline and heap, constants on this stack.
+            unsafe {
+                list.SetDescriptorHeaps(&[Some(views.clone())]);
+                list.SetComputeRootSignature(&table.0);
+                list.SetPipelineState(&table.1);
+                list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+                list.SetComputeRoot32BitConstants(1, 4, constants.as_ptr().cast(), 0);
+                list.Dispatch((WORDS / 64) as u32, 1, 1);
+            }
+        })
+        .expect("the dispatch ran");
+        assert!(
+            t.words(3)
+                .iter()
+                .enumerate()
+                .all(|(i, &w)| w == word(i, 0x5555) + 7),
+            "a table view from the view's base reads its second page at offset 64 KiB"
+        );
+        // A range outside buffers in the piece: a view of the piece (a
+        // window cut to it).
+        let window = crate::shadow::find(t.page(0) as u64 + 8, 16).expect("a window");
+        assert!(window.is_view());
+        let (from, n) = window.range();
+        assert!(from <= t.page(0) as u64 && t.page(0) as u64 + 24 <= from + n);
+        assert!(
+            from >= t.at as u64 && from + n <= (t.at + 4 * PAGE) as u64,
+            "cut to the piece"
+        );
+        crate::shadow::unregister(0xa1_0001, start);
+    }
+
+    /// A range across the line between two pieces keeps a copy; one inside
+    /// the second piece is a view.
+    #[test]
+    fn a_straddling_range_keeps_a_copy() {
+        if !on() {
+            eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here");
+            return;
+        }
+        use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        let len = crate::tile_plan::PIECE + 4 * PAGE;
+        // SAFETY: address space for the test, two pages at the line committed.
+        let at =
+            unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(at, 0);
+        reserved(at, len);
+        let line = at + crate::tile_plan::PIECE;
+        // SAFETY: inside the reservation above.
+        assert!(
+            !unsafe {
+                VirtualAlloc(
+                    (line - PAGE) as *const _,
+                    2 * PAGE,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            }
+            .is_null()
+        );
+        // Inside first: the copy window the range across would make holds it.
+        let inside = crate::shadow::find(line as u64 + 64, 16).expect("a view");
+        assert!(inside.is_view(), "inside the second piece: a view");
+        assert!(inside.range().0 >= line as u64);
+        let across = crate::shadow::find(line as u64 - 64, 128).expect("a copy");
+        assert!(!across.is_view(), "across the pieces' line: a copy");
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A page of a section without a heap mapped into a piece makes it fall
+    /// back: its views leave the registries, and the same title buffer gets
+    /// a copy.
+    #[test]
+    fn a_fallen_back_reservation_gives_copies() {
+        if !on() {
+            eprintln!("skipped: VICTORY_ALIAS_PHYSICAL=gpu is not on here");
+            return;
+        }
+        let heap = crate::alias::physical_heap(2 * PAGE).expect("a heap");
+        let t = Title::new(2);
+        t.show(&heap, 0, 1);
+        t.fill(0, 0x6666);
+        let start = t.page(0) as u64;
+        crate::shadow::register(0xa1_0002, start, PAGE as u64);
+        let before = crate::shadow::find(start, 64).expect("a view");
+        assert!(before.is_view());
+        mapped(t.page(1), PAGE, None, 0);
+        assert!(
+            view(t.page(0), t.page(0) + PAGE).is_none(),
+            "the piece fell back"
+        );
+        let after = crate::shadow::find(start, 64).expect("a copy");
+        assert!(!after.is_view() && !after.is_aliased(), "a copy now");
+        crate::shadow::unregister(0xa1_0002, start);
     }
 }
