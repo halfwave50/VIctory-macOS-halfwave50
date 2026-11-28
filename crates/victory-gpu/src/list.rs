@@ -1572,6 +1572,34 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
 #[inline(never)]
 extern "system" fn ignored_state(_: This) {}
 
+/// `DiscardResource(resource, region)`: ignored, as the host keeps the
+/// contents anyway. mac: logged with `VICTORY_DEPTH_TOUCH_LOG=1`
+/// (`crate::depth_touch`); never more.
+#[inline(never)]
+extern "system" fn discard_resource(this: This, resource: This, region: *const u32) {
+    if crate::depth_touch::on() {
+        crate::depth_touch::discard(this, resource, region);
+    }
+}
+
+/// The pixel shader depth order: ignored. mac: its raw arguments logged with
+/// `VICTORY_DEPTH_TOUCH_LOG=1` (`crate::depth_touch`).
+#[inline(never)]
+extern "system" fn depth_order(this: This, first: u64, second: u64) {
+    if crate::depth_touch::on() {
+        crate::depth_touch::raw(crate::depth_touch::Kind::DepthOrder, this, first, second);
+    }
+}
+
+/// Newer lists' 0x470 `(u64)`: ignored (see [`NEWER_METHODS`]). mac: its
+/// argument logged with `VICTORY_DEPTH_TOUCH_LOG=1` (`crate::depth_touch`).
+#[inline(never)]
+extern "system" fn method_470(this: This, value: u64) {
+    if crate::depth_touch::on() {
+        crate::depth_touch::raw(crate::depth_touch::Kind::Method470, this, value, 0);
+    }
+}
+
 extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
     #[cfg(windows)]
     with_state(this, |list, s| s.set_depth_bounds(list, min, max));
@@ -2052,7 +2080,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
     (72, wait64 as *const ()),                    // 0x240 (newer 0x250)
-    (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
+    (73, depth_order as *const ()),               // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
     (124, ignored_state as *const ()),            // 0x3e0 shading rate
@@ -2062,7 +2090,7 @@ const METHODS: [(usize, *const ()); 52] = [
 const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
-    (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
+    (55, discard_resource as *const ()),            // 0x1b8 DiscardResource
     (28, query_mark as *const ()),                  // 0xe0 BeginQuery
     (29, query_mark as *const ()),                  // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
@@ -2093,7 +2121,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
-    (142, ignored_state as *const ()),
+    (142, method_470 as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
 ];
@@ -2860,7 +2888,7 @@ void main(uint3 g : SV_GroupID) {
                 table.0[0x1b0 / 8],
                 state::clear_unordered_float as *const ()
             );
-            assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+            assert_eq!(table.0[0x1b8 / 8], discard_resource as *const ());
         }
     }
 

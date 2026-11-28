@@ -57,6 +57,8 @@ mod compute;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+// mac: `VICTORY_DEPTH_TOUCH_LOG=1`, log only.
+mod depth_touch;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
