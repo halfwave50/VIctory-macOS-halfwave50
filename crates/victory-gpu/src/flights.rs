@@ -129,11 +129,107 @@ pub(crate) fn after_writes(writes: &[(usize, Option<u64>, usize)], address: usiz
 
 /// mac: the names `VICTORY_FLIGHTS_WITH=<list>` takes, each building on the
 /// ones before it (`notes/overlap-stages-design.md` §6), but `uploads`
-/// (E2b, a refinement of `alias`), which needs `alias` only ([`NEEDS`]).
-pub(crate) const WITH: [&str; 7] = ["alias", "writes", "copies", "ring", "relay", "present", "uploads"];
+/// (E2b, a refinement of `alias`) and `uploads2` (E2c, the same at a cost
+/// proportional to what changed), which need `alias` only ([`NEEDS`]) and
+/// do not go together ([`EXCLUDES`]).
+pub(crate) const WITH: [&str; 8] = ["alias", "writes", "copies", "ring", "relay", "present", "uploads", "uploads2"];
 
 /// The names each of [`WITH`] needs taken first (bits).
-const NEEDS: [u32; 7] = [0, 0b1, 0b11, 0b111, 0b1111, 0b1_1111, 0b1];
+const NEEDS: [u32; 8] = [0, 0b1, 0b11, 0b111, 0b1111, 0b1_1111, 0b1, 0b1];
+
+/// The names each of [`WITH`] cannot be taken with (bits): `uploads2` is
+/// refused beside `uploads` (one rule for the texture uploads at a time).
+const EXCLUDES: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 1 << 6];
+
+/// mac: `VICTORY_FLIGHTS_WITH=alias,uploads2` (E2c of
+/// `notes/overlap-stages-design.md`): how the texture upload check of a
+/// submission prepared beside the one left reads a texture, from what its
+/// tracker says now and where its title memory is. Unlike E2b's rule
+/// ([`UploadReach`]), nothing is asked of what the one left may write:
+/// what it does write is known once it is finished, from the trackers its
+/// landing told (each byte of title memory it changes is either written in
+/// place through an aliased region, or written at its landing by the CPU,
+/// and every landing write marks the trackers over it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Beside {
+    /// Unchanged since its last upload: nothing to read now; brought up
+    /// after the finish if its tracker was told of a change meanwhile.
+    Unchanged,
+    /// Changed, in memory the GPU never writes in place (host copies, which
+    /// the one left changes only at its landing, after the finish): read
+    /// now, and again after the finish if its tracker was told meanwhile.
+    Now,
+    /// To be read once, after the finish (the list notes its states now).
+    Later(Kept),
+}
+
+/// Why [`Beside::Later`]: indices for the counts too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// Changed, and a page of it (or another address of one) is in an
+    /// aliased region, which the one left's shaders may be writing in place
+    /// while it is read (a torn read, or a write no tracker is told of:
+    /// read it after them).
+    InPlace = 0,
+    /// Not tracked, or tracked only in part (the rest read whole at every
+    /// refresh): no tracker would tell whether the one left's landing wrote
+    /// it, so it is read once, after that.
+    Untracked = 1,
+}
+
+/// The rule of [`Beside`]: `changed` is what the texture's tracker says
+/// (always for one not `tracked`), `in_place` whether a page of its memory
+/// is in an aliased region.
+pub(crate) fn beside(changed: bool, tracked: bool, in_place: bool) -> Beside {
+    if !tracked {
+        Beside::Later(Kept::Untracked)
+    } else if !changed {
+        Beside::Unchanged
+    } else if in_place {
+        Beside::Later(Kept::InPlace)
+    } else {
+        Beside::Now
+    }
+}
+
+/// mac (E2c, `uploads2`): asks for clean host copies made while the
+/// submission left runs whose landing may tell them (`asked`), set aside
+/// instead of joining the submission's refreshes; once it is finished,
+/// [`Stash::told`] gives back only those whose copies were told of a change
+/// since. A refresh of a copy still clean copies nothing (its tracker has
+/// no page to take), so the others need nothing.
+#[derive(Debug)]
+pub(crate) struct Stash<T>(Vec<T>);
+
+impl<T> Default for Stash<T> {
+    fn default() -> Self {
+        Stash(Vec::new())
+    }
+}
+
+impl<T> Stash<T> {
+    /// Sets an ask aside.
+    pub(crate) fn keep(&mut self, ask: T) {
+        self.0.push(ask);
+    }
+
+    /// Whether none is set aside.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many are set aside.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Once the one left is finished: the asks whose copy is no longer
+    /// `clean`, in the order they were made; the rest are dropped. Empty
+    /// after.
+    pub(crate) fn told(&mut self, clean: impl Fn(&T) -> bool) -> Vec<T> {
+        std::mem::take(&mut self.0).into_iter().filter(|ask| !clean(ask)).collect()
+    }
+}
 
 /// mac: `VICTORY_FLIGHTS_WITH=alias,uploads` (E2b of
 /// `notes/overlap-stages-design.md`): what the texture uploads of the
@@ -242,8 +338,9 @@ pub(crate) fn union_of(
 /// `VICTORY_FLIGHTS_WITH`'s rule: of the comma list `value`, the names taken
 /// (bit `i` for [`WITH`]`[i]`), and a line for each one refused: unknown, not
 /// in this build (`built`, the bits it has), asked without every name it
-/// needs ([`NEEDS`]: the ones before it), or refused by `refuse(i)` for a
-/// reason of its own.
+/// needs ([`NEEDS`]: the ones before it), asked with one it cannot go with
+/// ([`EXCLUDES`], taken before it), or refused by `refuse(i)` for a reason
+/// of its own.
 pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Option<&'static str>) -> (u32, Vec<String>) {
     let mut asked = 0u32;
     let mut refused = Vec::new();
@@ -260,6 +357,9 @@ pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Opti
         } else if taken & NEEDS[i] != NEEDS[i] {
             let needed: Vec<&str> = (0..WITH.len()).filter(|&k| NEEDS[i] & 1 << k != 0).map(|k| WITH[k]).collect();
             Some(format!("it needs {} first", needed.join(",")))
+        } else if taken & EXCLUDES[i] != 0 {
+            let with: Vec<&str> = (0..WITH.len()).filter(|&k| taken & EXCLUDES[i] & 1 << k != 0).map(|k| WITH[k]).collect();
+            Some(format!("it does not go with {}", with.join(",")))
         } else {
             refuse(i).map(str::to_owned)
         };
@@ -539,6 +639,132 @@ mod tests {
         let (taken, refused) = with_names("alias,uploads", 0b11, none);
         assert_eq!(taken, 1);
         assert_eq!(refused, ["uploads: not in this build"]);
+        // E2c's `uploads2` needs `alias` only, and not with `uploads`.
+        let built = 0b1100_0011;
+        assert_eq!(with_names("alias,writes,uploads2", built, none), (0b1000_0011, vec![]));
+        assert_eq!(with_names("uploads2,alias", built, none), (0b1000_0001, vec![]));
+        let (taken, refused) = with_names("uploads2", built, none);
+        assert_eq!(taken, 0);
+        assert_eq!(refused, ["uploads2: it needs alias first"]);
+        let (taken, refused) = with_names("alias,uploads2,uploads", built, none);
+        assert_eq!(taken, 0b100_0001, "the first of the two rules kept");
+        assert_eq!(refused, ["uploads2: it does not go with uploads"]);
+        let (taken, refused) = with_names("alias,uploads2", 0b100_0011, none);
+        assert_eq!(taken, 1);
+        assert_eq!(refused, ["uploads2: not in this build"]);
+    }
+
+    /// E2c (`uploads2`): the rule of the check beside the one left, by
+    /// what a texture's tracker says and where its memory is.
+    #[test]
+    fn uploads2_reads_a_texture_now_only_if_it_changed_where_nothing_writes_in_place() {
+        // (changed, tracked, in place) → how.
+        let table = [
+            ((false, true, false), Beside::Unchanged),
+            ((false, true, true), Beside::Unchanged),
+            ((true, true, false), Beside::Now),
+            ((true, true, true), Beside::Later(Kept::InPlace)),
+            ((true, false, false), Beside::Later(Kept::Untracked)),
+            ((true, false, true), Beside::Later(Kept::Untracked)),
+            // (An untracked texture always says changed; asked anyway.)
+            ((false, false, true), Beside::Later(Kept::Untracked)),
+        ];
+        for ((changed, tracked, in_place), want) in table {
+            assert_eq!(beside(changed, tracked, in_place), want, "changed {changed}, tracked {tracked}, in place {in_place}");
+        }
+        assert_eq!(Kept::InPlace as usize, 0);
+        assert_eq!(Kept::Untracked as usize, 1);
+    }
+
+    /// E2c's soundness, as a model: one texture over one page, the
+    /// submission left (N) running while the next (N+1) is prepared. Over
+    /// every kind of texture (changed or not since its last upload, tracked
+    /// or not, in an aliased region or not) and every way N may change its
+    /// page (not at all; in place through the alias, told at its landing or
+    /// not; at its landing by the CPU, which always tells), with N's
+    /// in-place write seen by a read beside it or not (a torn read takes
+    /// either side): the bytes N+1's upload list leaves in the texture are
+    /// those it leaves when N is finished before the uploads (E2's finish,
+    /// then one refresh of every texture whose tracker says changed).
+    #[test]
+    fn uploads2_ends_with_the_bytes_a_finish_first_gives() {
+        // Page values: 1 the texture's last upload, 2 the title's later
+        // write, 3 N's write.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Write {
+            None,
+            InPlace { told: bool },
+            Landing,
+        }
+        let mut cases = 0;
+        for changed in [false, true] {
+            for tracked in [false, true] {
+                for in_place in [false, true] {
+                    for write in [Write::None, Write::InPlace { told: false }, Write::InPlace { told: true }, Write::Landing] {
+                        // The GPU writes in place only in aliased memory.
+                        if matches!(write, Write::InPlace { .. }) && !in_place {
+                            continue;
+                        }
+                        for seen_beside in [false, true] {
+                            let before = if changed { 2 } else { 1 };
+                            let after = if write == Write::None { before } else { 3 };
+                            // What a read beside N sees of the page.
+                            let beside_read = match write {
+                                Write::InPlace { .. } if seen_beside => 3,
+                                _ => before,
+                            };
+                            let told = matches!(write, Write::Landing | Write::InPlace { told: true });
+                            // N finished first: a refresh if its tracker
+                            // says changed (always untracked), after N.
+                            let dirty_after = !tracked || changed || told;
+                            let first = if dirty_after { after } else { 1 };
+                            // E2c.
+                            let mut texture = 1;
+                            let mut dirty = !tracked || changed;
+                            match beside(changed, tracked, in_place) {
+                                Beside::Now => {
+                                    texture = beside_read;
+                                    dirty = false;
+                                }
+                                Beside::Unchanged | Beside::Later(_) => {}
+                            }
+                            // N's landing tells the trackers.
+                            dirty |= told;
+                            // After the finish: the kept are read; the others
+                            // brought up if their trackers say changed.
+                            if dirty {
+                                texture = after;
+                            }
+                            assert_eq!(
+                                texture, first,
+                                "changed {changed}, tracked {tracked}, in place {in_place}, {write:?}, seen beside \
+                                 {seen_beside}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 2 * (2 + 4) * 2);
+    }
+
+    /// E2c's asks for clean copies set aside: given back once the one left
+    /// is finished only where the copy was told of a change since, in the
+    /// order they were made.
+    #[test]
+    fn uploads2_gives_back_only_the_asks_whose_copies_were_told() {
+        let mut stash = Stash::default();
+        assert!(stash.is_empty());
+        for ask in [(1, 0x100), (2, 0x200), (3, 0x300), (2, 0x400)] {
+            stash.keep(ask);
+        }
+        assert_eq!(stash.len(), 4);
+        // Copies 2 and 3 were told.
+        let told = stash.told(|&(copy, _)| copy == 1);
+        assert_eq!(told, [(2, 0x200), (3, 0x300), (2, 0x400)]);
+        assert!(stash.is_empty(), "taken");
+        assert!(stash.told(|_| false).is_empty());
     }
 
     /// E2b: an upload beside the one left waits for it only where it may

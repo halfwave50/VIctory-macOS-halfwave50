@@ -513,13 +513,14 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 /// submission shows from the next one on.
 ///
 /// mac: `before` is told what is to be brought up before any of its title
-/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`); it returns the
-/// indices of those to bring up only after the submission left is finished
-/// (`alias,uploads`, [`Uploads::land_late`]).
+/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`); it says how to
+/// read them ([`Reads`]): now, or some or all only after the submission
+/// left is finished (`alias,uploads`, `alias,uploads2`,
+/// [`Uploads::land_late`]).
 pub(crate) fn uploads_after(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
-    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<usize>,
+    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]) -> Reads,
 ) -> Option<Uploads> {
     // mac: two, used in turn with flights' `alias`, else the first only: a
     // submission prepared while the one before still runs takes the list
@@ -597,29 +598,71 @@ pub(crate) fn uploads_after(
     // flights) are kept for after the submission left is finished
     // ([`Uploads::land_late`]): the list notes their states now, for its
     // prelude, and records their copies then.
-    let mut kept = before(&work);
     let mut late = Late::default();
-    if !kept.is_empty() {
-        kept.sort_unstable();
-        kept.dedup();
-        let mut now = Vec::with_capacity(work.len() - kept.len());
-        let mut kept = kept.into_iter().peekable();
-        for (i, item) in std::mem::take(&mut work).into_iter().enumerate() {
-            if kept.next_if_eq(&i).is_some() {
-                let (first, back) = crate::texture::upload_later(list, &item.1);
-                if let Some(first) = first {
-                    // SAFETY: an open list; the barrier names a live texture.
-                    unsafe { list.list.ResourceBarrier(&[first]) };
-                }
-                late.back.extend(back);
-                late.work.push(item);
-            } else {
-                now.push(item);
-            }
+    // (E2c: the state each texture read beside it was in, for after.)
+    let mut now_states = Vec::new();
+    let later = |item: (Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>), late: &mut Late| {
+        let (first, back) = crate::texture::upload_later(list, &item.1);
+        if let Some(first) = first {
+            // SAFETY: an open list; the barrier names a live texture.
+            unsafe { list.list.ResourceBarrier(&[first]) };
         }
-        work = now;
+        late.back.extend(back);
+        late.work.push(item);
+    };
+    match before(&work) {
+        Reads::Now => {}
+        Reads::Keep(mut kept) if !kept.is_empty() => {
+            kept.sort_unstable();
+            kept.dedup();
+            let mut now = Vec::with_capacity(work.len() - kept.len());
+            let mut kept = kept.into_iter().peekable();
+            for (i, item) in std::mem::take(&mut work).into_iter().enumerate() {
+                if kept.next_if_eq(&i).is_some() {
+                    later(item, &mut late);
+                } else {
+                    now.push(item);
+                }
+            }
+            work = now;
+        }
+        Reads::Keep(_) => {}
+        // mac (E2c, `uploads2`): sorted by what each texture's tracker says
+        // and where its memory is (`crate::flights::Beside`), with nothing
+        // asked of the one left: the changed ones read now unless a page is
+        // in an aliased region or they are not tracked (those after its
+        // finish); every other one is looked at again after its finish,
+        // with the state it is in now.
+        Reads::Again => {
+            let started = std::time::Instant::now();
+            let textures = work.len();
+            late.uploads2 = true;
+            late.marks = crate::watch::texture_marks();
+            let (mut changed, mut kept) = (0, [0usize; 2]);
+            let mut now = Vec::new();
+            for item in std::mem::take(&mut work) {
+                match item.0.beside() {
+                    crate::flights::Beside::Later(why) => {
+                        changed += 1;
+                        kept[why as usize] += 1;
+                        later(item, &mut late);
+                    }
+                    crate::flights::Beside::Now => {
+                        changed += 1;
+                        now_states.push(item.1.state.load(Relaxed));
+                        now.push(item);
+                    }
+                    crate::flights::Beside::Unchanged => {
+                        let state = item.1.state.load(Relaxed);
+                        late.again.push(Again { item, state, read: false });
+                    }
+                }
+            }
+            work = now;
+            crate::host::unwaited::flights::checked(textures, changed, kept, work.len(), started.elapsed());
+        }
     }
-    let mut recorded = !late.work.is_empty();
+    let mut recorded = !late.work.is_empty() || !late.again.is_empty();
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
     for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
@@ -687,8 +730,14 @@ pub(crate) fn uploads_after(
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };
     }
+    // mac (E2c): those read beside it are looked at again after its finish
+    // too, where its landing may have told their trackers since.
+    if late.uploads2 {
+        late.again.extend(work.into_iter().zip(now_states).map(|(item, state)| Again { item, state, read: true }));
+        recorded |= !late.again.is_empty();
+    }
     // mac: with textures kept for later, closed once they are recorded.
-    let pending = !late.work.is_empty();
+    let pending = !late.work.is_empty() || !late.again.is_empty();
     if !pending {
         list.close();
     }
@@ -710,7 +759,7 @@ pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
-    uploads_after(heaps, textures, &mut |_| Vec::new())
+    uploads_after(heaps, textures, &mut |_| Reads::Now)
 }
 
 /// The upload list, used under its lock only.
@@ -719,12 +768,40 @@ pub(crate) struct Holder(Option<HostList>);
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
 
+/// mac: how [`uploads_after`] reads the textures of a submission prepared
+/// beside the one left (flights' `alias`, `crate::host::unwaited::flights`).
+pub(crate) enum Reads {
+    /// All now (nothing runs beside, or it was finished first).
+    Now,
+    /// Now, but those named (indices), kept for after its finish (E2b,
+    /// `uploads`).
+    Keep(Vec<usize>),
+    /// Sorted by the textures' own trackers, those not read now looked at
+    /// again after its finish (E2c, `uploads2`, `crate::flights::Beside`).
+    Again,
+}
+
 /// mac (E2b of flights): textures an upload list brings up only once the
 /// submission left is finished, and the barriers that leave them readable.
 #[derive(Default)]
 struct Late {
     work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)>,
     back: Vec<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>,
+    /// mac (E2c, `uploads2`): the check's other textures, looked at again
+    /// after the finish; the count of texture-page marks at the check
+    /// (`crate::watch::texture_marks`).
+    uploads2: bool,
+    again: Vec<Again>,
+    marks: u64,
+}
+
+/// mac (E2c): a texture of the check not kept: whether it was read beside
+/// the one left, and the state it was in before the submission's preludes
+/// (what the upload list, run first, finds it in on the GPU).
+struct Again {
+    item: (Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>),
+    state: u32,
+    read: bool,
 }
 
 /// The upload list of a submission, ours until it has run.
@@ -755,6 +832,9 @@ impl Uploads {
         let started = std::time::Instant::now();
         let late = std::mem::take(&mut *self.late.lock().unwrap_or_else(|e| e.into_inner()));
         let list = self.list();
+        if late.uploads2 {
+            return land2(list, late, started);
+        }
         let mut uploaded = 0;
         for ((staging, copy), upload) in late.work.iter().zip(crate::texture::refresh_all(&late.work)) {
             if let Some((buffer, at, subresources)) = upload {
@@ -782,6 +862,54 @@ impl Uploads {
     pub(crate) fn release_worker(&self) {
         drop(self.worker.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
+}
+
+/// mac (E2c of flights, `uploads2`): [`Uploads::land_late`] once the
+/// submission left is finished. The kept textures are read now, as E2b's
+/// are. Every other texture of the check is brought up if its tracker says
+/// it changed since the check (the one left's landing marks every tracker
+/// over what it writes back; asked only if a texture page was marked at
+/// all since, `crate::watch::texture_marks`): through the list's own
+/// states where it moves the texture already, else from the state it was
+/// in before the submission ([`crate::texture::record_upload_from`]).
+fn land2(list: &HostList, late: Late, started: std::time::Instant) {
+    let mut landed = crate::host::unwaited::flights::Landed2 { kept: late.work.len(), ..Default::default() };
+    for ((staging, copy), upload) in late.work.iter().zip(crate::texture::refresh_all(&late.work)) {
+        if let Some((buffer, at, subresources)) = upload {
+            crate::texture::record_copies(list, copy, staging, (&buffer, at), &subresources);
+            landed.kept_uploaded += 1;
+            #[cfg(feature = "diagnostics")]
+            UPLOADED.fetch_add(1, Relaxed);
+        }
+    }
+    if !late.back.is_empty() {
+        // SAFETY: an open list; the barriers name live textures.
+        unsafe { list.list.ResourceBarrier(&late.back) };
+    }
+    if crate::watch::texture_marks() == late.marks {
+        landed.skipped = late.again.len();
+    } else {
+        landed.asked = late.again.len();
+        let told: Vec<&Again> = late.again.iter().filter(|a| a.item.0.maybe_changed()).collect();
+        let items: Vec<_> = told.iter().map(|a| a.item.clone()).collect();
+        for ((again, (staging, copy)), upload) in told.iter().zip(&items).zip(crate::texture::refresh_all(&items)) {
+            landed.told[usize::from(again.read)] += 1;
+            let Some(upload) = upload else { continue };
+            landed.uploaded += 1;
+            #[cfg(feature = "diagnostics")]
+            UPLOADED.fetch_add(1, Relaxed);
+            if list.moves(copy) {
+                if let Some(readable) = crate::texture::record_upload(list, copy, staging, &upload) {
+                    // SAFETY: an open list; the barrier names a live texture.
+                    unsafe { list.list.ResourceBarrier(&[readable]) };
+                }
+            } else {
+                crate::texture::record_upload_from(list, copy, staging, &upload, again.state);
+            }
+        }
+    }
+    list.close();
+    crate::host::unwaited::flights::landed2(&landed, started.elapsed());
 }
 
 impl Drop for Uploads {

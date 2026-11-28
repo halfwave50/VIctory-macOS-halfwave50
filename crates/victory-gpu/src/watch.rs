@@ -1193,6 +1193,9 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 /// leaving their protection as it is. With `save`, before the write lands:
 /// trackers armed for a page they had taken keep its bytes.
 fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
+    // mac (E2c of flights): whether a tracker other than a buffer copy's
+    // (a texture's staging) was marked ([`texture_marks`]).
+    let mut texture = false;
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -1200,6 +1203,7 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
                 set_dirty(c.2, true);
                 set.insert(page)
             };
+            texture |= !c.3;
             if first_write && save {
                 c.save(page);
             }
@@ -1207,6 +1211,26 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
+    if texture {
+        // After the dirty bits: a reader that sees this count sees them.
+        TEXTURE_MARKS.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// mac: how many times a tracker other than a buffer copy's was marked
+/// changed so far ([`mark_changed`], every way a write is told: faults,
+/// writes we make, a landing's copy-back and tells, remaps).
+static TEXTURE_MARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// mac (E2c of flights, `VICTORY_FLIGHTS_WITH=alias,uploads2`):
+/// [`TEXTURE_MARKS`] now. Read at an upload check and again once the
+/// submission left is finished: the same count means no texture's tracker
+/// was marked in between, so none of the check's textures was told of a
+/// change (a texture's tracker is marked only here; a refresh of ours that
+/// could not stage what it took puts it back, `Tracked::retry`, for the
+/// next check, as without flights).
+pub(crate) fn texture_marks() -> u64 {
+    TEXTURE_MARKS.load(Ordering::Acquire)
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written

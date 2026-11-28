@@ -541,6 +541,45 @@ pub(crate) fn upload_later(
     (list.move_texture(copy, COPY_DEST), list.move_texture(copy, SHADER_RESOURCE))
 }
 
+/// mac (E2c of flights, `VICTORY_FLIGHTS_WITH=alias,uploads2`): an upload
+/// recorded into `list` after its prelude was made, for a texture the list
+/// does not move otherwise ([`HostList::moves`] is false): from `state`,
+/// the one it was in before the submission's preludes (the list runs first,
+/// so it is in that one on the GPU), to the copy destination, its copies,
+/// and back to `state`, which the later lists' preludes start from. The
+/// list then holds the texture in `state` as it holds those it moves
+/// ([`HostList::holds_in`]), so that it lives until the list has run.
+pub(crate) fn record_upload_from(
+    list: &HostList,
+    copy: &Arc<crate::resource::HostTexture>,
+    staging: &Staging,
+    (buffer, at, subresources): &Upload,
+    state: u32,
+) {
+    let dest = copy.legal_state(COPY_DEST);
+    let moves = state != dest;
+    if moves {
+        let to = crate::host::transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(state as i32),
+            D3D12_RESOURCE_STATES(dest as i32),
+        );
+        // SAFETY: an open list; the barrier names a live texture.
+        unsafe { list.list.ResourceBarrier(&[to]) };
+    }
+    record_copies(list, copy, staging, (buffer, *at), subresources);
+    if moves {
+        let back = crate::host::transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(dest as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: as above.
+        unsafe { list.list.ResourceBarrier(&[back]) };
+    }
+    list.holds_in(copy, state);
+}
+
 /// The copies of an upload into host texture `copy` (in the copy
 /// destination state), its staging kept by `list`, and its counts.
 pub(crate) fn record_copies(
@@ -774,6 +813,28 @@ impl Staging {
         last.states.clear();
         self.force_refresh
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// mac (E2c of flights, `VICTORY_FLIGHTS_WITH=alias,uploads2`): how the
+    /// upload check of a submission prepared beside the one left reads it
+    /// (`crate::flights::beside`): whether it changed; whether it is
+    /// tracked whole (a tracker with untracked parts has no clean bit, and
+    /// a write to those parts tells nothing); whether a page of its memory,
+    /// or another address of one (the runtime's links), is in an aliased
+    /// region, written in place (asked only of a changed one).
+    pub(crate) fn beside(&self) -> crate::flights::Beside {
+        let changed = self.maybe_changed();
+        let tracked = self.tracked.as_ref().is_some_and(|t| t.bit().is_some());
+        let in_place = changed && tracked && {
+            let (at, len) = self.title_range();
+            let aliased = |at: usize, len: usize| crate::shadow::has_aliased_overlap(at as u64, (at + len) as u64);
+            len > 0 && (aliased(at, len) || {
+                let mut others = Vec::new();
+                crate::watch::shown_elsewhere(std::iter::once((at, at + len)), &mut others);
+                others.iter().any(|&page| aliased(page, crate::watch::PAGE))
+            })
+        };
+        crate::flights::beside(changed, tracked, in_place)
     }
 
     /// Whether its memory may have changed since it was last detiled (an
