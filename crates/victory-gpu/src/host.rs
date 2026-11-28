@@ -5713,6 +5713,8 @@ impl Meter {
             crate::draw::table_memo::log(report_frames);
             crate::bindless::log_held(report_frames);
             crate::descriptor::pool::log(report_frames);
+            // mac: `VICTORY_HEAP_SYNC_FAST`'s passes, with it or its A/B only.
+            crate::descriptor::host::sync_fast::log(report_frames);
             crate::descriptor::reports::log(report_frames);
             crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
@@ -6259,6 +6261,14 @@ pub(crate) fn retire(resource: ID3D12Resource) {
     // mac: taken as before; counted, and tried again first, with
     // `VICTORY_HEAP_LOCKS` (`crate::descriptor::slots`).
     crate::descriptor::slots::locked(&RETIRED, crate::descriptor::slots::RETIRED).push(resource);
+}
+
+/// Retires a batch of resources under one hold of [`RETIRED`].
+pub(crate) fn retire_many(resources: &mut Vec<ID3D12Resource>) {
+    if !resources.is_empty() {
+        crate::descriptor::slots::locked(&RETIRED, crate::descriptor::slots::RETIRED)
+            .append(resources);
+    }
 }
 
 /// After a submission has run, with none running: the retired resources go.

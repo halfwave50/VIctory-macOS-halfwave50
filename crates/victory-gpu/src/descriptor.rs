@@ -308,6 +308,8 @@ fn sync(ran: Option<&dyn Fn() -> bool>) {
         .then(|| SYNC_ISOLATION.read().unwrap_or_else(|e| e.into_inner()));
     // mac: lock waits and made slots are counted as a sync's (`slots`).
     let _syncing = slots::Syncing::enter();
+    // mac: its time, on either path (`VICTORY_HEAP_SYNC_FAST`'s line).
+    let _timed = crate::descriptor::host::sync_fast::Timed::start(ran.is_some());
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
@@ -347,6 +349,48 @@ fn sync(ran: Option<&dyn Fn() -> bool>) {
             }
         }
         let mut runs = runs.into_iter();
+        if told == reports::Told::No && crate::mac_switches::heap_sync_fast() {
+            const AHEAD_BATCH_PAGES: usize = 8;
+            let page_size = crate::watch::PAGE;
+            let mut batch: Vec<(u32, u32)> = Vec::new();
+            // The title memory of the batched pages: a round that ends
+            // leaves them with the rest, not looked at, as the default
+            // path leaves the page it ends at.
+            let mut batched: Vec<(usize, usize)> = Vec::new();
+            while let Some((from, to)) = runs.next() {
+                for page in (from & !(page_size - 1)..to).step_by(page_size) {
+                    let (page, end) = (page.max(from), (page + page_size).min(to));
+                    if ran.is_some_and(|ran| ran()) {
+                        host.leave(batched.into_iter().chain(std::iter::once((page, to))).chain(runs));
+                        ahead::cut();
+                        return;
+                    }
+                    if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                        continue;
+                    }
+                    let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::SyncSlots,
+                        last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                    );
+                    let (first, last) = (first as u32, last.min(u64::from(heap.desc.count)) as u32);
+                    if first < last {
+                        batch.push((first, last));
+                        batched.push((page, end));
+                    }
+                    if ran.is_some() && batch.len() >= AHEAD_BATCH_PAGES {
+                        host.sync_pages_fast(&batch, start, step);
+                        batch.clear();
+                        batched.clear();
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                host.sync_pages_fast(&batch, start, step);
+            }
+            continue;
+        }
         while let Some((from, to)) = runs.next() {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.

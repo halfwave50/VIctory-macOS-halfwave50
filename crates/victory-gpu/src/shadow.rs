@@ -557,7 +557,7 @@ impl Shadow {
 
     /// A view or a list asks for the copy in this frame. The refresh of
     /// every copy a page table names does not count: it would keep them all.
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         let frame = crate::queue::presented();
         if self.used.load(Ordering::Relaxed) != frame {
             self.used.store(frame, Ordering::Relaxed);
@@ -2126,6 +2126,10 @@ pub(crate) fn generation() -> u64 {
 /// Epoch for [`find`]'s per-thread lookup cache; bumped on every change to
 /// `BUFFERS`, `ALIASED`, or `LOOSE` (while holding that table's write lock).
 static LOOKUP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn lookup_epoch() -> u64 {
+    LOOKUP_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
 
 fn lookup_changed() {
     LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);

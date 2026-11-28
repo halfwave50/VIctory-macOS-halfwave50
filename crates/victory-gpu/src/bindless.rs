@@ -70,6 +70,23 @@ impl Viewed {
 
 pub(crate) type Range = (usize, u64, u64, bool);
 
+/// mac (tests, [`Viewed::census`]): each slot's entry (kind 0 a buffer
+/// range as copy, start, end and unordered access, 1 a texture, 2 a view
+/// left without a host view), the ranges with their slot counts, the
+/// textures with theirs, the ends, the hulls and the unordered ranges.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Census {
+    pub(crate) slots: Vec<(u32, u8, Range)>,
+    pub(crate) ranges: Vec<(Range, u32)>,
+    pub(crate) textures: Vec<(usize, u32)>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) ends: Vec<((usize, bool), Vec<(u64, u32)>, Vec<(u64, u32)>)>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) hulls: Vec<((usize, bool), usize, u64, u64, bool, Option<u32>)>,
+    pub(crate) unordered: Option<Vec<(usize, usize, usize)>>,
+}
+
 /// A merged range: copy, start, bytes, unordered access, the copy's bit in
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
@@ -122,6 +139,17 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
     *n = if add { *n + 1 } else { n.saturating_sub(1) };
     if *n == 0 {
         counts.remove(&at);
+    }
+}
+
+fn same_seen(a: &Seen, b: &Seen) -> bool {
+    match (a, b) {
+        (Seen::Buffer(sa, aa, la, ua), Seen::Buffer(sb, ab, lb, ub)) => {
+            Arc::ptr_eq(sa, sb) && aa == ab && la == lb && ua == ub
+        }
+        (Seen::Texture(ta), Seen::Texture(tb)) => ta == tb,
+        (Seen::Left(ka), Seen::Left(kb)) => ka == kb,
+        _ => false,
     }
 }
 
@@ -188,6 +216,161 @@ impl Inner {
         }
         unordered_changed
     }
+}
+
+/// One more (`add`) or one fewer slot views what `seen` reads, deferring hull
+/// recomputation to `dirty_hulls` so a batch updates each shadow's hull once.
+/// Takes disjoint field borrows so callers can hold `Entry` into `Inner::slots`
+/// at the same time (1 hash probe per slot, 0 clones).
+fn count_fields(
+    ranges: &mut Counts<Range, (u32, Arc<Shadow>)>,
+    textures: &mut BTreeMap<usize, u32>,
+    ends_map: &mut HashMap<(usize, bool), Ends>,
+    unordered: &mut Option<Unordered<Shadow>>,
+    seen: &Seen,
+    add: bool,
+    dirty_hulls: &mut Vec<(usize, bool)>,
+) -> bool {
+    let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
+    let mut unordered_changed = false;
+    match seen {
+        Seen::Buffer(shadow, address, len, uav) => {
+            let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
+            let e = ranges.entry_or(key, || (0, shadow.clone()));
+            let was = e.0;
+            step(&mut e.0);
+            let now = e.0;
+            if now == 0 {
+                ranges.remove(&key);
+            }
+            if (was == 0) != (now == 0) {
+                if key.3
+                    && let Some(u) = unordered
+                {
+                    if now > 0 {
+                        u.came(key, shadow);
+                    } else {
+                        u.went(&key);
+                    }
+                    unordered_changed = true;
+                }
+                let ends = ends_map
+                    .entry((key.0, key.3))
+                    .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
+                tally(&mut ends.1, key.1, now > 0);
+                tally(&mut ends.2, key.2, now > 0);
+                // No search under the census lock: a repeat of the last pair
+                // is passed by here, the others at the end of the batch
+                // (`Inner::rebuild_hulls`).
+                let hk = (key.0, key.3);
+                if dirty_hulls.last() != Some(&hk) {
+                    dirty_hulls.push(hk);
+                }
+            }
+        }
+        Seen::Texture(r) => {
+            let n = textures.entry(*r).or_insert(0);
+            step(n);
+            if *n == 0 {
+                textures.remove(r);
+            }
+        }
+        Seen::Left(_) => {}
+    }
+    unordered_changed
+}
+
+impl Inner {
+    /// The hulls of the `(copy, kind)` pairs a batch touched, each once
+    /// (sorted and deduplicated here: `count_fields` only drops a repeat of
+    /// the pair before).
+    fn rebuild_hulls(&mut self, mut dirty_hulls: Vec<(usize, bool)>) {
+        dirty_hulls.sort_unstable();
+        dirty_hulls.dedup();
+        for hk in dirty_hulls {
+            let hull = self.ends.get(&hk).and_then(|(shadow, starts, ends)| {
+                let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
+                Some((shadow.clone(), from, to - from, hk.1, shadow.dirty_bit()))
+            });
+            match hull {
+                Some(hull) => {
+                    self.hulls.insert(hk, hull);
+                }
+                None => {
+                    self.ends.remove(&hk);
+                    self.hulls.remove(&hk);
+                }
+            }
+        }
+    }
+
+    fn enter_batch(&mut self, fast: &Fast<Shadow>, updates: &mut Vec<(u32, u64, Option<Seen>)>) {
+        use std::collections::hash_map::Entry;
+        let mut olds: Vec<Seen> = Vec::with_capacity(updates.len());
+        let mut dirty_hulls: Vec<(usize, bool)> = Vec::new();
+        let mut changed = false;
+
+        // Pass 1: update `slots` in one hash probe each and add all new ranges
+        // before subtracting old ones so moving ranges never hit zero mid-batch.
+        for (index, ticket, seen) in updates.drain(..) {
+            if !self.tickets.newer(index, ticket) {
+                continue;
+            }
+            match (self.slots.entry(index), seen) {
+                (Entry::Occupied(mut occ), Some(new_seen)) => {
+                    if same_seen(occ.get(), &new_seen) {
+                        continue;
+                    }
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &new_seen,
+                        true,
+                        &mut dirty_hulls,
+                    );
+                    olds.push(occ.insert(new_seen));
+                }
+                (Entry::Vacant(vac), Some(new_seen)) => {
+                    changed |= count_fields(
+                        &mut self.ranges,
+                        &mut self.textures,
+                        &mut self.ends,
+                        &mut self.unordered,
+                        &new_seen,
+                        true,
+                        &mut dirty_hulls,
+                    );
+                    vac.insert(new_seen);
+                }
+                (Entry::Occupied(occ), None) => {
+                    olds.push(occ.remove());
+                }
+                (Entry::Vacant(_), None) => {}
+            }
+        }
+
+        // Pass 2: subtract replaced/cleared ranges.
+        for old in &olds {
+            changed |= count_fields(
+                &mut self.ranges,
+                &mut self.textures,
+                &mut self.ends,
+                &mut self.unordered,
+                old,
+                false,
+                &mut dirty_hulls,
+            );
+        }
+
+        // Pass 3: rebuild `hulls` once per touched `(shadow, uav)` pair.
+        self.rebuild_hulls(dirty_hulls);
+
+        if changed {
+            fast.changed();
+        }
+    }
 
     /// mac (`VICTORY_CENSUS_FAST=1`): slot `index` holds `seen`, as of the
     /// making that drew `ticket`, unless a later making of the slot is in
@@ -223,6 +406,12 @@ impl Inner {
 pub(crate) struct Batch<'a> {
     viewed: &'a Viewed,
     updates: Vec<(u32, u64, Option<Seen>)>,
+    /// mac (`VICTORY_HEAP_SYNC_FAST=1`): entered by [`Inner::enter_batch`],
+    /// one probe a slot, new ranges before old ones go. Chosen by the pass
+    /// that makes the batch (`descriptor::host::sync_fast`), so the workers
+    /// of one pass all enter it the same way, whatever the switch reads
+    /// meanwhile (`crate::ab`).
+    in_place: bool,
 }
 
 impl Batch<'_> {
@@ -253,6 +442,10 @@ impl Batch<'_> {
             return;
         }
         let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
+        if self.in_place {
+            inner.enter_batch(fast, &mut self.updates);
+            return;
+        }
         for (index, ticket, seen) in self.updates.drain(..) {
             inner.enter(fast, index, ticket, seen);
         }
@@ -288,6 +481,9 @@ pub(crate) struct Pass<'a> {
     viewed: &'a Viewed,
     /// This pass installed the thread's hold (it is the outermost one).
     own: bool,
+    /// mac: what it holds goes in by [`Inner::enter_batch`] ([`Batch`]'s
+    /// `in_place`).
+    in_place: bool,
 }
 
 impl Pass<'_> {
@@ -311,8 +507,13 @@ impl Pass<'_> {
         }
         let n = updates.len();
         let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
-        for (index, ticket, seen) in updates {
-            inner.enter(fast, index, ticket, seen);
+        if self.in_place {
+            let mut updates = updates;
+            inner.enter_batch(fast, &mut updates);
+        } else {
+            for (index, ticket, seen) in updates {
+                inner.enter(fast, index, ticket, seen);
+            }
         }
         drop(inner);
         crate::census_fast::entered(n);
@@ -331,6 +532,16 @@ impl Drop for Pass<'_> {
 impl Viewed {
     /// mac: a heap sync pass over this census's heap ([`Pass`]).
     pub(crate) fn pass(&self) -> Pass<'_> {
+        self.pass_as(false)
+    }
+
+    /// mac: [`Viewed::pass`] whose held updates go in place
+    /// (`VICTORY_HEAP_SYNC_FAST=1`, [`Inner::enter_batch`]).
+    pub(crate) fn pass_in_place(&self) -> Pass<'_> {
+        self.pass_as(true)
+    }
+
+    fn pass_as(&self, in_place: bool) -> Pass<'_> {
         let owner = std::ptr::from_ref(self) as usize;
         let own = self.batch
             && HELD.with(|h| {
@@ -341,7 +552,7 @@ impl Viewed {
                 }
                 free
             });
-        Pass { viewed: self, own }
+        Pass { viewed: self, own, in_place }
     }
 
     /// mac: `seen` for slot `index`, made with `ticket`, held for the pass
@@ -401,7 +612,13 @@ impl Viewed {
 
     /// mac: census updates entered together (`VICTORY_CENSUS_FAST=1`).
     pub(crate) fn batch(&self) -> Batch<'_> {
-        Batch { viewed: self, updates: Vec::new() }
+        Batch { viewed: self, updates: Vec::new(), in_place: false }
+    }
+
+    /// mac: [`Viewed::batch`] entered in place (`VICTORY_HEAP_SYNC_FAST=1`,
+    /// [`Inner::enter_batch`]).
+    pub(crate) fn batch_in_place(&self) -> Batch<'_> {
+        Batch { viewed: self, updates: Vec::new(), in_place: true }
     }
 
     /// The range slot `index` views of a buffer copy (the copy, the title
@@ -412,6 +629,42 @@ impl Viewed {
             Some(Seen::Buffer(shadow, address, len, uav)) => Some((Arc::as_ptr(shadow) as usize, *address, *len, *uav)),
             _ => None,
         }
+    }
+
+    /// mac (tests): everything the census counts, in a fixed order, so that
+    /// two censuses of the same copies compare whole ([`Census`]).
+    #[cfg(test)]
+    pub(crate) fn census(&self) -> Census {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots: Vec<_> = inner
+            .slots
+            .iter()
+            .map(|(&i, seen)| match seen {
+                Seen::Buffer(s, a, l, u) => (i, 0u8, (Arc::as_ptr(s) as usize, *a, a + l, *u)),
+                Seen::Texture(r) => (i, 1, (*r, 0, 0, false)),
+                Seen::Left((kind, a, l)) => (i, 2, (*kind, *a, *l, false)),
+            })
+            .collect();
+        slots.sort_unstable();
+        let mut ranges: Vec<_> = inner.ranges.iter().map(|(k, (n, _))| (*k, *n)).collect();
+        ranges.sort_unstable();
+        let textures = inner.textures.iter().map(|(&r, &n)| (r, n)).collect();
+        let pairs = |m: &BTreeMap<u64, u32>| m.iter().map(|(&a, &n)| (a, n)).collect::<Vec<_>>();
+        let mut ends: Vec<_> = inner.ends.iter().map(|(&k, (_, s, e))| (k, pairs(s), pairs(e))).collect();
+        ends.sort_unstable();
+        let mut hulls: Vec<_> = inner
+            .hulls
+            .iter()
+            .map(|(&k, (s, from, len, uav, bit))| (k, Arc::as_ptr(s) as usize, *from, *len, *uav, *bit))
+            .collect();
+        hulls.sort_unstable();
+        drop(inner);
+        let unordered = unordered_writes(self).map(|w| {
+            let mut w: Vec<_> = w.iter().map(|(s, a, b)| (Arc::as_ptr(s) as usize, *a, *b)).collect();
+            w.sort_unstable();
+            w
+        });
+        Census { slots, ranges, textures, ends, hulls, unordered }
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -1478,6 +1731,93 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(old.range_at(0), None, "entered at once");
         drop(batch);
         drop((old, fast));
+        release();
+    }
+
+    /// mac (`VICTORY_HEAP_SYNC_FAST=1`): four threads at once entering
+    /// batches and passes in place ([`Inner::enter_batch`]), as the workers
+    /// of a fast heap sync do, leave the census that the same makings
+    /// entered one at a time leave: each slot's entry, every range with its
+    /// count, the textures, the ends, the hulls and the unordered ranges. The
+    /// threads make slots of their own but views of the same ranges, so
+    /// counts reach zero and come back across the threads' batches, and a
+    /// range often moves between two slots of one batch. No thread-local
+    /// switch: the batch and the pass say how they go in.
+    #[test]
+    fn batches_entered_in_place_by_several_threads_count_as_one_at_a_time() {
+        const THREADS: u32 = 4;
+        const SLOTS_EACH: u32 = 96;
+        let memory = vec![0u8; 0x3000];
+        let at = memory.as_ptr() as u64;
+        let (Some(copies), release) = three_copies(&memory) else {
+            return; // no host GPU here
+        };
+        // Each thread's makings, drawn before: (slot, what it views).
+        let makings: Vec<Vec<(u32, Option<Seen>)>> = (0..THREADS)
+            .map(|t| {
+                let mut x = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(u64::from(t) + 7);
+                let mut next = move || {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x
+                };
+                (0..6_000u32)
+                    .map(|step| {
+                        let slot = t + THREADS * (next() % u64::from(SLOTS_EACH)) as u32;
+                        let seen = match next() % 16 {
+                            0 | 1 => None,
+                            2 => Some(Seen::Texture(0x1000 + (next() % 4) as usize)),
+                            3 => Some(Seen::Left(((next() % 4) as usize, 0, 0))),
+                            _ => {
+                                // Few distinct ranges, so that the threads share them.
+                                let k = next() % 3;
+                                let from = at + 0x1000 * k + (next() % 6) * 64;
+                                let len = [0, 16, 64, 256][(next() % 4) as usize];
+                                Some(Seen::Buffer(copies[k as usize].clone(), from, len, (step + t) % 3 == 0))
+                            }
+                        };
+                        (slot, seen)
+                    })
+                    .collect()
+            })
+            .collect();
+        let one = Viewed::new(true);
+        for making in &makings {
+            for (slot, seen) in making {
+                one.set_seen(*slot, seen.clone());
+            }
+        }
+        for passes in [false, true] {
+            let several = Viewed::with_batch(true, true);
+            std::thread::scope(|scope| {
+                for (t, making) in makings.iter().enumerate() {
+                    let several = &several;
+                    scope.spawn(move || {
+                        if passes && t % 2 == 1 {
+                            // A pass holds what `set_seen` makes, as `mirror`'s.
+                            let pass = several.pass_in_place();
+                            for (slot, seen) in making {
+                                several.set_seen(*slot, seen.clone());
+                                pass.enter_if_full();
+                            }
+                        } else {
+                            let mut batch = several.batch_in_place();
+                            for (k, (slot, seen)) in making.iter().enumerate() {
+                                batch.set_seen(*slot, seen.clone());
+                                batch.enter_if_full();
+                                if k % 997 == 0 {
+                                    std::thread::yield_now();
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(several.census(), one.census(), "passes {passes}");
+        }
+        assert!(one.census().unordered.is_some_and(|u| !u.is_empty()), "unordered ranges are tested");
+        drop(one);
         release();
     }
 

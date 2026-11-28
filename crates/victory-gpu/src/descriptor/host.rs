@@ -17,6 +17,7 @@ use super::{VIEW_TAG, View, ViewPin, view_at, views_current_into, views_forgot};
 use crate::host::host;
 
 mod quick;
+pub(crate) mod sync_fast;
 #[cfg(test)]
 mod split_tests;
 
@@ -322,6 +323,9 @@ pub(crate) struct HostHeap {
     widened: Mutex<HashMap<usize, (usize, std::sync::Weak<crate::shadow::Widened>)>>,
     /// Slots queued for background texture upload (`crate::heap_worker`).
     uploads: Mutex<UploadQueue>,
+    /// mac (`VICTORY_HEAP_SYNC_FAST=1`): staged CPU descriptors for buffer
+    /// views and `null_view`, copied via `CopyDescriptorsSimple`.
+    staged_fast: Mutex<Option<sync_fast::StagedState>>,
 }
 
 /// mac: slots, and runs of title heap memory (`HostHeap::left`).
@@ -498,6 +502,7 @@ impl HostHeap {
             viewed: Default::default(),
             widened: Default::default(),
             uploads: Default::default(),
+            staged_fast: Mutex::new(None),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -1067,6 +1072,13 @@ impl HostHeap {
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        if crate::mac_switches::heap_sync_fast() {
+            let last = last.min(self.count);
+            if first < last {
+                self.sync_pages_fast(&[(first, last)], start, step);
+            }
+            return;
+        }
         let stale = self.stale_slots(first, last, start, step);
         self.make_stale(stale, start, step);
     }
