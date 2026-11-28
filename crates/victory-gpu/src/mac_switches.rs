@@ -1153,6 +1153,16 @@ pub(crate) enum AliasPhysical {
     Verify,
     /// `verify-tiles`: `verify` in `gpu-tiles`' order (no section views).
     VerifyTiles,
+    /// `gpu-sections`: `gpu`'s views of sections alone: no reserved pieces,
+    /// no tile mappings, no sink and no flush. A range that is one run of one
+    /// section's pages is a view of the placed buffer over the section's heap
+    /// (every title address of a page reaches that one GPU range); every other
+    /// range keeps its host copy, as with the switch off
+    /// (`notes/alias-physical-debug.md`, "One range per page").
+    GpuSections,
+    /// `verify-sections`: `verify` for `gpu-sections` (views of sections only,
+    /// checked, never drawn through).
+    VerifySections,
 }
 
 impl AliasPhysical {
@@ -1166,12 +1176,15 @@ impl AliasPhysical {
                 | AliasPhysical::GpuSingle
                 | AliasPhysical::Verify
                 | AliasPhysical::VerifyTiles
+                | AliasPhysical::GpuSections
+                | AliasPhysical::VerifySections
         )
     }
 
-    /// Whether the reservations' pieces are made and tiled from the heaps
-    /// (`crate::alias_physical`): the GPU reads the pages through them, or
-    /// (`verify`) their views are checked and not used.
+    /// Whether the GPU side is on (`crate::alias_physical`): the GPU reads the
+    /// pages through views of the sections' heaps and (but `gpu-sections`)
+    /// of the reservations' pieces, or (`verify`) their views are checked
+    /// and not used.
     pub(crate) fn gpu(self) -> bool {
         matches!(
             self,
@@ -1180,19 +1193,34 @@ impl AliasPhysical {
                 | AliasPhysical::GpuSingle
                 | AliasPhysical::Verify
                 | AliasPhysical::VerifyTiles
+                | AliasPhysical::GpuSections
+                | AliasPhysical::VerifySections
         )
+    }
+
+    /// Whether the reservations get pieces, reserved buffers tiled from the
+    /// heaps as the title maps its pages (all GPU modes but `gpu-sections`
+    /// and `verify-sections`, which never map a tile).
+    pub(crate) fn pieces(self) -> bool {
+        self.gpu() && !matches!(self, AliasPhysical::GpuSections | AliasPhysical::VerifySections)
     }
 
     /// Whether runs of a section's pages are views of the section's heap
     /// (`=gpu`, canonical views first; `=verify` checks them).
     pub(crate) fn canonical(self) -> bool {
-        matches!(self, AliasPhysical::Gpu | AliasPhysical::Verify)
+        matches!(
+            self,
+            AliasPhysical::Gpu | AliasPhysical::Verify | AliasPhysical::GpuSections | AliasPhysical::VerifySections
+        )
     }
 
     /// Whether the views are only checked, never drawn through (`verify`,
-    /// `verify-tiles`).
+    /// `verify-tiles`, `verify-sections`).
     pub(crate) fn verify(self) -> bool {
-        matches!(self, AliasPhysical::Verify | AliasPhysical::VerifyTiles)
+        matches!(
+            self,
+            AliasPhysical::Verify | AliasPhysical::VerifyTiles | AliasPhysical::VerifySections
+        )
     }
 
     /// The switch as written.
@@ -1206,6 +1234,8 @@ impl AliasPhysical {
             AliasPhysical::GpuSingle => "VICTORY_ALIAS_PHYSICAL=gpu-single",
             AliasPhysical::Verify => "VICTORY_ALIAS_PHYSICAL=verify",
             AliasPhysical::VerifyTiles => "VICTORY_ALIAS_PHYSICAL=verify-tiles",
+            AliasPhysical::GpuSections => "VICTORY_ALIAS_PHYSICAL=gpu-sections",
+            AliasPhysical::VerifySections => "VICTORY_ALIAS_PHYSICAL=verify-sections",
         }
     }
 }
@@ -1268,7 +1298,8 @@ pub(crate) fn alias_physical() -> AliasPhysical {
         let (rule, known) = alias_physical_rule(value.as_deref());
         if !known {
             tracing::warn!(
-                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu, gpu, gpu-tiles, gpu-single, verify and verify-tiles; stage 2's counts alone",
+                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu, gpu, gpu-tiles, gpu-single, gpu-sections, verify, verify-tiles \
+                 and verify-sections; stage 2's counts alone",
                 value.as_deref().unwrap_or_default()
             );
         }
@@ -1292,6 +1323,8 @@ fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
         Some("gpu-single") => (AliasPhysical::GpuSingle, true),
         Some("verify") => (AliasPhysical::Verify, true),
         Some("verify-tiles") => (AliasPhysical::VerifyTiles, true),
+        Some("gpu-sections") => (AliasPhysical::GpuSections, true),
+        Some("verify-sections") => (AliasPhysical::VerifySections, true),
         Some(_) => (AliasPhysical::Count, false),
     }
 }
@@ -1399,6 +1432,21 @@ pub(crate) mod tests {
         let v = AliasPhysical::VerifyTiles;
         assert!(v.heaps() && v.gpu() && !v.canonical() && v.verify());
         assert!(!AliasPhysical::Cpu.verify() && !AliasPhysical::Count.verify());
+        // Sections alone: no pieces, no tiles.
+        for s in [AliasPhysical::GpuSections, AliasPhysical::VerifySections] {
+            assert!(s.heaps() && s.gpu() && s.canonical() && !s.pieces(), "{s:?}");
+        }
+        assert!(AliasPhysical::VerifySections.verify() && !AliasPhysical::GpuSections.verify());
+        for pieces in [
+            AliasPhysical::Gpu,
+            AliasPhysical::Verify,
+            AliasPhysical::GpuTiles,
+            AliasPhysical::GpuSingle,
+            AliasPhysical::VerifyTiles,
+        ] {
+            assert!(pieces.pieces(), "{pieces:?}");
+        }
+        assert!(!AliasPhysical::Cpu.pieces() && !AliasPhysical::Off.pieces());
         assert!(AliasPhysical::Cpu.heaps() && !AliasPhysical::Cpu.gpu());
         assert!(!AliasPhysical::Count.heaps() && !AliasPhysical::Off.heaps());
         for off in [None, Some(""), Some("0")] {
@@ -1418,6 +1466,8 @@ pub(crate) mod tests {
             ("gpu-single", AliasPhysical::GpuSingle),
             ("verify", AliasPhysical::Verify),
             (" verify-tiles", AliasPhysical::VerifyTiles),
+            ("gpu-sections", AliasPhysical::GpuSections),
+            ("verify-sections ", AliasPhysical::VerifySections),
         ] {
             assert_eq!(alias_physical_rule(Some(value)), (rule, true), "{value:?}");
         }

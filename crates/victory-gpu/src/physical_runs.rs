@@ -324,7 +324,8 @@ pub(crate) fn gpu_on() {
 /// copy as mixed, views of sections and of pieces dropped by remaps. Since
 /// the start: pieces made and fallen back, views of sections and of pieces
 /// (those with a page at two or more addresses, as flushed), copies kept
-/// for ranges in pieces, and mixed.
+/// for ranges in pieces, and mixed. `sections_only`: no pieces at all
+/// (`=gpu-sections`), so none of their counts is written.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GpuCounts {
     pub(crate) fresh: u64,
@@ -345,6 +346,7 @@ pub(crate) struct GpuCounts {
     pub(crate) shared: u64,
     pub(crate) kept: u64,
     pub(crate) mixed_total: u64,
+    pub(crate) sections_only: bool,
 }
 
 /// A section's heap of `len` bytes was made: heap-backed sections now, and
@@ -439,6 +441,19 @@ fn stage2_line(
         )
     }) + &gpu.map_or(String::new(), |g| {
         let f = |n: u64| n as f64 / frames.max(1.0);
+        if g.sections_only {
+            return format!(
+                "; GPU side, views of sections only (no pieces, no tile mappings): since the start {} views of \
+                 sections, {} mixed; per frame {:.1} views of sections made ({:.2} MB), {:.1} mixed, {:.1} dropped \
+                 by remaps",
+                g.section_total,
+                g.mixed_total,
+                f(g.section_views),
+                f(g.section_bytes) / 1e6,
+                f(g.mixed),
+                f(g.section_drops),
+            );
+        }
         format!(
             "; GPU side: {} pieces ({} fell back to copies); since the start {} views of sections, {} views of pieces \
              ({} with a page at two or more addresses), {} copies kept for ranges in pieces, {} mixed; per frame \
@@ -701,6 +716,7 @@ mod tests {
                 shared: 300,
                 kept: 12,
                 mixed_total: 9,
+                sections_only: false,
             }),
             10.0,
         );
@@ -713,6 +729,32 @@ mod tests {
                  2.0 to the sink, in 3.0 UpdateTileMappings, 0.40 ms"
             ),
             "{gpu}"
+        );
+        // `=gpu-sections`: views of sections alone, nothing of pieces or tiles.
+        let sections = stage2_line(
+            [0; 4],
+            [0; 4],
+            [0; 5],
+            &r,
+            Some([1, 0, 0, 0, 0]),
+            Some(GpuCounts {
+                section_views: 40,
+                section_bytes: 25_000_000,
+                mixed: 3,
+                section_drops: 2,
+                section_total: 1_500,
+                mixed_total: 9,
+                sections_only: true,
+                ..GpuCounts::default()
+            }),
+            10.0,
+        );
+        assert!(
+            sections.ends_with(
+                "; GPU side, views of sections only (no pieces, no tile mappings): since the start 1500 views of \
+                 sections, 9 mixed; per frame 4.0 views of sections made (2.50 MB), 0.3 mixed, 0.2 dropped by remaps"
+            ),
+            "{sections}"
         );
     }
 
