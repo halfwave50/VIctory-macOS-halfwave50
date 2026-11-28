@@ -1359,6 +1359,9 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             let links = g.alias_of.entry(x).or_default();
             if !links.contains(&y) {
                 links.push(y);
+                // mac: under the guard lock, so that a reader of the links
+                // that saw this count saw the links before it.
+                LINKS_MADE.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -1380,6 +1383,17 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
 pub(crate) fn aliased(at: usize, len: usize) -> bool {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     guards().alias_of.range(first..last).next().is_some()
+}
+
+/// mac: links between addresses made so far ([`title_memory_aliased`]):
+/// what [`shown_elsewhere`] found is still all there is while this has not
+/// moved (links that go only make it find more than there is).
+static LINKS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// mac: [`LINKS_MADE`] now: read before [`shown_elsewhere`], it tells
+/// whether a link was made after that look.
+pub(crate) fn links_made() -> u64 {
+    LINKS_MADE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// mac: the title addresses of the pages that show a page of `ranges`

@@ -53,6 +53,15 @@
 //! range is noted for its copy-back when its own submission is finished
 //! (`Host::finish`), not when it is prepared, where the finish of the one
 //! left would take it.
+//!
+//! With `uploads` too (`VICTORY_FLIGHTS_WITH=alias,uploads`, E2b), the
+//! texture uploads never finish it: a texture whose memory it may write or
+//! land in (in pages: its declared and landing ranges and bottom-of-pipe
+//! writes, the ranges its heaps' unordered views reach, those pages' other
+//! addresses; `crate::flights::UploadReach`) is kept out of the reads and
+//! brought up into the same upload list as soon as it is finished, for
+//! whatever reason, at the latest just before the next goes to the GPU
+//! (`crate::bindless::Uploads::land_late`); the others are read beside it.
 
 use super::*;
 
@@ -91,9 +100,16 @@ pub(in crate::host) static FORCED_ALIAS: std::sync::atomic::AtomicBool = std::sy
 #[cfg(test)]
 pub(in crate::host) static FORCED_WRITES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Turns `uploads` on for the tests (with [`FORCED_ALIAS`]).
+#[cfg(test)]
+pub(in crate::host) static FORCED_UPLOADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The names of `VICTORY_FLIGHTS_WITH` this build has (bits of
-/// `crate::flights::WITH`): `alias`, `writes`.
-const BUILT: u32 = 0b11;
+/// `crate::flights::WITH`): `alias`, `writes`, `uploads`.
+const BUILT: u32 = 0b100_0011;
+
+/// `uploads`' bit in `crate::flights::WITH`.
+const UPLOADS_BIT: u32 = 1 << 6;
 
 /// mac: `VICTORY_FLIGHTS_WITH=<list>` (`notes/overlap-stages-design.md` §6),
 /// read once: the overlap line's increments taken, as bits of
@@ -136,8 +152,29 @@ fn with() -> u32 {
                  when its own submission is finished"
             );
         }
+        if taken & UPLOADS_BIT != 0 {
+            tracing::info!(
+                "VICTORY_FLIGHTS_WITH=uploads: the texture uploads of a submission prepared beside the one before do \
+                 not finish that one; a texture whose memory it may write or land in (by page: what it declared and \
+                 lands in, what its heaps' unordered views reach, those pages' other addresses; all with \
+                 title-memory programs) is brought up into the same upload list as soon as it is finished, at the \
+                 latest before the next goes to the GPU; the others are read beside it"
+            );
+        }
         taken
     })
+}
+
+/// mac: whether the texture uploads beside the submission left keep what
+/// it may write for after its finish instead of finishing it
+/// (`VICTORY_FLIGHTS_WITH=alias,uploads`, E2b of
+/// `notes/overlap-stages-design.md`).
+pub(crate) fn with_uploads() -> bool {
+    #[cfg(test)]
+    if FORCED_UPLOADS.load(Relaxed) {
+        return with_alias();
+    }
+    on() && with() & UPLOADS_BIT != 0
 }
 
 /// Whether flights take zero-copy title buffers (`VICTORY_FLIGHTS_WITH=alias`).
@@ -223,6 +260,34 @@ static UPLOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// while it ran, which no longer finish it.
 static WRITES: AtomicU64 = AtomicU64::new(0);
 
+/// With `VICTORY_FLIGHTS_WITH=alias,uploads` (E2b), since the last frame
+/// line, of the upload checks beside it (indices below): textures looked at
+/// and of them changed since their last upload (their trackers say so);
+/// checks that kept textures for after its finish, and textures kept by
+/// reason (`crate::flights::MET_EVERY` to `MET_OTHER`); new looks at the
+/// other addresses (a link was made since the last); one check in
+/// [`SAMPLE`] looked at more closely, its textures, of them in aliased
+/// memory and shown at another address too.
+static CHECKS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+const LOOKED: usize = 0;
+const CHANGED: usize = 1;
+const KEPT_CHECKS: usize = 2;
+const KEPT_BY: usize = 3;
+const ANEW: usize = 7;
+const SAMPLED: usize = 8;
+const SAMPLED_TEXTURES: usize = 9;
+const SAMPLED_ALIASED: usize = 10;
+const SAMPLED_SHOWN: usize = 11;
+const SAMPLE: u64 = 8;
+static SAMPLING: AtomicU64 = AtomicU64::new(0);
+/// Of those kept: landings ([`landed_late`]), textures brought up then and
+/// of them uploaded (changed), microseconds; landings by the [`Why`] of the
+/// finish they followed ([`LAST_WHY`]).
+static LATE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static LATE_BY: [AtomicU64; WHYS] = [const { AtomicU64::new(0) }; WHYS];
+/// The [`Why`] of the last finish beside a submission prepared.
+static LAST_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(Why::Give as usize);
+
 /// What the submission left may write or will write once it is finished,
 /// read from it under the submission lock when first needed.
 pub(in crate::host) struct Footprint {
@@ -239,9 +304,51 @@ pub(in crate::host) struct Footprint {
     /// Title memory whose copies hold shader writes kept from it
     /// (`crate::memory::kept`): a refresh there drops them.
     kept: crate::flights::Spans,
+    /// mac: with `VICTORY_FLIGHTS_WITH=alias,uploads` (E2b): what the
+    /// texture uploads beside it may not read before it is finished, and
+    /// the count of links between addresses (`crate::watch::links_made`)
+    /// its other addresses were found at.
+    upload: Option<Mutex<(u64, crate::flights::UploadReach)>>,
+}
+
+/// The pages that show a page of what `reach` names at another address.
+fn others_of(reach: &crate::flights::UploadReach) -> crate::flights::Spans {
+    let mut pages = Vec::new();
+    crate::watch::shown_elsewhere(reach.declared.iter().chain(reach.heaps.iter()), &mut pages);
+    let mut others = crate::flights::Spans::default();
+    for page in pages {
+        others.add(page, page + crate::watch::PAGE);
+    }
+    others.join();
+    others
 }
 
 impl Footprint {
+    /// E2b's [`Footprint::upload`] of `left`: the pages of its declared and
+    /// landing ranges and bottom-of-pipe writes, of what its heaps' views
+    /// for unordered access reach (`crate::bindless::written_ranges`), and
+    /// their other addresses; everything with title-memory programs.
+    fn upload_of(left: &Left) -> Mutex<(u64, crate::flights::UploadReach)> {
+        let mut reach = crate::flights::UploadReach { every: left.memory, ..Default::default() };
+        let links = crate::watch::links_made();
+        if !left.memory {
+            let page = crate::watch::PAGE;
+            for &(at, end) in &left.declared {
+                reach.declared.add_pages(at, end, page);
+            }
+            for &(at, n) in &left.writes {
+                reach.declared.add_pages(at as usize, (at + n) as usize, page);
+            }
+            for heap in &left.ran.heaps {
+                crate::bindless::written_ranges(heap, |from, to| reach.heaps.add_pages(from as usize, to as usize, page));
+            }
+            reach.declared.join();
+            reach.heaps.join();
+            reach.others = others_of(&reach);
+        }
+        Mutex::new((links, reach))
+    }
+
     fn of(left: &Left) -> Footprint {
         let mut written = std::collections::HashSet::new();
         let mut spans = crate::flights::Spans::default();
@@ -272,7 +379,8 @@ impl Footprint {
             kept.add(at, at + n);
         }
         kept.join();
-        Footprint { landing: crate::flights::Landing { every: left.memory, spans, others }, written, kept }
+        let upload = with_uploads().then(|| Footprint::upload_of(left));
+        Footprint { landing: crate::flights::Landing { every: left.memory, spans, others }, written, kept, upload }
     }
 
     /// Whether title memory `[at, at + len)` may change when it is finished.
@@ -411,6 +519,8 @@ impl Footprint {
             landing: Default::default(),
             written: Default::default(),
             kept: Default::default(),
+            upload: with_uploads()
+                .then(|| Mutex::new((0, crate::flights::UploadReach { every: true, ..Default::default() }))),
         }
     }
 }
@@ -475,6 +585,7 @@ impl Host {
         let Some(b) = beside.as_mut() else { return Duration::ZERO };
         let Some(value) = b.value.take() else { return Duration::ZERO };
         b.shared.done.store(true, Release);
+        LAST_WHY.store(why as usize, Relaxed);
         let at = Instant::now();
         BESIDE[1].fetch_add((at - b.started).as_micros() as u64, Relaxed);
         let mut waited = Duration::ZERO;
@@ -594,18 +705,26 @@ impl Host {
     /// Their reads then never meet its shaders' writes in aliased memory,
     /// and a texture its copy-back tells is told before they look, as when
     /// it is finished before the next is prepared.
+    ///
+    /// With `alias,uploads` (E2b) it is not finished: the indices returned
+    /// are those of `work` to bring up only once it is
+    /// (`crate::bindless::Uploads::land_late`), which [`kept_for_later`]
+    /// picks.
     pub(in crate::host) fn beside_texture_reads(
         &self,
         submitted: &mut u64,
         beside: &mut Option<Beside>,
         work: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)],
-    ) {
+    ) -> Vec<usize> {
         if !with_alias() || work.is_empty() {
-            return;
+            return Vec::new();
         }
-        let Some(b) = beside.as_mut().filter(|b| b.running()) else { return };
+        let Some(b) = beside.as_mut().filter(|b| b.running()) else { return Vec::new() };
         UPLOADS[0].fetch_add(1, Relaxed);
         let footprint = b.footprint();
+        if let Some(upload) = &footprint.upload {
+            return kept_for_later(upload, work);
+        }
         let met = work.iter().find_map(|(staging, _)| {
             let (at, len) = staging.title_range();
             footprint.meets(at, len)
@@ -614,7 +733,75 @@ impl Host {
             UPLOADS[k].fetch_add(1, Relaxed);
             self.finish_beside(submitted, beside, Why::Uploads);
         }
+        Vec::new()
     }
+}
+
+/// mac: E2b (`VICTORY_FLIGHTS_WITH=alias,uploads`): of `work`, the textures
+/// to bring up only once the submission left is finished: those whose title
+/// memory (what a refresh of it may read) shares a page with what it may
+/// write or land in, or with another address of such a page
+/// ([`crate::flights::UploadReach::meets`]). The other addresses are looked
+/// up again if a link between addresses was made since (a mapping made
+/// meanwhile). Counted for the flights line.
+fn kept_for_later(
+    upload: &Mutex<(u64, crate::flights::UploadReach)>,
+    work: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)],
+) -> Vec<usize> {
+    let mut held = upload.lock().unwrap_or_else(|e| e.into_inner());
+    let (links, reach) = &mut *held;
+    let now = crate::watch::links_made();
+    if now != *links && !reach.every {
+        reach.others = others_of(reach);
+        *links = now;
+        CHECKS[ANEW].fetch_add(1, Relaxed);
+    }
+    let mut kept = Vec::new();
+    let mut by = [0u64; 4];
+    if !reach.nothing() {
+        for (i, (staging, _)) in work.iter().enumerate() {
+            let (at, len) = staging.title_range();
+            if let Some(k) = reach.meets(at, len) {
+                by[k] += 1;
+                kept.push(i);
+            }
+        }
+    }
+    drop(held);
+    let changed = work.iter().filter(|(staging, _)| staging.maybe_changed()).count();
+    CHECKS[LOOKED].fetch_add(work.len() as u64, Relaxed);
+    CHECKS[CHANGED].fetch_add(changed as u64, Relaxed);
+    if !kept.is_empty() {
+        CHECKS[KEPT_CHECKS].fetch_add(1, Relaxed);
+    }
+    for (k, n) in by.iter().enumerate() {
+        CHECKS[KEPT_BY + k].fetch_add(*n, Relaxed);
+    }
+    if SAMPLING.fetch_add(1, Relaxed).is_multiple_of(SAMPLE) {
+        let (mut aliased, mut shown) = (0, 0);
+        for (staging, _) in work {
+            let (at, len) = staging.title_range();
+            aliased += u64::from(crate::shadow::find_aliased(at as u64, (at + len) as u64).is_some());
+            shown += u64::from(len > 0 && crate::watch::aliased(at, len));
+        }
+        CHECKS[SAMPLED].fetch_add(1, Relaxed);
+        CHECKS[SAMPLED_TEXTURES].fetch_add(work.len() as u64, Relaxed);
+        CHECKS[SAMPLED_ALIASED].fetch_add(aliased, Relaxed);
+        CHECKS[SAMPLED_SHOWN].fetch_add(shown, Relaxed);
+    }
+    kept
+}
+
+/// mac: E2b: textures kept for after the finish of the submission left
+/// were brought up (`crate::bindless::Uploads::land_late`): `textures`,
+/// `uploaded` of them changed, in `took`. Counted by the finish they
+/// followed.
+pub(crate) fn landed_late(textures: usize, uploaded: usize, took: Duration) {
+    LATE[0].fetch_add(1, Relaxed);
+    LATE[1].fetch_add(textures as u64, Relaxed);
+    LATE[2].fetch_add(uploaded as u64, Relaxed);
+    LATE[3].fetch_add(took.as_micros() as u64, Relaxed);
+    LATE_BY[LAST_WHY.load(Relaxed).min(WHYS - 1)].fetch_add(1, Relaxed);
 }
 
 /// An early refresh refused (the copy stopped being idle): made the
@@ -666,13 +853,64 @@ fn uploads_line(frames: f64) -> String {
     format!(
         "; VICTORY_FLIGHTS_WITH=alias: {made:.1}/frame texture uploads made while it ran, {reached:.1} of them \
          finished it first as a texture's memory is in what it may write, {twice:.1} as a texture's memory is shown \
-         at another address too{}",
+         at another address too{}{}",
         if with_writes() {
             format!("; writes: {writes:.1}/frame declarations in aliased copies made while it ran, not finishing it")
         } else {
             String::new()
-        }
+        },
+        if with_uploads() { kept_line(frames) } else { String::new() }
     )
+}
+
+/// The flights line's part for `VICTORY_FLIGHTS_WITH=alias,uploads` (E2b).
+fn kept_line(frames: f64) -> String {
+    let c: [u64; 12] = std::array::from_fn(|i| CHECKS[i].swap(0, Relaxed));
+    let late: [u64; 4] = std::array::from_fn(|i| LATE[i].swap(0, Relaxed));
+    let by: [f64; WHYS] = std::array::from_fn(|i| LATE_BY[i].swap(0, Relaxed) as f64 / frames);
+    let f = |n: u64| n as f64 / frames;
+    let kept: u64 = c[KEPT_BY..KEPT_BY + 4].iter().sum();
+    let per = |n: u64| if c[SAMPLED] == 0 { 0.0 } else { n as f64 / c[SAMPLED] as f64 };
+    format!(
+        "; uploads: of those checks, {looked:.0} textures/frame looked at ({changed:.0} changed since their last \
+         upload); {met:.1}/frame kept {kept:.1} textures/frame for after its finish instead of finishing it (as it \
+         runs title-memory programs {e:.1}, in a page it declared or lands in {d:.1}, in a page its heaps' unordered \
+         views reach {h:.1}, at another address of such a page {o:.1}); {landings:.1}/frame landings of them, after \
+         the finish by (the 13 above) {by:.1?}, brought up {brought:.1} textures/frame, {uploaded:.1} of them \
+         changed, in {late_ms:.1} ms/frame; {anew:.1}/frame other addresses looked up again; one check in {SAMPLE} \
+         ({sampled:.1}/frame): {t:.0} textures a check, {a:.0} in aliased memory, {s:.0} shown at another address too",
+        looked = f(c[LOOKED]),
+        changed = f(c[CHANGED]),
+        met = f(c[KEPT_CHECKS]),
+        kept = f(kept),
+        e = f(c[KEPT_BY + crate::flights::MET_EVERY]),
+        d = f(c[KEPT_BY + crate::flights::MET_DECLARED]),
+        h = f(c[KEPT_BY + crate::flights::MET_HEAPS]),
+        o = f(c[KEPT_BY + crate::flights::MET_OTHER]),
+        landings = f(late[0]),
+        brought = f(late[1]),
+        uploaded = f(late[2]),
+        late_ms = late[3] as f64 / 1000.0 / frames,
+        anew = f(c[ANEW]),
+        sampled = f(c[SAMPLED]),
+        t = per(c[SAMPLED_TEXTURES]),
+        a = per(c[SAMPLED_ALIASED]),
+        s = per(c[SAMPLED_SHOWN]),
+    )
+}
+
+/// Textures kept for after the finish so far, by reason
+/// (`crate::flights::MET_EVERY` to `MET_OTHER`; tests).
+#[cfg(test)]
+pub(super) fn kept_for(k: usize) -> u64 {
+    CHECKS[KEPT_BY + k].load(Relaxed)
+}
+
+/// Kept textures brought up after a finish so far, and of them uploaded
+/// (tests).
+#[cfg(test)]
+pub(super) fn landed() -> (u64, u64) {
+    (LATE[1].load(Relaxed), LATE[2].load(Relaxed))
 }
 
 /// Finishes so far by every [`Why`] (tests; the frame line takes them).

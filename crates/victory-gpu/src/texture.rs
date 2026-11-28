@@ -515,17 +515,45 @@ pub(crate) fn record_upload(
     staging: &Staging,
     (buffer, at, subresources): &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
-    const COPY_DEST: u32 = 0x400;
-    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources);
+    record_copies(list, copy, staging, (buffer, *at), subresources);
+    list.move_texture(copy, SHADER_RESOURCE)
+}
+
+/// The states [`record_upload`] moves a host texture through.
+const COPY_DEST: u32 = 0x400;
+const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+
+/// mac: [`record_upload`] for a texture whose upload is recorded later
+/// (`crate::bindless`, E2b of flights): `list` notes now that it takes the
+/// texture as a copy destination and leaves it readable by shaders, so that
+/// its prelude, made before the copies are recorded, moves it there; the
+/// barrier that leaves it readable, recorded after its copies (or alone if
+/// nothing changed), is returned, and one to record now if the list had it
+/// in another state already.
+pub(crate) fn upload_later(
+    list: &HostList,
+    copy: &Arc<crate::resource::HostTexture>,
+) -> (Option<D3D12_RESOURCE_BARRIER>, Option<D3D12_RESOURCE_BARRIER>) {
+    (list.move_texture(copy, COPY_DEST), list.move_texture(copy, SHADER_RESOURCE))
+}
+
+/// The copies of an upload into host texture `copy` (in the copy
+/// destination state), its staging kept by `list`, and its counts.
+pub(crate) fn record_copies(
+    list: &HostList,
+    copy: &Arc<crate::resource::HostTexture>,
+    staging: &Staging,
+    (buffer, at): (&ID3D12Resource, u64),
+    subresources: &[Sub],
+) {
+    copies(list, &copy.texture, staging, (buffer, at), subresources);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    list.move_texture(copy, SHADER_RESOURCE)
 }
 
 /// The uploads [`record_upload`] recorded into `resource`'s host texture
