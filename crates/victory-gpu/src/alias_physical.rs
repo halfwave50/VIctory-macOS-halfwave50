@@ -2846,4 +2846,68 @@ void main(uint3 id : SV_DispatchThreadID)
         // SAFETY: querying device health.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    /// Verify mode tells a hazard new against copy mode from one copy mode
+    /// has too. The window case above (copy mode reads both ranges from one
+    /// window copy: new) and a page at two title addresses, one in a
+    /// scattered title buffer bound for writes, one a title buffer of one
+    /// page (copy mode: two copies, as before). With the one-range rule the
+    /// first submission still has the window case (the run was bound before
+    /// the window's copy took its view out); the next has none, and the
+    /// two-address page is a pair of copies, counted as copy mode's own.
+    /// With `=verify-ranges-old` both hazards stay.
+    #[test]
+    fn verify_tells_hazards_new_against_copy_mode_from_its_own() {
+        use crate::alias_verify::{Bind, check, forget_seen, take_submitted};
+        if !verify_on() {
+            return;
+        }
+        let heap = crate::alias::physical_heap(8 * PAGE).expect("a heap");
+        let (t, u) = (Title::new(192), Title::new(1));
+        let w0 = window_in(&t);
+        let block = crate::shadow::loose_window_bytes() as usize;
+        let k = (w0 - t.at) / PAGE;
+        t.show(&heap, k + 1, 2);
+        t.show(&heap, k + 2, 3);
+        t.show(&heap, k + 3, 0);
+        // The scattered buffer at the end of t (another window): heap pages
+        // 4 and 1; heap page 1 at u's page 0 too.
+        let b = t.page(t.pages - 2);
+        t.show(&heap, t.pages - 2, 4);
+        t.show(&heap, t.pages - 1, 1);
+        u.show(&heap, 0, 1);
+        crate::shadow::register(0xa1_00a0, b as u64, 2 * PAGE as u64);
+        crate::shadow::register(0xa1_00a1, u.page(0) as u64, PAGE as u64);
+        let outer = crate::shadow::find(b as u64, 16).expect("a copy");
+        let single = crate::shadow::find(u.page(0) as u64, 16).expect("a copy");
+        let window = crate::shadow::find((w0 + 16) as u64, 16).expect("the window's copy");
+        assert!(!outer.is_view() && !single.is_view() && !window.is_view(), "verify mode keeps copies");
+        let (r1, r2) = ((w0 + PAGE + 16) as u64, (w0 + 2 * PAGE + 16) as u64);
+        let bind = || {
+            forget_seen();
+            check(Bind::RootUav, &window, r1, 2 * PAGE as u64 - 32);
+            check(Bind::Root, &window, r2, PAGE as u64);
+            check(Bind::RootUav, &outer, b as u64, 2 * PAGE as u64);
+            check(Bind::Root, &single, u.page(0) as u64, PAGE as u64);
+            assert!(flush_now(), "a submission's flush");
+            take_submitted()
+        };
+        // Notes earlier tests left go with a first flush.
+        assert!(flush_now());
+        let _ = take_submitted();
+        let (one, two) = (bind(), bind());
+        eprintln!("{}: hazards, new, copy mode's own: {one:?} then {two:?}", crate::mac_switches::alias_physical().name());
+        if one_range() {
+            assert_eq!(one, [1, 1, 1], "the window case once (bound before the copy), new; the page pair copy mode's");
+            assert_eq!(two, [0, 0, 1], "none the next time; copy mode's own pair stays");
+        } else {
+            assert_eq!(one[..2], [2, 1], "both hazards, one new: {one:?}");
+            assert_eq!(two, one, "and again");
+        }
+        crate::shadow::unregister(0xa1_00a0, b as u64);
+        crate::shadow::unregister(0xa1_00a1, u.page(0) as u64);
+        drop((outer, single, window));
+        crate::shadow::forget_windows(w0 as u64, (w0 + 2 * block) as u64);
+        crate::shadow::forget_windows(b as u64, (b + 2 * PAGE) as u64);
+    }
 }
