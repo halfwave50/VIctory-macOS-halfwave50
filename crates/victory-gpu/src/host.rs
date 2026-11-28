@@ -1188,6 +1188,13 @@ pub(crate) mod tests {
     }
 }
 
+/// mac: list epochs (`VICTORY_TABLE_MEMO`): never the same twice.
+static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
 type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
 
 /// UAV writes and heap-writing draws in command-recording order.
@@ -1201,6 +1208,13 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
+    /// mac (`VICTORY_TABLE_MEMO`, from VIctory-macOS #462): changed, to a
+    /// value no list had, whenever a texture's state in the list or a depth
+    /// twin's changes, and with `deferred_epoch`; that one whenever the
+    /// list's sets of refreshes and slots asked are cleared (a title copy,
+    /// a reset). [`HostList::epoch`].
+    epoch: std::sync::atomic::AtomicU64,
+    deferred_epoch: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1691,6 +1705,8 @@ impl Host {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
+                epoch: next_epoch().into(),
+                deferred_epoch: next_epoch().into(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -3011,6 +3027,35 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.changed_deferred();
+    }
+
+    /// mac (`VICTORY_TABLE_MEMO`): what a remembered texture entry depends
+    /// on in the list changed.
+    pub(crate) fn changed_something(&self) {
+        self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// mac: the list's sets of refreshes and slots asked were cleared.
+    fn changed_deferred(&self) {
+        let next = next_epoch();
+        self.deferred_epoch.store(next, Ordering::Relaxed);
+        self.epoch.store(next, Ordering::Relaxed);
+    }
+
+    /// mac: the list's texture epoch (`VICTORY_TABLE_MEMO`).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// mac: the list's epoch of its refresh and slot sets.
+    pub(crate) fn deferred_epoch(&self) -> u64 {
+        self.deferred_epoch.load(Ordering::Relaxed)
+    }
+
+    /// mac: the steps the list has for submission time (the memo's check).
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -3058,6 +3103,9 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.changed_something();
+                }
                 (before != wanted).then_some(before)
             }
         }
@@ -3095,7 +3143,13 @@ impl HostList {
                 v.insert(crate::twin::Use::new(depth, side, writes));
                 None
             }
-            std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let copy = o.get_mut().again(side, writes);
+                if copy.is_some() || writes {
+                    self.changed_something();
+                }
+                copy
+            }
         }
     }
 
@@ -3516,6 +3570,8 @@ impl HostList {
         deferred.refreshed.clear();
         deferred.slots.clear();
         deferred.filled_scratch.clear();
+        drop(deferred);
+        self.changed_deferred();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -5438,6 +5494,8 @@ impl Meter {
             crate::placed_read::log(report_frames);
             // mac: the view table and its lock (`VICTORY_VIEW_INLINE`), always.
             crate::descriptor::log_views(report_frames);
+            // mac: `VICTORY_TABLE_MEMO` (VIctory-macOS #462), with it only.
+            crate::draw::table_memo::log(report_frames);
             crate::bindless::log_held(report_frames);
             crate::descriptor::pool::log(report_frames);
             crate::descriptor::reports::log(report_frames);

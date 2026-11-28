@@ -102,7 +102,13 @@ pub(crate) struct State {
     /// The run of indirect draws being recorded whose clamps go to the host
     /// list before (`crate::indirect::hoisting_at`).
     hoist: Option<Hoist>,
+    /// mac: table entries prepared in this list (`VICTORY_TABLE_MEMO`, from
+    /// VIctory-macOS #462; empty without it).
+    memo: table_memo::Memo,
 }
+
+/// mac: table entries a list prepared already (`VICTORY_TABLE_MEMO`).
+pub(crate) mod table_memo;
 
 /// Where the clamps of a run of indirect draws go: `clamps`, the host list
 /// before the one at `into`, still open, as long as that one has `writes`
@@ -347,6 +353,7 @@ impl State {
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
+        self.memo.clear();
         self.root_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
@@ -1591,7 +1598,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -1602,12 +1609,19 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view, true);
+        // mac: `VICTORY_TABLE_MEMO`: nothing to do if it stands as prepared.
+        let memo = self.memo.begin(list, Some((host, index)), handle, u.kind);
+        if matches!(memo, table_memo::Entry::Skip) {
+            return;
+        }
+        let view = host.mirror(index, handle, true);
+        if let Some(view) = &view {
+            readable(list, u, view, true);
         }
         if !heap.samplers() {
             list.defer_slot(&host.viewed, index);
         }
+        self.memo.end(list, memo, view.as_deref());
     }
 
     /// The descriptors a shader reads through tables, made from the
@@ -1685,9 +1699,15 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view, true);
+                    let memo = self.memo.begin(list, None, handle, u.kind);
+                    if matches!(memo, table_memo::Entry::Skip) {
+                        continue;
                     }
+                    let view = crate::descriptor::view(handle);
+                    if let Some(view) = &view {
+                        readable(list, u, view, true);
+                    }
+                    self.memo.end(list, memo, view.as_deref());
                 }
                 made.push((slot, first * 32));
                 continue;
@@ -2584,6 +2604,8 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    // mac: `VICTORY_TABLE_MEMO` (VIctory-macOS #462).
+    mod table_memo;
     mod tracked_rows;
 
     use super::*;
