@@ -1400,16 +1400,31 @@ mod tests {
     /// (`VICTORY_ASYNC_HEAP_SYNC=1`, else every flight is finished at the
     /// heap sync) and tracked memory (`VICTORY_FAULT_TRACKING=1`, else no
     /// copy is clean).
+    ///
+    /// The same with `alias,uploads2` (E2c), where the ask is set aside and
+    /// made after the finish because the landing told the copy.
     #[test]
     fn with_flights_a_clean_copy_the_one_left_lands_in_is_read_after_it() {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let flights = Flights::on();
+        a_clean_copy_is_read_after_the_landing(host, None);
+        a_clean_copy_is_read_after_the_landing(host, Some(Rule::E2c));
+    }
+
+    fn a_clean_copy_is_read_after_the_landing(host: &Host, rule: Option<Rule>) {
+        let (flights, switches) = match rule {
+            None => (Some(Flights::on()), None),
+            Some(rule) => match E2b::on(rule) {
+                Some(switches) => (None, Some(switches)),
+                None => return,
+            },
+        };
         if !crate::descriptor::ahead::on() || !crate::watch::fault_tracking() {
             eprintln!("skipped: needs VICTORY_ASYNC_HEAP_SYNC=1 and VICTORY_FAULT_TRACKING=1");
             return;
         }
+        let counts = flights::uploads2_counts();
         settle(By::Signal);
         let page = crate::watch::PAGE;
         let p = crate::watch::tests::pool(1);
@@ -1444,10 +1459,15 @@ mod tests {
         let read = copy.read_host(p as u64, 1)[0];
         settle(By::Signal);
         drop(flights);
-        assert_eq!(read, 0x2222_2222, "the second read what the first landed");
+        drop(switches);
+        assert_eq!(read, 0x2222_2222, "the second read what the first landed ({rule:?})");
         // (Left unless a diagnostics build captures.)
         if left {
             assert_eq!(flights::finished_for(flights::Why::Flush), flushes + 1, "finished for the held refresh");
+            if rule.is_some() {
+                let now = flights::uploads2_counts();
+                assert_eq!([now[6] - counts[6], now[7] - counts[7]], [1, 1], "set aside, and made as told");
+            }
         }
         crate::shadow::unregister(p, p as u64);
         drop(back);
@@ -1555,31 +1575,50 @@ mod tests {
         drop(take_done());
     }
 
-    /// mac: E2b's switches for a test (flights, `alias`, `uploads`), off
-    /// again when dropped; `None` (and a line) where the test cannot run:
-    /// it needs Rosetta (the aliasing) and the heap sync ahead
-    /// (`VICTORY_ASYNC_HEAP_SYNC=1`, else every flight is finished at the
-    /// heap sync, before the uploads).
+    /// mac: the two rules for the texture uploads beside the one left that
+    /// never finish it: E2b (`uploads`) and E2c (`uploads2`).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Rule {
+        E2b,
+        E2c,
+    }
+
+    /// mac: a rule's switches for a test (flights, `alias`, `uploads` or
+    /// `uploads2`), off again when dropped; `None` (and a line) where the
+    /// test cannot run: it needs Rosetta (the aliasing) and the heap sync
+    /// ahead (`VICTORY_ASYNC_HEAP_SYNC=1`, else every flight is finished at
+    /// the heap sync, before the uploads).
     struct E2b(#[allow(dead_code)] Flights);
 
     impl E2b {
-        fn on() -> Option<E2b> {
+        fn on(rule: Rule) -> Option<E2b> {
             let flights = Flights::on();
             if !crate::watch::rosetta() || !crate::descriptor::ahead::on() {
                 eprintln!("skipped: needs Rosetta and VICTORY_ASYNC_HEAP_SYNC=1");
                 return None;
             }
             flights::FORCED_ALIAS.store(true, Relaxed);
-            flights::FORCED_UPLOADS.store(true, Relaxed);
+            match rule {
+                Rule::E2b => flights::FORCED_UPLOADS.store(true, Relaxed),
+                Rule::E2c => flights::FORCED_UPLOADS2.store(true, Relaxed),
+            }
             Some(E2b(flights))
         }
     }
 
     impl Drop for E2b {
         fn drop(&mut self) {
+            flights::FORCED_UPLOADS2.store(false, Relaxed);
             flights::FORCED_UPLOADS.store(false, Relaxed);
             flights::FORCED_ALIAS.store(false, Relaxed);
         }
+    }
+
+    /// mac: whether texture `object` (host texture `copy`) is tracked (E2c:
+    /// else it is read once, after the finish, and no tracker is told).
+    fn tracked(object: crate::object::This, copy: &crate::resource::HostTexture) -> bool {
+        let staging = crate::texture::staging(object, &copy.texture).expect("staging");
+        staging.beside() != crate::flights::Beside::Later(crate::flights::Kept::Untracked)
     }
 
     /// mac: an RGBA8 128x128 linear texture over the page at `at`, its
@@ -1648,12 +1687,24 @@ mod tests {
     /// the first's bytes, not the old ones. A texture elsewhere, which the
     /// title changed, is uploaded beside it with the title's bytes and not
     /// kept.
+    ///
+    /// The same with `alias,uploads2` (E2c): the texture the first writes is
+    /// unchanged at the check, so it is not read then; the first's landing
+    /// tells its tracker (the declared range's copy-back), and it is brought
+    /// up after the finish as told (or, not tracked, read once after it).
+    /// The one elsewhere changed where nothing writes in place: read beside.
     #[test]
     fn with_flights_uploads_a_texture_the_one_left_writes_is_brought_up_after_it() {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let Some(switches) = E2b::on() else { return };
+        for rule in [Rule::E2b, Rule::E2c] {
+            the_one_left_writes_a_texture(host, rule);
+        }
+    }
+
+    fn the_one_left_writes_a_texture(host: &Host, rule: Rule) {
+        let Some(switches) = E2b::on(rule) else { return };
         settle(By::Signal);
         let page = crate::watch::PAGE;
         let aliased = crate::watch::tests::pool(1);
@@ -1662,6 +1713,8 @@ mod tests {
         let elsewhere = crate::watch::tests::pool(1);
         for (at, of_the_one_left) in [(elsewhere, false), (aliased, true)] {
             let (object, copy) = texture_over(host, at);
+            let is_tracked = tracked(object, &copy);
+            let counts = flights::uploads2_counts();
             let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
             // The first writes 0x22 over the aliased page on the GPU, as it
             // declares.
@@ -1703,8 +1756,24 @@ mod tests {
             if left {
                 assert_eq!(flights::finished_for(flights::Why::Uploads), finishes, "never finished for the uploads");
                 let more = u64::from(of_the_one_left);
-                assert_eq!(flights::kept_for(crate::flights::MET_DECLARED), kept + more, "kept only where it writes");
-                assert_eq!(flights::landed(), (landed + more, landed_uploads + more), "brought up after its finish");
+                if rule == Rule::E2b {
+                    assert_eq!(flights::kept_for(crate::flights::MET_DECLARED), kept + more, "kept only where it writes");
+                    assert_eq!(flights::landed(), (landed + more, landed_uploads + more), "brought up after its finish");
+                } else {
+                    // [changed, kept in place, kept untracked, now, told
+                    // (unchanged), told (read beside), stashed, made].
+                    let now = flights::uploads2_counts();
+                    let d: Vec<u64> = now.iter().zip(&counts).map(|(a, b)| a - b).collect();
+                    let want = match (is_tracked, of_the_one_left) {
+                        // Changed by the title elsewhere: read beside it.
+                        (true, false) => [1, 0, 0, 1, 0, 0],
+                        // Unchanged, told by the first's landing.
+                        (true, true) => [0, 0, 0, 0, 1, 0],
+                        // Not tracked: read once, after its finish.
+                        (false, _) => [1, 0, 1, 0, 0, 0],
+                    };
+                    assert_eq!(d[..6], want, "E2c's path for the texture (tracked {is_tracked}, the first's {of_the_one_left})");
+                }
             }
             drop(back);
             drop(take_done());
@@ -1718,16 +1787,27 @@ mod tests {
     /// copies the bytes back there; the texture is over the other view. It
     /// is kept for after the finish as at another address of such a page,
     /// and the second holds the landed bytes.
+    ///
+    /// With `uploads2` (E2c): unchanged at the check, not read then; the
+    /// landing's copy-back marks the trackers at both addresses, and it is
+    /// brought up after the finish as told.
     #[test]
     fn with_flights_uploads_a_texture_shown_where_the_one_left_lands_is_brought_up_after_it() {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let Some(switches) = E2b::on() else { return };
+        for rule in [Rule::E2b, Rule::E2c] {
+            the_one_left_lands_at_another_address(host, rule);
+        }
+    }
+
+    fn the_one_left_lands_at_another_address(host: &Host, rule: Rule) {
+        let Some(switches) = E2b::on(rule) else { return };
         settle(By::Signal);
         let page = crate::watch::PAGE;
         let (a, b) = crate::watch::tests::twin_views(1);
         let (object, copy) = texture_over(host, b);
+        let (is_tracked, counts) = (tracked(object, &copy), flights::uploads2_counts());
         crate::shadow::register(a, a as u64, page as u64);
         let host_copy = crate::shadow::find(a as u64, page as u64).expect("a host copy");
         assert!(!host_copy.is_aliased());
@@ -1758,9 +1838,85 @@ mod tests {
         assert!(texels.iter().all(|&x| x == 0x55), "the landed bytes, first bytes {:x?}", &texels[..8]);
         if left {
             assert_eq!(flights::finished_for(flights::Why::Uploads), finishes, "never finished for the uploads");
-            assert_eq!(flights::kept_for(crate::flights::MET_OTHER), kept + 1, "kept as at another address");
+            if rule == Rule::E2b {
+                assert_eq!(flights::kept_for(crate::flights::MET_OTHER), kept + 1, "kept as at another address");
+            } else {
+                let now = flights::uploads2_counts();
+                let d: Vec<u64> = now.iter().zip(&counts).map(|(a, b)| a - b).collect();
+                // [changed, kept in place, kept untracked, now, told
+                // (unchanged), told (read beside)].
+                let want = if is_tracked { [0, 0, 0, 0, 1, 0] } else { [1, 0, 1, 0, 0, 0] };
+                assert_eq!(d[..6], want, "E2c's path (tracked {is_tracked})");
+            }
         }
         crate::shadow::unregister(a, a as u64);
+        drop(back);
+        drop(take_done());
+        drop(switches);
+    }
+
+    /// mac: E2c (`VICTORY_FLIGHTS_WITH=alias,uploads2`): the first
+    /// submission's landing writes the memory of a texture the second
+    /// uploads, with nothing declared (work for after, written as a texture
+    /// copy-back or read-back lands, `crate::watch::writing`). The texture is
+    /// unchanged when the second's uploads are sorted beside the first, so
+    /// it is not read then; the landing's marks bring it up after the
+    /// finish, in the same upload list, from the state it was in, so the
+    /// second holds the landed bytes. A texture beside it that nothing
+    /// wrote is not uploaded at all. Needs tracked memory
+    /// (`VICTORY_FAULT_TRACKING=1`), Rosetta and the heap sync ahead.
+    #[test]
+    fn with_flights_uploads2_a_texture_the_landing_writes_unchanged_is_brought_up_through_its_marks() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !crate::watch::fault_tracking() {
+            eprintln!("skipped: needs VICTORY_FAULT_TRACKING=1");
+            return;
+        }
+        let Some(switches) = E2b::on(Rule::E2c) else { return };
+        settle(By::Signal);
+        let page = crate::watch::PAGE;
+        let (written, untouched) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
+        let (object, copy) = texture_over(host, written);
+        let (other, other_copy) = texture_over(host, untouched);
+        assert!(tracked(object, &copy) && tracked(other, &other_copy), "tracked textures");
+        let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+        // The first lands 0x44 over the texture's page when it is finished,
+        // declaring nothing.
+        lists[0].defer_after(move || {
+            let _writing = crate::watch::writing(written, page);
+            // SAFETY: the pool's page.
+            unsafe { std::ptr::write_bytes(written as *mut u8, 0x44, page) };
+        });
+        let (_back, read, bytes) = upload_and_read(host, &lists[1], object, &copy);
+        // The other is read by the second too (its bytes on the GPU are not
+        // asked: `texture_over`'s first upload list is never run).
+        crate::texture::upload(&lists[1], other, &other_copy.texture);
+        lists.iter().for_each(|l| l.close());
+        let (finishes, counts) = (flights::finished_for(flights::Why::Uploads), flights::uploads2_counts());
+        let uploads = [object, other].map(crate::texture::uploads);
+        let opener = hold_queue(host, 300);
+        let mut back = host.execute_title(1, vec![lists[0].clone()]);
+        let left = VALUE.load(Acquire) != 0;
+        back.extend(host.execute_title(1, vec![lists[1].clone()]));
+        opener.join().unwrap();
+        settle(By::Signal);
+        // SAFETY: the read-back buffer's mapping; its list has run.
+        let texels = unsafe { std::slice::from_raw_parts(read, bytes) };
+        assert!(texels.iter().all(|&x| x == 0x44), "the landed bytes, first bytes {:x?}", &texels[..8]);
+        assert_eq!(
+            [object, other].map(crate::texture::uploads),
+            [uploads[0] + 1, uploads[1]],
+            "the landed one uploaded once, the other not"
+        );
+        if left {
+            assert_eq!(flights::finished_for(flights::Why::Uploads), finishes, "never finished for the uploads");
+            let now = flights::uploads2_counts();
+            let d: Vec<u64> = now.iter().zip(&counts).map(|(a, b)| a - b).collect();
+            // Both unchanged at the check; the landed one told.
+            assert_eq!(d[..6], [0, 0, 0, 0, 1, 0], "brought up through the landing's marks");
+        }
         drop(back);
         drop(take_done());
         drop(switches);

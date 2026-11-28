@@ -2006,7 +2006,9 @@ impl Host {
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         // mac: with flights' `alias`, the one left is finished first where
         // their memory could meet what it writes; with `alias,uploads`
-        // (E2b) those textures are kept for after its finish instead.
+        // (E2b) those textures are kept for after its finish instead; with
+        // `alias,uploads2` (E2c) only changed ones are read now, and the
+        // others brought up after its finish where its landing told them.
         let uploads = (!heaps.is_empty() || !textures.is_empty())
             .then(|| {
                 crate::bindless::uploads_after(&heaps, &textures, &mut |work| {
@@ -2014,10 +2016,11 @@ impl Host {
                 })
             })
             .flatten();
-        // mac (E2b): once the one left is finished, for whatever reason,
-        // the textures kept are brought up at once (before any later step
-        // of this submission writes title memory, as the uploads came
-        // before them); nothing if none are kept.
+        // mac (E2b, E2c): once the one left is finished, for whatever
+        // reason, the textures kept (E2c: and those its landing told) are
+        // brought up at once (before any later step of this submission
+        // writes title memory, as the uploads came before them); nothing if
+        // none are kept.
         let land = |beside: &Option<unwaited::flights::Beside>| {
             if !beside.as_ref().is_some_and(unwaited::flights::Beside::running)
                 && let Some(uploads) = &uploads
@@ -2108,7 +2111,8 @@ impl Host {
             batch.early = true;
             batch.flush();
             batch.early = false;
-            if !held.is_empty() {
+            // mac (E2c): asks set aside are looked at only after its finish.
+            if !held.is_empty() || !batch.stash.0.is_empty() {
                 self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Flush);
                 land(&beside);
                 batch.refreshes = held;
@@ -3181,6 +3185,24 @@ impl HostList {
                 (before != wanted).then_some(before)
             }
         }
+    }
+
+    /// mac (E2c of flights): whether the list moves host texture `copy`
+    /// already (its prelude, made or to be made, starts it in the state its
+    /// first move asked for).
+    pub(crate) fn moves(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) -> bool {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(std::sync::Arc::as_ptr(copy) as usize))
+    }
+
+    /// mac (E2c of flights): the list holds host texture `copy` (one it
+    /// does not move, [`HostList::moves`]) until it has run, as starting
+    /// and leaving it in `state`, the state it is in: its prelude, if not
+    /// made yet, moves nothing for it, and a later move of it starts there.
+    pub(crate) fn holds_in(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, state: u32) {
+        let _ = self.track(copy, state);
     }
 
     /// [`HostList::transition`] for a host texture of ours (a twin's
@@ -4439,6 +4461,23 @@ struct Batch {
     /// mac: a title copy's step is running: its refresh batches count
     /// inside it ([`REFRESH_CLOCK`]).
     in_title_copy: bool,
+    /// mac (E2c of flights, `VICTORY_FLIGHTS_WITH=alias,uploads2`): asks for
+    /// clean copies made while the submission left still runs and that its
+    /// landing may tell, set aside ([`Batch::replay`]).
+    stash: Stashed,
+}
+
+/// mac (E2c): [`Batch::stash`]; asks never looked at again are counted
+/// when it goes (0 if the rules hold).
+#[derive(Default)]
+struct Stashed(crate::flights::Stash<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>);
+
+impl Drop for Stashed {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            unwaited::flights::lost(self.0.len());
+        }
+    }
 }
 
 /// For the frame line, since the last one: title copies (not into memory
@@ -4526,7 +4565,35 @@ fn refresh(shadow: &crate::shadow::Shadow, address: usize, len: usize, early: bo
 }
 
 impl Batch {
+    /// mac (E2c, `uploads2`): once the submission left is finished, the asks
+    /// set aside go into the refreshes where their copies were told of a
+    /// change since (by its landing, or anything else); a refresh of a copy
+    /// still clean would copy nothing (`Shadow::update` of a clean copy), so
+    /// the others are dropped. Before any refresh is made after the finish:
+    /// at the next ask, title copy or flush.
+    fn replay(&mut self) {
+        if self.stash.0.is_empty() || !unwaited::flights::beside_done() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let told = self.stash.0.told(|(shadow, _, _)| shadow.clean());
+        // `pending` names every copy in `refreshes` (refreshes held for after
+        // the finish were put back without it).
+        self.pending.clear();
+        for (i, (shadow, _)) in self.refreshes.iter().enumerate() {
+            self.pending.insert(std::sync::Arc::as_ptr(shadow) as usize, i);
+        }
+        let made = told.len();
+        for (shadow, address, len) in told {
+            self.add(&shadow, address, len);
+        }
+        unwaited::flights::replayed(made, started.elapsed());
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if !self.stash.0.is_empty() {
+            self.replay();
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         // Title memory that is the copy's own: nothing to copy, ever.
         if shadow.is_aliased() && len > 0 {
@@ -4543,6 +4610,12 @@ impl Batch {
         }
         if clean {
             unwaited::flights::kept_clean();
+            // mac (E2c): set aside, looked at again after its finish.
+            if unwaited::flights::with_uploads2() {
+                unwaited::flights::stashed();
+                self.stash.0.keep((shadow.clone(), address, len));
+                return;
+            }
         }
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
@@ -4604,6 +4677,8 @@ impl Batch {
     // it says so, the copy makes everything due again, as it may change
     // bytes any copy holds.
     fn title_copied(&mut self, at: usize, len: usize) {
+        // mac (E2c): what was set aside goes first, as it was asked first.
+        self.replay();
         if crate::watch::aliased(at, len) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
@@ -4664,6 +4739,8 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
+        // mac (E2c): with the asks set aside that were told.
+        self.replay();
         self.pending.clear();
         let work = std::mem::take(&mut self.refreshes);
         self.flush_work(work, false)

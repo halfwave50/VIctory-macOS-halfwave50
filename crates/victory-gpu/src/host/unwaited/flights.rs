@@ -62,6 +62,19 @@
 //! brought up into the same upload list as soon as it is finished, for
 //! whatever reason, at the latest just before the next goes to the GPU
 //! (`crate::bindless::Uploads::land_late`); the others are read beside it.
+//!
+//! With `uploads2` instead (`VICTORY_FLIGHTS_WITH=alias,uploads2`, E2c) the
+//! uploads do not finish it either, at a cost proportional to what changed:
+//! nothing is asked of what it may write. A texture changed since its last
+//! upload is read beside it, unless a page of it is in an aliased region
+//! (written in place while it runs) or it is not tracked: those are read
+//! once, after its finish. After its finish every other texture of the
+//! check is brought up if its tracker was told of a change meanwhile (its
+//! landing marks every tracker over what it writes back), in the same
+//! upload list, with barriers from the state it had before this
+//! submission (`crate::flights::Beside`). Asks for clean host copies its
+//! landing may tell are set aside, and only those whose copies were told
+//! are made after its finish (`crate::flights::Stash`).
 
 use super::*;
 
@@ -104,12 +117,19 @@ pub(in crate::host) static FORCED_WRITES: std::sync::atomic::AtomicBool = std::s
 #[cfg(test)]
 pub(in crate::host) static FORCED_UPLOADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Turns `uploads2` on for the tests (with [`FORCED_ALIAS`]).
+#[cfg(test)]
+pub(in crate::host) static FORCED_UPLOADS2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The names of `VICTORY_FLIGHTS_WITH` this build has (bits of
-/// `crate::flights::WITH`): `alias`, `writes`, `uploads`.
-const BUILT: u32 = 0b100_0011;
+/// `crate::flights::WITH`): `alias`, `writes`, `uploads`, `uploads2`.
+const BUILT: u32 = 0b1100_0011;
 
 /// `uploads`' bit in `crate::flights::WITH`.
 const UPLOADS_BIT: u32 = 1 << 6;
+
+/// `uploads2`' bit in `crate::flights::WITH`.
+const UPLOADS2_BIT: u32 = 1 << 7;
 
 /// mac: `VICTORY_FLIGHTS_WITH=<list>` (`notes/overlap-stages-design.md` §6),
 /// read once: the overlap line's increments taken, as bits of
@@ -161,20 +181,48 @@ fn with() -> u32 {
                  latest before the next goes to the GPU; the others are read beside it"
             );
         }
+        if taken & UPLOADS2_BIT != 0 {
+            tracing::info!(
+                "VICTORY_FLIGHTS_WITH=uploads2: the texture uploads of a submission prepared beside the one before do \
+                 not finish that one, at a cost proportional to what changed: a texture changed since its last \
+                 upload is read beside it, unless it is in an aliased region or not tracked (read once after its \
+                 finish); after its finish the check's other textures whose trackers its landing told are brought \
+                 up into the same upload list; asks for clean copies its landing may tell are set aside and made \
+                 only where it told them"
+            );
+        }
         taken
     })
 }
 
-/// mac: whether the texture uploads beside the submission left keep what
-/// it may write for after its finish instead of finishing it
-/// (`VICTORY_FLIGHTS_WITH=alias,uploads`, E2b of
-/// `notes/overlap-stages-design.md`).
+/// mac: whether the texture uploads beside the submission left never
+/// finish it (`VICTORY_FLIGHTS_WITH=alias,uploads`, E2b of
+/// `notes/overlap-stages-design.md`, or `alias,uploads2`, E2c).
 pub(crate) fn with_uploads() -> bool {
     #[cfg(test)]
-    if FORCED_UPLOADS.load(Relaxed) {
+    if FORCED_UPLOADS.load(Relaxed) || FORCED_UPLOADS2.load(Relaxed) {
         return with_alias();
     }
-    on() && with() & UPLOADS_BIT != 0
+    on() && with() & (UPLOADS_BIT | UPLOADS2_BIT) != 0
+}
+
+/// mac: whether that is E2c's rule (`VICTORY_FLIGHTS_WITH=alias,uploads2`):
+/// textures read beside it only where they changed and the GPU cannot be
+/// writing them, the others brought up after its finish where its landing
+/// told their trackers; clean copies' asks set aside
+/// (`crate::flights::Beside`, `crate::flights::Stash`).
+pub(crate) fn with_uploads2() -> bool {
+    #[cfg(test)]
+    if FORCED_UPLOADS2.load(Relaxed) {
+        return with_alias();
+    }
+    on() && with() & UPLOADS2_BIT != 0
+}
+
+/// E2b's rule (`uploads`, not `uploads2`): the footprint works out its
+/// [`Footprint::upload`].
+fn with_reach() -> bool {
+    with_uploads() && !with_uploads2()
 }
 
 /// Whether flights take zero-copy title buffers (`VICTORY_FLIGHTS_WITH=alias`).
@@ -288,6 +336,113 @@ static LATE_BY: [AtomicU64; WHYS] = [const { AtomicU64::new(0) }; WHYS];
 /// The [`Why`] of the last finish beside a submission prepared.
 static LAST_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(Why::Give as usize);
 
+/// With `uploads` or `uploads2`, since the last frame line: microseconds of
+/// the upload checks beside it, a clock pair around each whole check (E2b:
+/// its look at every texture, and the footprint work that asks for; E2c:
+/// the sort of the check's textures, [`checked`]); footprints worked out
+/// and their microseconds (every flights arm works them out; counted here).
+static CHECK_US: AtomicU64 = AtomicU64::new(0);
+static FOOTPRINTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With `uploads2` (E2c), since the last frame line, indices below: checks
+/// beside it, the textures in them; of those, changed since their last
+/// upload (looked at), kept for after its finish (changed in an aliased
+/// region, not tracked), read beside it; after its finish: landings of
+/// checks, their trackers asked again, textures not asked as no texture
+/// page was marked since the check, brought up as told (unchanged at the
+/// check, read beside it), uploaded of those, kept ones uploaded, the
+/// landings' microseconds; clean copies' asks set aside, made after its
+/// finish, the microseconds that took, and asks lost (never made: 0).
+static U2: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+const U2_CHECKS: usize = 0;
+const U2_TEXTURES: usize = 1;
+const U2_CHANGED: usize = 2;
+const U2_KEPT: usize = 3;
+const U2_NOW: usize = 5;
+const U2_LANDINGS: usize = 6;
+const U2_ASKED: usize = 7;
+const U2_SKIPPED: usize = 8;
+const U2_TOLD: usize = 9;
+const U2_UPLOADED: usize = 11;
+const U2_KEPT_UPLOADED: usize = 12;
+const U2_LATE_US: usize = 13;
+const U2_STASHED: usize = 14;
+const U2_MADE: usize = 15;
+const U2_REPLAY_US: usize = 16;
+const U2_LOST: usize = 17;
+const U2_KEPT_BROUGHT: usize = 18;
+
+/// mac (E2c): an upload check beside the submission left sorted `textures`:
+/// `changed` of them changed since their last upload, `kept` of those kept
+/// for after its finish by [`crate::flights::Kept`], `now` read beside it,
+/// in `took` (the whole check, the sort and the noting of states).
+pub(crate) fn checked(textures: usize, changed: usize, kept: [usize; 2], now: usize, took: Duration) {
+    U2[U2_CHECKS].fetch_add(1, Relaxed);
+    U2[U2_TEXTURES].fetch_add(textures as u64, Relaxed);
+    U2[U2_CHANGED].fetch_add(changed as u64, Relaxed);
+    for (k, n) in kept.iter().enumerate() {
+        U2[U2_KEPT + k].fetch_add(*n as u64, Relaxed);
+    }
+    U2[U2_NOW].fetch_add(now as u64, Relaxed);
+    CHECK_US.fetch_add(took.as_micros() as u64, Relaxed);
+}
+
+/// What an E2c landing after the finish did ([`landed2`]).
+#[derive(Default)]
+pub(crate) struct Landed2 {
+    /// Textures whose trackers were asked again, and those not asked (no
+    /// texture page marked since the check).
+    pub(crate) asked: usize,
+    pub(crate) skipped: usize,
+    /// Brought up as told: unchanged at the check, read beside it; of all
+    /// those, uploaded (their refresh found bytes to copy).
+    pub(crate) told: [usize; 2],
+    pub(crate) uploaded: usize,
+    /// The kept ones brought up, and of them uploaded.
+    pub(crate) kept: usize,
+    pub(crate) kept_uploaded: usize,
+}
+
+/// mac (E2c): the textures of a check were brought up after the finish of
+/// the submission left (`crate::bindless::Uploads::land_late`), in `took`;
+/// counted by the finish they followed.
+pub(crate) fn landed2(l: &Landed2, took: Duration) {
+    U2[U2_LANDINGS].fetch_add(1, Relaxed);
+    U2[U2_ASKED].fetch_add(l.asked as u64, Relaxed);
+    U2[U2_SKIPPED].fetch_add(l.skipped as u64, Relaxed);
+    for (k, n) in l.told.iter().enumerate() {
+        U2[U2_TOLD + k].fetch_add(*n as u64, Relaxed);
+    }
+    U2[U2_UPLOADED].fetch_add(l.uploaded as u64, Relaxed);
+    U2[U2_KEPT_BROUGHT].fetch_add(l.kept as u64, Relaxed);
+    U2[U2_KEPT_UPLOADED].fetch_add(l.kept_uploaded as u64, Relaxed);
+    U2[U2_LATE_US].fetch_add(took.as_micros() as u64, Relaxed);
+    LATE_BY[LAST_WHY.load(Relaxed).min(WHYS - 1)].fetch_add(1, Relaxed);
+}
+
+/// mac (E2c): an ask for a clean copy set aside (`crate::host::Batch`).
+pub(crate) fn stashed() {
+    U2[U2_STASHED].fetch_add(1, Relaxed);
+}
+
+/// mac (E2c): asks set aside were looked at again after the finish:
+/// `made` of them went into the refreshes, in `took`.
+pub(crate) fn replayed(made: usize, took: Duration) {
+    U2[U2_MADE].fetch_add(made as u64, Relaxed);
+    U2[U2_REPLAY_US].fetch_add(took.as_micros() as u64, Relaxed);
+}
+
+/// mac (E2c): asks set aside that were never looked at again (0 if the
+/// rules hold: every path finishes the one left before its last flush).
+pub(crate) fn lost(asks: usize) {
+    U2[U2_LOST].fetch_add(asks as u64, Relaxed);
+}
+
+/// mac: the upload check took `took` (E2b's, with `uploads`).
+pub(crate) fn checked_reach(took: Duration) {
+    CHECK_US.fetch_add(took.as_micros() as u64, Relaxed);
+}
+
 /// What the submission left may write or will write once it is finished,
 /// read from it under the submission lock when first needed.
 pub(in crate::host) struct Footprint {
@@ -379,7 +534,8 @@ impl Footprint {
             kept.add(at, at + n);
         }
         kept.join();
-        let upload = with_uploads().then(|| Footprint::upload_of(left));
+        // mac: E2b only; E2c asks nothing of it for the uploads.
+        let upload = with_reach().then(|| Footprint::upload_of(left));
         Footprint { landing: crate::flights::Landing { every: left.memory, spans, others }, written, kept, upload }
     }
 
@@ -428,10 +584,15 @@ pub(crate) struct Shared {
 impl Shared {
     fn footprint(&self) -> &Footprint {
         self.footprint.get_or_init(|| {
-            LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(
+            // mac: timed for the uploads' part of the flights line.
+            let started = Instant::now();
+            let footprint = LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(
                 || Footprint { landing: crate::flights::Landing { every: true, ..Default::default() }, ..Footprint::empty() },
                 Footprint::of,
-            )
+            );
+            FOOTPRINTS[0].fetch_add(1, Relaxed);
+            FOOTPRINTS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            footprint
         })
     }
 
@@ -469,6 +630,13 @@ pub(crate) fn with_landing<R>(f: impl FnOnce(Option<&crate::flights::Landing>) -
         let now = n.borrow();
         f(now.as_ref().filter(|s| !s.done.load(Acquire)).map(|s| s.landing()))
     })
+}
+
+/// mac (E2c): whether nothing runs beside the submission this thread
+/// prepares any more (none left, or it was finished), without working out
+/// its footprint (asked under a heap's lock: working it out takes them).
+pub(crate) fn beside_done() -> bool {
+    NOW.with(|n| n.borrow().as_ref().is_none_or(|s| s.done.load(Acquire)))
 }
 
 /// An ask for a clean copy kept for after the finish (the frame line).
@@ -519,7 +687,7 @@ impl Footprint {
             landing: Default::default(),
             written: Default::default(),
             kept: Default::default(),
-            upload: with_uploads()
+            upload: with_reach()
                 .then(|| Mutex::new((0, crate::flights::UploadReach { every: true, ..Default::default() }))),
         }
     }
@@ -709,21 +877,30 @@ impl Host {
     /// With `alias,uploads` (E2b) it is not finished: the indices returned
     /// are those of `work` to bring up only once it is
     /// (`crate::bindless::Uploads::land_late`), which [`kept_for_later`]
-    /// picks.
+    /// picks. With `alias,uploads2` (E2c) it is not finished either, and
+    /// nothing is asked of it: the check sorts its textures itself
+    /// (`crate::bindless::Reads::Again`).
     pub(in crate::host) fn beside_texture_reads(
         &self,
         submitted: &mut u64,
         beside: &mut Option<Beside>,
         work: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)],
-    ) -> Vec<usize> {
+    ) -> crate::bindless::Reads {
+        use crate::bindless::Reads;
         if !with_alias() || work.is_empty() {
-            return Vec::new();
+            return Reads::Now;
         }
-        let Some(b) = beside.as_mut().filter(|b| b.running()) else { return Vec::new() };
+        let Some(b) = beside.as_mut().filter(|b| b.running()) else { return Reads::Now };
         UPLOADS[0].fetch_add(1, Relaxed);
+        if with_uploads2() {
+            return Reads::Again;
+        }
+        let started = Instant::now();
         let footprint = b.footprint();
         if let Some(upload) = &footprint.upload {
-            return kept_for_later(upload, work);
+            let kept = kept_for_later(upload, work);
+            checked_reach(started.elapsed());
+            return Reads::Keep(kept);
         }
         let met = work.iter().find_map(|(staging, _)| {
             let (at, len) = staging.title_range();
@@ -733,7 +910,7 @@ impl Host {
             UPLOADS[k].fetch_add(1, Relaxed);
             self.finish_beside(submitted, beside, Why::Uploads);
         }
-        Vec::new()
+        Reads::Now
     }
 }
 
@@ -859,8 +1036,78 @@ fn uploads_line(frames: f64) -> String {
         } else {
             String::new()
         },
-        if with_uploads() { kept_line(frames) } else { String::new() }
+        if with_uploads2() {
+            uploads2_line(frames)
+        } else if with_uploads() {
+            kept_line(frames)
+        } else {
+            String::new()
+        }
     )
+}
+
+/// The ms a frame of the upload checks and the footprints worked out (how
+/// many a frame, ms), for both E2b's and E2c's parts.
+fn clocks(frames: f64) -> (f64, f64, f64) {
+    let check = CHECK_US.swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let [n, us] = FOOTPRINTS.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    (check, n, us / 1000.0)
+}
+
+/// The flights line's part for `VICTORY_FLIGHTS_WITH=alias,uploads2` (E2c).
+fn uploads2_line(frames: f64) -> String {
+    let c: [u64; 19] = std::array::from_fn(|i| U2[i].swap(0, Relaxed));
+    let by: [f64; WHYS] = std::array::from_fn(|i| LATE_BY[i].swap(0, Relaxed) as f64 / frames);
+    let f = |n: u64| n as f64 / frames;
+    let ms = |us: u64| us as f64 / 1000.0 / frames;
+    let (check_ms, footprints, footprint_ms) = clocks(frames);
+    // Looked at: the changed ones, and those unchanged at the check that
+    // were brought up after (those read beside it and told again are among
+    // the changed).
+    format!(
+        "; uploads2: of those checks ({checks:.1}/frame, {textures:.0} textures/frame in them), {looked:.0} \
+         textures/frame looked at ({changed:.0} changed since their last upload, sorted at the check; {told_clean:.1} \
+         unchanged then, brought up after its finish as their trackers were told since); kept for after its finish \
+         {kept:.1} (changed in an aliased region {in_place:.1}, not tracked whole {untracked:.1}), read beside it \
+         {now:.1}; \
+         {landings:.1}/frame landings after the finish by (the 13 above) {by:.1?}: trackers asked again {asked:.0}, \
+         {skipped:.0} not asked as no texture page was marked since the check, brought up as told {told_clean:.1} \
+         unchanged at the check and {told_again:.1} read beside it ({uploaded:.1} of them uploaded), kept ones \
+         brought up {kept_brought:.1} ({kept_uploaded:.1} uploaded); clocks: the checks {check_ms:.2} ms/frame, the \
+         landings after the finish {late_ms:.2} ms/frame, footprints worked out {footprints:.1}/frame in \
+         {footprint_ms:.2} ms; {stashed:.0}/frame asks for clean copies set aside, {made:.0} of them made after its \
+         finish (told) in {replay_ms:.2} ms/frame, {lost:.0} lost (0 if the rules hold)",
+        checks = f(c[U2_CHECKS]),
+        textures = f(c[U2_TEXTURES]),
+        looked = f(c[U2_CHANGED] + c[U2_TOLD]),
+        changed = f(c[U2_CHANGED]),
+        kept = f(c[U2_KEPT] + c[U2_KEPT + 1]),
+        in_place = f(c[U2_KEPT + crate::flights::Kept::InPlace as usize]),
+        untracked = f(c[U2_KEPT + crate::flights::Kept::Untracked as usize]),
+        now = f(c[U2_NOW]),
+        landings = f(c[U2_LANDINGS]),
+        asked = f(c[U2_ASKED]),
+        skipped = f(c[U2_SKIPPED]),
+        told_clean = f(c[U2_TOLD]),
+        told_again = f(c[U2_TOLD + 1]),
+        uploaded = f(c[U2_UPLOADED]),
+        kept_brought = f(c[U2_KEPT_BROUGHT]),
+        kept_uploaded = f(c[U2_KEPT_UPLOADED]),
+        late_ms = ms(c[U2_LATE_US]),
+        stashed = f(c[U2_STASHED]),
+        made = f(c[U2_MADE]),
+        replay_ms = ms(c[U2_REPLAY_US]),
+        lost = f(c[U2_LOST]),
+    )
+}
+
+/// E2c's counts so far (tests): changed at the checks, kept by
+/// [`crate::flights::Kept`], read beside it, brought up as told (unchanged
+/// at the check, read beside it), asks set aside and made.
+#[cfg(test)]
+pub(super) fn uploads2_counts() -> [u64; 8] {
+    let c = |i: usize| U2[i].load(Relaxed);
+    [c(U2_CHANGED), c(U2_KEPT), c(U2_KEPT + 1), c(U2_NOW), c(U2_TOLD), c(U2_TOLD + 1), c(U2_STASHED), c(U2_MADE)]
 }
 
 /// The flights line's part for `VICTORY_FLIGHTS_WITH=alias,uploads` (E2b).
@@ -871,6 +1118,8 @@ fn kept_line(frames: f64) -> String {
     let f = |n: u64| n as f64 / frames;
     let kept: u64 = c[KEPT_BY..KEPT_BY + 4].iter().sum();
     let per = |n: u64| if c[SAMPLED] == 0 { 0.0 } else { n as f64 / c[SAMPLED] as f64 };
+    // mac: the clocks E2c added, for comparison (counts only).
+    let (check_ms, footprints, footprint_ms) = clocks(frames);
     format!(
         "; uploads: of those checks, {looked:.0} textures/frame looked at ({changed:.0} changed since their last \
          upload); {met:.1}/frame kept {kept:.1} textures/frame for after its finish instead of finishing it (as it \
@@ -878,7 +1127,9 @@ fn kept_line(frames: f64) -> String {
          views reach {h:.1}, at another address of such a page {o:.1}); {landings:.1}/frame landings of them, after \
          the finish by (the 13 above) {by:.1?}, brought up {brought:.1} textures/frame, {uploaded:.1} of them \
          changed, in {late_ms:.1} ms/frame; {anew:.1}/frame other addresses looked up again; one check in {SAMPLE} \
-         ({sampled:.1}/frame): {t:.0} textures a check, {a:.0} in aliased memory, {s:.0} shown at another address too",
+         ({sampled:.1}/frame): {t:.0} textures a check, {a:.0} in aliased memory, {s:.0} shown at another address \
+         too; clocks: the checks {check_ms:.2} ms/frame, footprints worked out {footprints:.1}/frame in \
+         {footprint_ms:.2} ms",
         looked = f(c[LOOKED]),
         changed = f(c[CHANGED]),
         met = f(c[KEPT_CHECKS]),
