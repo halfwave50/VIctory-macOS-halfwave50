@@ -1,5 +1,7 @@
 //! Title submissions the host GPU is not waited for
-//! (`VICTORY_ASYNC_SUBMIT=1`; off by default, and then nothing here runs).
+//! (`VICTORY_ASYNC_SUBMIT=1`; off by default, and then nothing here runs
+//! but the submission lock, [`Host::submissions`], and the counting of
+//! [`lines`]).
 //!
 //! The idea and its settle points are Belobug's (fork commits 2bfe95a,
 //! a049b48, eebcf07, 9b89ec2, bdecda3, cf57ca3, a59f3e5), written again for

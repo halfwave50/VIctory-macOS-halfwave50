@@ -274,30 +274,129 @@ pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Opti
 /// mac: E1 of `notes/overlap-stages-design.md` (lines only): per thread that
 /// calls us, the microseconds inside our queue calls (the outermost one),
 /// waiting for the held-work lock and waiting for the submission lock, since
-/// the last frame line. A thread takes its slot once, without a lock; past
-/// [`threads::SLOTS`] threads share the last one (id 0).
+/// the last frame line. This counting runs on every queue call whatever the
+/// switches (only the line needs `VICTORY_ASYNC_SUBMIT=1`;
+/// `crate::host::unwaited::lines` has its cost).
+///
+/// A thread takes one of [`threads::SLOTS`] rows at its first count (under
+/// a lock, once) and gives it back when it ends; what it counted since the
+/// last line is then kept under its id for that line, and the row starts
+/// again at zero for the next thread. A count itself is a thread-local read
+/// and an atomic add, as before. The threads past the rows at once count
+/// together in one more row, with how many shared it (a thread there stays
+/// there), as do threads that end past [`threads::ENDED`] since the last
+/// line (so that nothing grows while no line is made).
 pub(crate) mod threads {
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::time::Instant;
 
+    /// Threads with a row of their own at once.
     pub(crate) const SLOTS: usize = 16;
+
+    /// Threads that ended since the last line kept under their own ids.
+    pub(crate) const ENDED: usize = 64;
+
+    /// The row the threads past [`SLOTS`] share.
+    const SHARED: usize = SLOTS;
+
+    /// No row yet (or given back).
+    const NONE: usize = usize::MAX;
 
     /// What a thread's time went on.
     #[derive(Clone, Copy)]
     pub(crate) enum Spent {
-        Inside = 1,
-        Held = 2,
-        Lock = 3,
+        Inside = 0,
+        Held = 1,
+        Lock = 2,
     }
 
-    /// Per slot: the thread's id, then microseconds by [`Spent`].
-    static TABLE: [[AtomicU64; 4]; SLOTS] = [const { [const { AtomicU64::new(0) }; 4] }; SLOTS];
-    static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+    /// Per row, microseconds by [`Spent`]: [`SLOTS`] rows of one thread
+    /// each, then [`SHARED`].
+    static US: [[AtomicU64; 3]; SLOTS + 1] = [const { [const { AtomicU64::new(0) }; 3] }; SLOTS + 1];
+
+    /// Who holds the rows: taken when a thread takes or gives back its row,
+    /// and by [`take`]; never on a count.
+    static ROWS: Mutex<Rows> =
+        Mutex::new(Rows { ids: [None; SLOTS], ended: Vec::new(), shared_now: 0, shared_ended: 0 });
+
+    struct Rows {
+        /// Per row, the id of the thread that holds it.
+        ids: [Option<u64>; SLOTS],
+        /// Threads that ended since the last take: id, microseconds.
+        ended: Vec<(u64, [u64; 3])>,
+        /// Threads counting in [`SHARED`] now,
+        shared_now: usize,
+        /// and those that counted there and ended since the last take.
+        shared_ended: usize,
+    }
+
+    fn rows() -> std::sync::MutexGuard<'static, Rows> {
+        ROWS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     thread_local! {
-        static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+        /// The thread's row, read on every count (nothing to drop, so the
+        /// read costs what it did).
+        static SLOT: Cell<usize> = const { Cell::new(NONE) };
+        /// Gives the row back when the thread ends (touched once, when the
+        /// thread takes its row).
+        static GIVE_BACK: GiveBack = const { GiveBack(Cell::new(NONE)) };
         static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Gives the thread's row (`.0`) back when the thread ends.
+    struct GiveBack(Cell<usize>);
+
+    impl Drop for GiveBack {
+        fn drop(&mut self) {
+            // A count after this (from another local's drop) takes a row
+            // again, and as it can no longer give one back, shares one.
+            let _ = SLOT.try_with(|s| s.set(NONE));
+            let row = self.0.get();
+            let mut rows = rows();
+            if row == SHARED {
+                rows.shared_now = rows.shared_now.saturating_sub(1);
+                rows.shared_ended += 1;
+            } else if let Some(id) = rows.ids.get_mut(row).and_then(Option::take) {
+                // Its row starts again at zero; what it counted stays its own.
+                let us = US[row].each_ref().map(|u| u.swap(0, Relaxed));
+                if us != [0; 3] {
+                    if rows.ended.len() < ENDED {
+                        rows.ended.push((id, us));
+                    } else {
+                        for (k, u) in us.into_iter().enumerate() {
+                            US[SHARED][k].fetch_add(u, Relaxed);
+                        }
+                        rows.shared_ended += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row for the thread's first count: a free one, or the shared one.
+    #[cold]
+    fn claim() -> usize {
+        let id = id();
+        let mut rows = rows();
+        // Its own row only if it can be given back (not from the drop of
+        // another of the thread's locals once this one is gone).
+        match rows.ids.iter().position(Option::is_none) {
+            Some(i) if GIVE_BACK.try_with(|g| g.0.set(i)).is_ok() => {
+                rows.ids[i] = Some(id);
+                i
+            }
+            _ if GIVE_BACK.try_with(|g| g.0.set(SHARED)).is_ok() => {
+                rows.shared_now += 1;
+                SHARED
+            }
+            _ => {
+                rows.shared_ended += 1;
+                SHARED
+            }
+        }
     }
 
     /// The thread's id as the table shows it (the Windows thread id).
@@ -315,17 +414,15 @@ pub(crate) mod threads {
 
     fn slot() -> usize {
         SLOT.with(|s| {
-            if s.get() == usize::MAX {
-                let i = CLAIMED.fetch_add(1, Relaxed).min(SLOTS - 1);
-                TABLE[i][0].store(if i < SLOTS - 1 { id() } else { 0 }, Relaxed);
-                s.set(i);
+            if s.get() == NONE {
+                s.set(claim());
             }
             s.get()
         })
     }
 
     pub(crate) fn add(spent: Spent, us: u64) {
-        TABLE[slot()][spent as usize].fetch_add(us, Relaxed);
+        US[slot()][spent as usize].fetch_add(us, Relaxed);
     }
 
     /// Times the thread's outermost call of ours while it lives.
@@ -350,15 +447,31 @@ pub(crate) mod threads {
         }
     }
 
-    /// Since the last call, per thread with anything: its id and the
-    /// microseconds inside, held, lock (then zero).
-    pub(crate) fn take() -> Vec<(u64, [u64; 3])> {
-        (0..CLAIMED.load(Relaxed).min(SLOTS))
-            .filter_map(|i| {
-                let us = [1, 2, 3].map(|k| TABLE[i][k].swap(0, Relaxed));
-                (us != [0; 3]).then(|| (TABLE[i][0].load(Relaxed), us))
-            })
-            .collect()
+    /// What [`take`] found.
+    pub(crate) struct Taken {
+        /// Per thread with anything, those that ended included: its id and
+        /// the microseconds inside, held, lock.
+        pub(crate) threads: Vec<(u64, [u64; 3])>,
+        /// The threads past the rows together, if they counted anything:
+        /// how many (there now, or there and ended since the last take) and
+        /// their microseconds.
+        pub(crate) shared: Option<(usize, [u64; 3])>,
+    }
+
+    /// Since the last take (then zero).
+    pub(crate) fn take() -> Taken {
+        let mut rows = rows();
+        let mut threads = std::mem::take(&mut rows.ended);
+        for (row, id) in rows.ids.iter().enumerate() {
+            let Some(id) = *id else { continue };
+            let us = US[row].each_ref().map(|u| u.swap(0, Relaxed));
+            if us != [0; 3] {
+                threads.push((id, us));
+            }
+        }
+        let us = US[SHARED].each_ref().map(|u| u.swap(0, Relaxed));
+        let many = rows.shared_now + std::mem::take(&mut rows.shared_ended);
+        Taken { threads, shared: (us != [0; 3]).then_some((many.max(1), us)) }
     }
 }
 
@@ -515,11 +628,19 @@ mod tests {
         }
     }
 
+    /// The tests of E1's table, one at a time (a take takes what all counted).
+    static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn threads_alone() -> std::sync::MutexGuard<'static, ()> {
+        THREADS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// E1's table: each thread its own slot, only the outermost call timed,
     /// the waits added as they come, zero after a take.
     #[test]
     fn each_thread_counts_its_outermost_call_and_its_waits() {
         use threads::{Inside, Spent, add, id, take};
+        let _alone = threads_alone();
         let ids: Vec<u64> = (0..2u64)
             .map(|k| {
                 std::thread::spawn(move || {
@@ -538,13 +659,98 @@ mod tests {
             })
             .collect();
         assert_ne!(ids[0], ids[1]);
-        let seen = take();
+        let seen = take().threads;
         for (k, me) in ids.iter().enumerate() {
             let &(_, [inside, held, lock]) = seen.iter().find(|(i, _)| i == me).expect("the thread's slot");
             assert!((20_000..1_000_000).contains(&inside), "once, not twice: {inside}");
             assert_eq!((held, lock), (1000 * (k as u64 + 1), 7));
         }
-        assert!(take().iter().all(|(i, _)| !ids.contains(i)), "zero after a take");
+        assert!(take().threads.iter().all(|(i, _)| !ids.contains(i)), "zero after a take");
+    }
+
+    /// A thread gives its row back when it ends: more threads than rows,
+    /// counting one after another (each ended before the next starts), each
+    /// keep their own figures under their own ids, none starting from what
+    /// the one before left in the row.
+    #[test]
+    fn threads_one_after_another_past_the_rows_each_keep_their_own_figures() {
+        use threads::{SLOTS, Spent, add, id, take};
+        let _alone = threads_alone();
+        take();
+        let ids: Vec<u64> = (0..2 * SLOTS as u64 + 1)
+            .map(|k| {
+                std::thread::spawn(move || {
+                    add(Spent::Held, 1000 + k);
+                    add(Spent::Lock, k + 1);
+                    id()
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        let seen = take();
+        for (k, &me) in ids.iter().enumerate() {
+            let k = k as u64;
+            assert!(seen.threads.contains(&(me, [0, 1000 + k, k + 1])), "thread {k} on its own: {:?}", seen.threads);
+        }
+        // (Under Wine, the host tests' threads count too.)
+        if cfg!(not(windows)) {
+            assert_eq!(seen.threads.len(), ids.len());
+            assert!(seen.shared.is_none(), "{:?}", seen.shared);
+        }
+    }
+
+    /// The threads past the rows at once count together in one more row,
+    /// with how many shared it; once they end, the rows are free again.
+    #[test]
+    fn threads_past_the_rows_at_once_count_together_with_how_many() {
+        use std::sync::{Arc, Barrier};
+        use threads::{SLOTS, Spent, add, id, take};
+        let _alone = threads_alone();
+        take();
+        let n = SLOTS + 4;
+        let (counted, taken) = (Arc::new(Barrier::new(n + 1)), Arc::new(Barrier::new(n + 1)));
+        let live: Vec<_> = (0..n as u64)
+            .map(|k| {
+                let (counted, taken) = (counted.clone(), taken.clone());
+                std::thread::spawn(move || {
+                    add(Spent::Held, 1);
+                    add(Spent::Lock, k + 1);
+                    counted.wait();
+                    taken.wait();
+                    id()
+                })
+            })
+            .collect();
+        // All of them live, each having counted.
+        counted.wait();
+        let seen = take();
+        taken.wait();
+        let ids: Vec<u64> = live.into_iter().map(|t| t.join().unwrap()).collect();
+        let own: Vec<usize> = (0..n).filter(|&k| seen.threads.contains(&(ids[k], [0, 1, k as u64 + 1]))).collect();
+        let rest = n - own.len();
+        let rest_lock: u64 = (0..n).filter(|k| !own.contains(k)).map(|k| k as u64 + 1).sum();
+        let (shared, us) = seen.shared.expect("the threads past the rows, together");
+        assert!(own.len() <= SLOTS, "{own:?}");
+        if cfg!(windows) {
+            // Under Wine, the host tests' threads may hold rows or share it too.
+            assert!(shared >= rest && us[1] >= rest as u64 && us[2] >= rest_lock, "{shared} {us:?}");
+        } else {
+            assert_eq!(own.len(), SLOTS, "a row each");
+            assert_eq!((shared, us), (n - SLOTS, [0, (n - SLOTS) as u64, rest_lock]));
+        }
+        // They ended: a thread after them has a row of its own.
+        let after = std::thread::spawn(|| {
+            add(Spent::Held, 5);
+            id()
+        })
+        .join()
+        .unwrap();
+        let seen = take();
+        assert!(seen.threads.contains(&(after, [0, 5, 0])), "{:?}", seen.threads);
+        if cfg!(not(windows)) {
+            assert!(seen.shared.is_none(), "{:?}", seen.shared);
+        }
     }
 
     #[test]
