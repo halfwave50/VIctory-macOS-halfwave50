@@ -728,6 +728,7 @@ pub(crate) mod tests {
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
@@ -768,6 +769,7 @@ pub(crate) mod tests {
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
         // No submission takes the marks meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
@@ -815,6 +817,7 @@ pub(crate) mod tests {
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
             // No submission takes the marks meanwhile.
+            let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
@@ -860,6 +863,7 @@ pub(crate) mod tests {
         let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
         viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
         // No submission uploads meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
@@ -896,6 +900,7 @@ pub(crate) mod tests {
             })
             .collect();
         // No submission uploads meanwhile.
+        let _shared = unwaited::shared(); // (the test lock first, as a submission takes them)
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
         for &object in &objects {
