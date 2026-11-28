@@ -2183,6 +2183,9 @@ impl Host {
                 group.push(mark.list());
             }
             let queue = self.queue();
+            // mac: stage 2's tile changes (`VICTORY_ALIAS_PHYSICAL=gpu`), on
+            // the queue before the lists; the GPU is idle here.
+            crate::alias_physical::flush(&queue);
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
                 // All native calls share the existing fence signal and wait.

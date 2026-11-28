@@ -31,6 +31,9 @@ mod ambient_estimate_set;
 mod ambient_set;
 #[cfg(windows)]
 mod alias;
+// mac: stage 2's GPU side (`VICTORY_ALIAS_PHYSICAL=gpu`).
+#[cfg(windows)]
+mod alias_physical;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod alias_plan;
@@ -130,6 +133,10 @@ mod tdr;
 mod texback;
 #[cfg(windows)]
 mod texture;
+// mac: stage 2's tile plan (`VICTORY_ALIAS_PHYSICAL`); plain std, so its
+// tests run everywhere.
+#[cfg(any(windows, test))]
+mod tile_plan;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
@@ -159,12 +166,31 @@ pub use alias::{
     alias_region, committed as alias_committed, enabled as alias_buffers, unalias_region,
     uncommitted as alias_uncommitted,
 };
-#[cfg(all(windows, feature = "diagnostics"))]
+// mac: in every build (`VICTORY_ALIAS_PHYSICAL=cpu`).
+#[cfg(windows)]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use physical_runs::{mapped as physical_mapped, unmapped as physical_unmapped};
+// mac: stage 2's counts (`notes/alias-physical-design.md`, I0).
+#[cfg(windows)]
+pub use physical_runs::{
+    counting as physical_counts, mapped_in as physical_mapped_in,
+    pages_changed as physical_pages_changed, reserved as physical_reserved,
+    section as physical_section, shown_changed as physical_shown_changed,
+    shown_delta as physical_shown_delta, tally_call as physical_tally_call,
+    view_remap_retried as physical_view_remap_retried,
+};
+// mac: stage 2's GPU side (`notes/alias-physical-design.md`, I3b).
+#[cfg(windows)]
+pub use alias_physical::{
+    flush_now as alias_physical_flush_now, mapped as alias_physical_mapped,
+    reserved as alias_physical_reserved, tile_at as alias_physical_tile_at,
+    unmapped as alias_physical_unmapped,
+};
+#[cfg(windows)]
+pub use physical_runs::gpu_mode as physical_gpu_mode;
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

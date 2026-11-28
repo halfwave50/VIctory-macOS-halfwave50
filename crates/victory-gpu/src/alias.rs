@@ -32,7 +32,6 @@ use windows_sys::Win32::System::Memory::{
 use crate::host::host;
 use crate::watch::PAGE;
 
-#[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -605,16 +604,23 @@ fn supported() -> Option<bool> {
 
 /// CPU-visible backing for XMem physical pages. The placed buffer keeps a
 /// CPU mapping of the heap from which reserved resources can take tiles.
-#[cfg(any(test, feature = "diagnostics"))]
+///
+/// mac: in every build, with `VICTORY_ALIAS_PHYSICAL=cpu` ([`physical_heap`]).
 pub struct PhysicalHeap {
     backing: ID3D12Resource,
     // A placed buffer must keep its heap alive.
     pub(crate) _heap: ID3D12Heap,
     address: usize,
     len: usize,
+    /// mac: made by [`physical_heap`], so counted in stage 2's line until
+    /// dropped (the probes make their own).
+    counted: bool,
+    /// mac: with `VICTORY_ALIAS_PHYSICAL=gpu`, its number among the heaps the
+    /// reservations' pieces are tiled from (`crate::alias_physical`); its
+    /// last tile, past the section's pages, is then the sink.
+    id: Option<u32>,
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl PhysicalHeap {
     pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
         let desc = D3D12_HEAP_DESC {
@@ -669,7 +675,15 @@ impl PhysicalHeap {
             _heap: heap,
             address: address as usize,
             len,
+            counted: false,
+            id: None,
         })
+    }
+
+    /// mac: its number among the heaps the reservations' pieces are tiled
+    /// from (`VICTORY_ALIAS_PHYSICAL=gpu`), if it is one.
+    pub fn id(&self) -> Option<u32> {
+        self.id
     }
 
     /// The CPU view, valid for the lifetime of this heap.
@@ -704,29 +718,109 @@ impl PhysicalHeap {
     }
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {
     fn drop(&mut self) {
         // SAFETY: unmapped once, while the placed buffer still owns the view.
         unsafe { self.backing.Unmap(0, None) };
+        if let Some(id) = self.id {
+            crate::alias_physical::heap_dropped(id);
+        }
+        if self.counted {
+            // The section's bytes, without the sink tile `=gpu` adds.
+            crate::physical_runs::heap_freed(self.len - if self.id.is_some() { PAGE } else { 0 });
+        }
     }
 }
 
-/// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.
-#[cfg(feature = "diagnostics")]
+/// mac: whether the title's physical sections get heaps
+/// (`VICTORY_ALIAS_PHYSICAL=cpu`, `gpu` or `gpu-single`, or VIctory-macOS #275's diagnostics trial
+/// `VICTORY_PHYSICAL_TILES=1`), asked once, at the title's first physical
+/// allocation. The switch needs the aliasing on ([`enabled`]: Rosetta, the
+/// copy-order split, no flights; `notes/alias-physical-design.md`). Both need
+/// the remap probe ([`supported`]), which makes the host device if nothing
+/// has yet: a heap needs it, whatever came first.
+pub(crate) fn physical_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let mode = crate::mac_switches::alias_physical();
+        let asked = mode.heaps();
+        let trial = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_PHYSICAL_TILES");
+        if !asked && !trial {
+            return false;
+        }
+        let name = if asked { mode.name() } else { "VICTORY_PHYSICAL_TILES=1" };
+        let refused = if asked && !enabled() {
+            Some(
+                "it needs VICTORY_ALIAS_BUFFERS on (Rosetta, VICTORY_COPY_ORDER=split, no VICTORY_FLIGHTS), which is off \
+                 or refused",
+            )
+        } else if supported().is_none() {
+            Some("the mach_vm_remap probe failed or could not run (not Rosetta, or no host device)")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            tracing::warn!("{name} refused: {why}; the title's physical pages stay in pagefile sections");
+            return false;
+        }
+        crate::physical_runs::backing_on();
+        tracing::info!(
+            "{name}: each of the title's physical-page allocations is backed by a CPU-visible D3D12 heap, and every \
+             title view of its pages is remapped onto it (mach_vm_remap, VIctory-macOS #275); DirectStorage writes \
+             go to the heap; {}; a view that cannot be remapped fails the title's map; counters at the end of the \
+             physical pages line",
+            if mode.gpu() {
+                "the GPU reads them through reserved buffers tiled from the heaps (stage 2's GPU side)"
+            } else {
+                "the GPU still reads the pages through host copies (stage 2's heap backing alone)"
+            }
+        );
+        true
+    })
+}
+
+/// CPU-visible backing for a physical section of `len` bytes
+/// (`victory_hle`'s `XMemAllocatePhysicalPages`), when [`physical_on`];
+/// `None` keeps the section a pagefile section.
 pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some())
-        || len == 0
-        || !len.is_multiple_of(PAGE)
-    {
+    if len == 0 || !len.is_multiple_of(PAGE) || !physical_on() {
         return None;
     }
     let host = host()?;
-    match PhysicalHeap::new(&host.device, len) {
-        Ok(heap) => Some(heap),
+    let started = std::time::Instant::now();
+    // mac: with the GPU side (`=gpu`), one more tile past the pages: the sink
+    // the pieces' unmapped tiles show (`crate::alias_physical`).
+    let gpu = crate::alias_physical::on();
+    match PhysicalHeap::new(&host.device, len + if gpu { PAGE } else { 0 }) {
+        Ok(mut heap) => {
+            heap.counted = true;
+            if gpu {
+                heap.id = Some(crate::alias_physical::heap_made(
+                    &heap._heap,
+                    len,
+                    heap.address + len,
+                ));
+            }
+            let [sections, bytes] = crate::physical_runs::heap_made(len);
+            tracing::info!(
+                mb = len >> 20,
+                ms = started.elapsed().as_millis() as u64,
+                cpu = format_args!("{:#x}", heap.cpu_address()),
+                sections,
+                total_mb = bytes >> 20,
+                "VICTORY_ALIAS_PHYSICAL: a physical section of mb MiB is backed by a CPU-visible D3D12 heap at cpu, \
+                 made in ms; sections and total_mb: all heap-backed sections now"
+            );
+            Some(heap)
+        }
         Err(error) => {
-            tracing::warn!(len, %error, "physical tile heap unavailable; using a file section");
+            crate::physical_runs::heap_refused();
+            tracing::warn!(
+                len,
+                mb = len >> 20,
+                %error,
+                "VICTORY_ALIAS_PHYSICAL: no CPU-visible heap that large; this section stays a pagefile section"
+            );
             None
         }
     }

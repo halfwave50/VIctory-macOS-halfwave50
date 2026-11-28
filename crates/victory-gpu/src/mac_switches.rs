@@ -1118,6 +1118,109 @@ pub(crate) fn heap_sync_threads(value: Option<&str>, split: bool, most: usize) -
     if split { asked.clamp(1, most.max(1)) } else { 1 }
 }
 
+/// mac: what `VICTORY_ALIAS_PHYSICAL` asks of the title's physical pages
+/// (stage 2, `notes/alias-physical-design.md`; `crate::alias::physical_heap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AliasPhysical {
+    /// Unset, empty or `0`: nothing, not even the counts (`crate::physical_runs`);
+    /// each section is a pagefile section, as before.
+    Off,
+    /// `count`, or a value that names nothing built: stage 2's counts alone.
+    Count,
+    /// `cpu`: each section is backed by a CPU-visible D3D12 heap and every
+    /// title view of its pages is remapped onto it (VIctory-macOS #275's
+    /// section heap): the heap backing alone, with the counts; the GPU still
+    /// reads the pages through host copies.
+    Cpu,
+    /// `gpu`: `cpu`, and one reserved buffer per piece of each placeholder
+    /// reservation, tiled from the heaps as the title maps its pages
+    /// (`crate::alias_physical`). A range that is one unbroken run of one
+    /// section's pages is a view of a placed buffer over that section's heap
+    /// (canonical: every title address of a page reaches one GPU range);
+    /// other ranges in one piece are views of the piece.
+    Gpu,
+    /// `gpu-tiles`: `gpu` without the section views: every range in one piece
+    /// is a view of the piece (I4's order, for comparison).
+    GpuTiles,
+    /// `gpu-single`: `gpu-tiles`, but a range with a page shown at two or
+    /// more addresses keeps its copy (`notes/alias-physical-design.md` §3).
+    GpuSingle,
+}
+
+impl AliasPhysical {
+    /// Whether the title's sections get heaps.
+    pub(crate) fn heaps(self) -> bool {
+        matches!(
+            self,
+            AliasPhysical::Cpu
+                | AliasPhysical::Gpu
+                | AliasPhysical::GpuTiles
+                | AliasPhysical::GpuSingle
+        )
+    }
+
+    /// Whether the GPU reads the pages through the reservations' pieces.
+    pub(crate) fn gpu(self) -> bool {
+        matches!(
+            self,
+            AliasPhysical::Gpu | AliasPhysical::GpuTiles | AliasPhysical::GpuSingle
+        )
+    }
+
+    /// Whether runs of a section's pages are views of the section's heap
+    /// (`=gpu`, canonical views first).
+    pub(crate) fn canonical(self) -> bool {
+        self == AliasPhysical::Gpu
+    }
+
+    /// The switch as written.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            AliasPhysical::Off => "VICTORY_ALIAS_PHYSICAL unset",
+            AliasPhysical::Count => "VICTORY_ALIAS_PHYSICAL=count",
+            AliasPhysical::Cpu => "VICTORY_ALIAS_PHYSICAL=cpu",
+            AliasPhysical::Gpu => "VICTORY_ALIAS_PHYSICAL=gpu",
+            AliasPhysical::GpuTiles => "VICTORY_ALIAS_PHYSICAL=gpu-tiles",
+            AliasPhysical::GpuSingle => "VICTORY_ALIAS_PHYSICAL=gpu-single",
+        }
+    }
+}
+
+/// [`AliasPhysical`], read once (at the title's first `xmem` call that asks).
+/// Any other value gives the counts alone, with a warning.
+pub(crate) fn alias_physical() -> AliasPhysical {
+    static RULE: OnceLock<AliasPhysical> = OnceLock::new();
+    *RULE.get_or_init(|| {
+        let value = std::env::var("VICTORY_ALIAS_PHYSICAL").ok();
+        let (rule, known) = alias_physical_rule(value.as_deref());
+        if !known {
+            tracing::warn!(
+                "VICTORY_ALIAS_PHYSICAL={}: not one of count, cpu, gpu, gpu-tiles and gpu-single; stage 2's counts alone",
+                value.as_deref().unwrap_or_default()
+            );
+        }
+        if rule != AliasPhysical::Off {
+            tracing::info!(
+                "VICTORY_ALIAS_PHYSICAL: stage 2's counts of the title's physical pages, in the physical pages line"
+            );
+        }
+        rule
+    })
+}
+
+/// [`alias_physical`]'s rule, and whether the value names something built.
+fn alias_physical_rule(value: Option<&str>) -> (AliasPhysical, bool) {
+    match value.map(str::trim) {
+        None | Some("" | "0") => (AliasPhysical::Off, true),
+        Some("count") => (AliasPhysical::Count, true),
+        Some("cpu") => (AliasPhysical::Cpu, true),
+        Some("gpu") => (AliasPhysical::Gpu, true),
+        Some("gpu-tiles") => (AliasPhysical::GpuTiles, true),
+        Some("gpu-single") => (AliasPhysical::GpuSingle, true),
+        Some(_) => (AliasPhysical::Count, false),
+    }
+}
+
 /// A switch's state: `0` off, `1` on, anything else (and unset) `default`.
 fn setting(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -1203,9 +1306,47 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, overlapping_rule, quick, setting,
-        spans_rule, texture_workers, uav_size, whole_wave_lds, writers,
+        AliasPhysical, alias_physical_rule, copy_order, epoch, heap_locks, heap_sync_pause,
+        heap_sync_threads, key, overlapping_rule, quick, setting, spans_rule, texture_workers,
+        uav_size, whole_wave_lds, writers,
     };
+
+    #[test]
+    fn alias_physical_counts_only_when_set() {
+        assert!(AliasPhysical::Gpu.heaps() && AliasPhysical::Gpu.gpu());
+        assert!(AliasPhysical::Gpu.canonical());
+        for tiles in [AliasPhysical::GpuTiles, AliasPhysical::GpuSingle] {
+            assert!(tiles.heaps() && tiles.gpu() && !tiles.canonical(), "{tiles:?}");
+        }
+        assert!(AliasPhysical::Cpu.heaps() && !AliasPhysical::Cpu.gpu());
+        assert!(!AliasPhysical::Count.heaps() && !AliasPhysical::Off.heaps());
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(
+                alias_physical_rule(off),
+                (AliasPhysical::Off, true),
+                "{off:?}"
+            );
+        }
+        for (value, rule) in [
+            ("count", AliasPhysical::Count),
+            (" count ", AliasPhysical::Count),
+            ("cpu", AliasPhysical::Cpu),
+            (" cpu ", AliasPhysical::Cpu),
+            ("gpu", AliasPhysical::Gpu),
+            ("gpu-tiles", AliasPhysical::GpuTiles),
+            ("gpu-single", AliasPhysical::GpuSingle),
+        ] {
+            assert_eq!(alias_physical_rule(Some(value)), (rule, true), "{value:?}");
+        }
+        // Any other value: the counts, with a warning.
+        for other in [Some("1"), Some("GPU"), Some("CPU"), Some("yes")] {
+            assert_eq!(
+                alias_physical_rule(other),
+                (AliasPhysical::Count, false),
+                "{other:?}"
+            );
+        }
+    }
 
     thread_local! {
         /// `snapshot_spans` is on for this thread's snapshots ([`SpansHere`]).

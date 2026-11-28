@@ -981,10 +981,17 @@ impl HostHeap {
     }
 
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
-    /// resource view and a raw unordered access view of the first `bytes`
-    /// (a multiple of 4) of `buffer`, which they hold; null views for no
-    /// buffer.
-    pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
+    /// resource view and a raw unordered access view of `bytes` (a multiple
+    /// of 4) of `buffer` from byte `first` on (mac: a view of a piece of a
+    /// reservation starts at its base there), which they hold; null views for
+    /// no buffer.
+    pub(crate) fn raw_pair_at(
+        &self,
+        index: u32,
+        buffer: Option<&ID3D12Resource>,
+        first: u64,
+        bytes: u64,
+    ) {
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
         // a longer copy's rest reads 0 through it.
@@ -995,7 +1002,7 @@ impl HostHeap {
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: 0,
+                    FirstElement: if buffer.is_some() { first / 4 } else { 0 },
                     NumElements: elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
@@ -1007,6 +1014,7 @@ impl HostHeap {
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: if buffer.is_some() { first / 4 } else { 0 },
                     NumElements: elements,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
                     ..Default::default()
@@ -3501,7 +3509,7 @@ mod tests {
         assert_eq!(heap.address_at(first), Some(0), "a root view");
         heap.make_at(first, &view);
         heap.make_at(first + 1, &view);
-        heap.raw_pair_at(first, None, 0);
+        heap.raw_pair_at(first, None, 0, 0);
         assert_eq!(heap.address_at(first), Some(0), "a view pair");
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
         // Slots past the dynamic ones (host copies' view pairs) have no
