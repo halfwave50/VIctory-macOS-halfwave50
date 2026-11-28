@@ -2001,7 +2001,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         // mac: with flights' `alias`, the one left is finished first where
-        // their memory could meet what it writes.
+        // their memory could meet what it writes; with `alias,uploads`
+        // (E2b) those textures are kept for after its finish instead.
         let uploads = (!heaps.is_empty() || !textures.is_empty())
             .then(|| {
                 crate::bindless::uploads_after(&heaps, &textures, &mut |work| {
@@ -2009,6 +2010,17 @@ impl Host {
                 })
             })
             .flatten();
+        // mac (E2b): once the one left is finished, for whatever reason,
+        // the textures kept are brought up at once (before any later step
+        // of this submission writes title memory, as the uploads came
+        // before them); nothing if none are kept.
+        let land = |beside: &Option<unwaited::flights::Beside>| {
+            if !beside.as_ref().is_some_and(unwaited::flights::Beside::running)
+                && let Some(uploads) = &uploads
+            {
+                uploads.land_late();
+            }
+        };
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         // mac: the barriers of a joined piece, by run (an upload list first
@@ -2058,8 +2070,12 @@ impl Host {
             // Its first title copy opens a list the copy-order split cut.
             batch.cut = list.after_copy();
             self.poll_beside(&mut submitted, &mut beside);
+            land(&beside);
             if beside.as_ref().is_some_and(unwaited::flights::Beside::running) {
-                let mut gate = |step: &Step| self.beside_step(&mut submitted, &mut beside, step);
+                let mut gate = |step: &Step| {
+                    self.beside_step(&mut submitted, &mut beside, step);
+                    land(&beside);
+                };
                 list.run_deferred(&mut batch, Some(&mut gate));
             } else {
                 list.run_deferred(&mut batch, None);
@@ -2090,6 +2106,7 @@ impl Host {
             batch.early = false;
             if !held.is_empty() {
                 self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Flush);
+                land(&beside);
                 batch.refreshes = held;
             }
         }
@@ -2099,6 +2116,8 @@ impl Host {
         batch.log_refreshes(*submitted + 1, runs.len());
         // mac: one submission on the host GPU at a time.
         self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Give);
+        // (E2b: the upload list is closed here at the latest.)
+        land(&beside);
         // Time finishing it is not this one's preparing.
         let aside = beside.as_ref().map_or(Duration::ZERO, |b| b.finishing);
         let prepared = std::time::Instant::now();

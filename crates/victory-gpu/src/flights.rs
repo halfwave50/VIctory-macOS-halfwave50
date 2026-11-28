@@ -128,13 +128,122 @@ pub(crate) fn after_writes(writes: &[(usize, Option<u64>, usize)], address: usiz
 }
 
 /// mac: the names `VICTORY_FLIGHTS_WITH=<list>` takes, each building on the
-/// ones before it (`notes/overlap-stages-design.md` §6).
-pub(crate) const WITH: [&str; 6] = ["alias", "writes", "copies", "ring", "relay", "present"];
+/// ones before it (`notes/overlap-stages-design.md` §6), but `uploads`
+/// (E2b, a refinement of `alias`), which needs `alias` only ([`NEEDS`]).
+pub(crate) const WITH: [&str; 7] = ["alias", "writes", "copies", "ring", "relay", "present", "uploads"];
+
+/// The names each of [`WITH`] needs taken first (bits).
+const NEEDS: [u32; 7] = [0, 0b1, 0b11, 0b111, 0b1111, 0b1_1111, 0b1];
+
+/// mac: `VICTORY_FLIGHTS_WITH=alias,uploads` (E2b of
+/// `notes/overlap-stages-design.md`): what the texture uploads of the
+/// submission prepared beside the one left may not read before that one is
+/// finished, in whole pages (the grain of the write marks, of the trackers
+/// and of the links between addresses). In place of E2's rule (whole copies
+/// its heaps view for unordered access, and any page shown at another
+/// address whenever it writes anything): the ranges it declared its shaders
+/// write and its landing lands in (read-backs, texture copy-backs) with its
+/// bottom-of-pipe writes; the ranges its heaps' unordered views reach, not
+/// the whole copies they are in; and the other addresses of those pages
+/// only. With title-memory programs: everything.
+#[derive(Debug, Default)]
+pub(crate) struct UploadReach {
+    /// It runs programs that use title memory (they write at addresses
+    /// they compute): every texture.
+    pub(crate) every: bool,
+    /// What its lists declared and what it lands in, its bottom-of-pipe
+    /// writes (pages, joined).
+    pub(crate) declared: Spans,
+    /// What its heaps view for unordered access (pages, joined).
+    pub(crate) heaps: Spans,
+    /// The pages that show a page of those two at another address (joined).
+    pub(crate) others: Spans,
+}
+
+/// The reasons [`UploadReach::meets`] gives, as indices.
+pub(crate) const MET_EVERY: usize = 0;
+pub(crate) const MET_DECLARED: usize = 1;
+pub(crate) const MET_HEAPS: usize = 2;
+pub(crate) const MET_OTHER: usize = 3;
+
+impl UploadReach {
+    /// Whether a texture over title memory `[at, at + len)` (what its
+    /// refresh may read) is to be read only once the one left is finished,
+    /// and why ([`MET_EVERY`] to [`MET_OTHER`]); none for an empty range.
+    pub(crate) fn meets(&self, at: usize, len: usize) -> Option<usize> {
+        if len == 0 {
+            None
+        } else if self.every {
+            Some(MET_EVERY)
+        } else if self.declared.touches(at, len) {
+            Some(MET_DECLARED)
+        } else if self.heaps.touches(at, len) {
+            Some(MET_HEAPS)
+        } else if self.others.touches(at, len) {
+            Some(MET_OTHER)
+        } else {
+            None
+        }
+    }
+
+    /// Whether it may write nothing at all (no texture meets it).
+    pub(crate) fn nothing(&self) -> bool {
+        !self.every && self.declared.is_empty() && self.heaps.is_empty()
+    }
+}
+
+impl Spans {
+    /// [`Spans::add`] of `[from, to)` widened to whole pages of `page`
+    /// bytes (a power of two).
+    pub(crate) fn add_pages(&mut self, from: usize, to: usize, page: usize) {
+        if from < to {
+            self.add(from & !(page - 1), to.checked_next_multiple_of(page).unwrap_or(usize::MAX));
+        }
+    }
+}
+
+/// mac: the union of ranges `[start, end)` given as the counts of their
+/// starts and of their ends (`crate::bindless`'s per-copy census), each run
+/// of it to `each` in order; ranges that touch are one run.
+pub(crate) fn union_of(
+    starts: &std::collections::BTreeMap<u64, u32>,
+    ends: &std::collections::BTreeMap<u64, u32>,
+    mut each: impl FnMut(u64, u64),
+) {
+    let (mut s, mut e) = (starts.iter().peekable(), ends.iter().peekable());
+    let (mut depth, mut open) = (0i64, 0u64);
+    loop {
+        // At one place, starts before ends: touching ranges stay one run.
+        let start_first = match (s.peek(), e.peek()) {
+            (Some(&(&a, _)), Some(&(&b, _))) => a <= b,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if start_first {
+            let (&at, &n) = s.next().expect("peeked");
+            if depth == 0 {
+                open = at;
+            }
+            depth += i64::from(n);
+        } else {
+            let (&at, &n) = e.next().expect("peeked");
+            depth -= i64::from(n);
+            if depth <= 0 {
+                if open < at {
+                    each(open, at);
+                }
+                depth = 0;
+            }
+        }
+    }
+}
 
 /// `VICTORY_FLIGHTS_WITH`'s rule: of the comma list `value`, the names taken
 /// (bit `i` for [`WITH`]`[i]`), and a line for each one refused: unknown, not
-/// in this build (`built`, the bits it has), asked without every name before
-/// it, or refused by `refuse(i)` for a reason of its own.
+/// in this build (`built`, the bits it has), asked without every name it
+/// needs ([`NEEDS`]: the ones before it), or refused by `refuse(i)` for a
+/// reason of its own.
 pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Option<&'static str>) -> (u32, Vec<String>) {
     let mut asked = 0u32;
     let mut refused = Vec::new();
@@ -148,8 +257,9 @@ pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Opti
     for (i, name) in WITH.iter().enumerate().filter(|&(i, _)| asked & 1 << i != 0) {
         let why = if built & 1 << i == 0 {
             Some("not in this build".to_owned())
-        } else if taken != (1 << i) - 1 {
-            Some(format!("it needs {} first", WITH[..i].join(",")))
+        } else if taken & NEEDS[i] != NEEDS[i] {
+            let needed: Vec<&str> = (0..WITH.len()).filter(|&k| NEEDS[i] & 1 << k != 0).map(|k| WITH[k]).collect();
+            Some(format!("it needs {} first", needed.join(",")))
         } else {
             refuse(i).map(str::to_owned)
         };
@@ -306,6 +416,103 @@ mod tests {
         let (taken, refused) = with_names("alias,writes", 0b11, |i| (i == 0).then_some("the heap worker"));
         assert_eq!(taken, 0);
         assert_eq!(refused, ["alias: the heap worker", "writes: it needs alias first"]);
+        // E2b's `uploads` needs `alias` only, wherever it is in the list.
+        let built = 0b100_0011;
+        assert_eq!(with_names("alias,uploads", built, none), (0b100_0001, vec![]));
+        assert_eq!(with_names("uploads,writes,alias", built, none), (0b100_0011, vec![]));
+        let (taken, refused) = with_names("uploads", built, none);
+        assert_eq!(taken, 0);
+        assert_eq!(refused, ["uploads: it needs alias first"]);
+        let (taken, refused) = with_names("alias,uploads", 0b11, none);
+        assert_eq!(taken, 1);
+        assert_eq!(refused, ["uploads: not in this build"]);
+    }
+
+    /// E2b: an upload beside the one left waits for it only where it may
+    /// write or land, in whole pages: what it declared or lands in, what its
+    /// heaps' unordered views reach, those pages' other addresses; with
+    /// title-memory programs, everything; elsewhere, nothing.
+    #[test]
+    fn an_upload_meets_the_one_left_only_where_it_may_write() {
+        const PAGE: usize = 0x1_0000;
+        let mut reach = UploadReach::default();
+        assert!(reach.nothing());
+        // A 0x100-byte declaration and bottom-of-pipe word: their pages.
+        reach.declared.add_pages(0x10_0040, 0x10_0140, PAGE);
+        reach.declared.add_pages(0x30_fff8, 0x31_0000, PAGE);
+        // An unordered view over two pages and a byte.
+        reach.heaps.add_pages(0x50_0000, 0x52_0001, PAGE);
+        // A page of those shown at another address.
+        reach.others.add_pages(0x90_0000, 0x91_0000, PAGE);
+        for s in [&mut reach.declared, &mut reach.heaps, &mut reach.others] {
+            s.join();
+        }
+        assert!(!reach.nothing());
+        assert_eq!(reach.declared.ranges(), &[(0x10_0000, 0x11_0000), (0x30_0000, 0x31_0000)]);
+        assert_eq!(reach.heaps.ranges(), &[(0x50_0000, 0x53_0000)]);
+        // A texture sharing a page with a declaration (not its bytes) meets it.
+        assert_eq!(reach.meets(0x10_8000, 0x1000), Some(MET_DECLARED));
+        assert_eq!(reach.meets(0x30_0000, 0x10), Some(MET_DECLARED));
+        assert_eq!(reach.meets(0x52_ff00, 0x8000), Some(MET_HEAPS));
+        assert_eq!(reach.meets(0x8f_0000, 0x1_0001), Some(MET_OTHER));
+        // Next to them, and empty: not.
+        assert_eq!(reach.meets(0x11_0000, 0x1_0000), None);
+        assert_eq!(reach.meets(0x53_0000, 0x3d_0000), None, "up to the other address's page");
+        assert_eq!(reach.meets(0x10_8000, 0), None);
+        // Title-memory programs: all of it.
+        let every = UploadReach { every: true, ..UploadReach::default() };
+        assert!(!every.nothing());
+        assert_eq!(every.meets(0x7000_0000, 0x10), Some(MET_EVERY));
+        assert_eq!(every.meets(0x7000_0000, 0), None);
+        // Pages at the top of memory do not wrap.
+        let mut top = Spans::default();
+        top.add_pages(usize::MAX - 0x10, usize::MAX, PAGE);
+        top.join();
+        assert!(top.touches(usize::MAX - 1, 1));
+    }
+
+    /// The census keeps, per copy, the counts of its ranges' starts and
+    /// ends: their union is found from those alone, touching and nested
+    /// ranges one run, the same range twice once.
+    #[test]
+    fn the_union_of_ranges_comes_from_their_starts_and_ends() {
+        let union = |ranges: &[(u64, u64)]| {
+            let (mut starts, mut ends) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
+            for &(a, b) in ranges {
+                *starts.entry(a).or_insert(0u32) += 1;
+                *ends.entry(b).or_insert(0u32) += 1;
+            }
+            let mut out = Vec::new();
+            union_of(&starts, &ends, |a, b| out.push((a, b)));
+            out
+        };
+        assert_eq!(union(&[]), []);
+        assert_eq!(union(&[(10, 20)]), [(10, 20)]);
+        assert_eq!(union(&[(10, 20), (20, 30)]), [(10, 30)], "touching");
+        assert_eq!(union(&[(10, 40), (15, 20), (25, 30)]), [(10, 40)], "nested");
+        assert_eq!(union(&[(10, 20), (10, 20), (30, 40)]), [(10, 20), (30, 40)], "twice, and apart");
+        assert_eq!(union(&[(30, 40), (10, 35), (50, 60), (55, 70)]), [(10, 40), (50, 70)]);
+        // Against a plain merge of many random ranges.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..50 {
+            let ranges: Vec<(u64, u64)> = (0..40)
+                .map(|_| {
+                    let a = next() % 1000;
+                    (a, a + 1 + next() % 60)
+                })
+                .collect();
+            let mut plain = Spans::default();
+            ranges.iter().for_each(|&(a, b)| plain.add(a as usize, b as usize));
+            plain.join();
+            let want: Vec<(u64, u64)> = plain.iter().map(|(a, b)| (a as u64, b as u64)).collect();
+            assert_eq!(union(&ranges), want, "{ranges:?}");
+        }
     }
 
     /// E1's table: each thread its own slot, only the outermost call timed,

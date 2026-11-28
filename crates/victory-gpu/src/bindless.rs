@@ -501,11 +501,13 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 /// submission shows from the next one on.
 ///
 /// mac: `before` is told what is to be brought up before any of its title
-/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`).
+/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`); it returns the
+/// indices of those to bring up only after the submission left is finished
+/// (`alias,uploads`, [`Uploads::land_late`]).
 pub(crate) fn uploads_after(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
-    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]),
+    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<usize>,
 ) -> Option<Uploads> {
     // mac: two, used in turn with flights' `alias`, else the first only: a
     // submission prepared while the one before still runs takes the list
@@ -579,9 +581,33 @@ pub(crate) fn uploads_after(
             }
         }
     }
-    // mac: before their title memory is read.
-    before(&work);
-    let mut recorded = false;
+    // mac: before their title memory is read; those it names (E2b of
+    // flights) are kept for after the submission left is finished
+    // ([`Uploads::land_late`]): the list notes their states now, for its
+    // prelude, and records their copies then.
+    let mut kept = before(&work);
+    let mut late = Late::default();
+    if !kept.is_empty() {
+        kept.sort_unstable();
+        kept.dedup();
+        let mut now = Vec::with_capacity(work.len() - kept.len());
+        let mut kept = kept.into_iter().peekable();
+        for (i, item) in std::mem::take(&mut work).into_iter().enumerate() {
+            if kept.next_if_eq(&i).is_some() {
+                let (first, back) = crate::texture::upload_later(list, &item.1);
+                if let Some(first) = first {
+                    // SAFETY: an open list; the barrier names a live texture.
+                    unsafe { list.list.ResourceBarrier(&[first]) };
+                }
+                late.back.extend(back);
+                late.work.push(item);
+            } else {
+                now.push(item);
+            }
+        }
+        work = now;
+    }
+    let mut recorded = !late.work.is_empty();
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
     for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
@@ -649,13 +675,19 @@ pub(crate) fn uploads_after(
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };
     }
-    list.close();
+    // mac: with textures kept for later, closed once they are recorded.
+    let pending = !late.work.is_empty();
+    if !pending {
+        list.close();
+    }
     // A list recording nothing is not run (its reset next time is fine).
     recorded.then(|| {
         crate::texture::slot_given(slot);
         Uploads {
             list: guard,
             worker: Mutex::new(ready),
+            pending: pending.into(),
+            late: Mutex::new(late),
         }
     })
 }
@@ -666,7 +698,7 @@ pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
-    uploads_after(heaps, textures, &mut |_| {})
+    uploads_after(heaps, textures, &mut |_| Vec::new())
 }
 
 /// The upload list, used under its lock only.
@@ -675,15 +707,57 @@ pub(crate) struct Holder(Option<HostList>);
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
 
+/// mac (E2b of flights): textures an upload list brings up only once the
+/// submission left is finished, and the barriers that leave them readable.
+#[derive(Default)]
+struct Late {
+    work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)>,
+    back: Vec<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>,
+}
+
 /// The upload list of a submission, ours until it has run.
 pub(crate) struct Uploads {
     list: std::sync::MutexGuard<'static, Holder>,
     worker: Mutex<Option<crate::heap_worker::ReadyDrain>>,
+    /// mac: textures kept for after the submission left is finished: the
+    /// list stays open until [`Uploads::land_late`] records them.
+    pending: std::sync::atomic::AtomicBool,
+    late: Mutex<Late>,
 }
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
         self.list.0.as_ref().expect("made before it is handed out")
+    }
+
+    /// mac (E2b of flights, `VICTORY_FLIGHTS_WITH=alias,uploads`): once the
+    /// submission left is finished, and before the list goes to the GPU:
+    /// the textures kept for then are brought up from title memory as it
+    /// is now (its shaders' writes and its landing in), their copies and
+    /// the barriers that leave them readable recorded, and the list closed.
+    /// At once and nothing more if none are kept, or after the first call.
+    pub(crate) fn land_late(&self) {
+        if !self.pending.swap(false, Relaxed) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let late = std::mem::take(&mut *self.late.lock().unwrap_or_else(|e| e.into_inner()));
+        let list = self.list();
+        let mut uploaded = 0;
+        for ((staging, copy), upload) in late.work.iter().zip(crate::texture::refresh_all(&late.work)) {
+            if let Some((buffer, at, subresources)) = upload {
+                crate::texture::record_copies(list, copy, staging, (&buffer, at), &subresources);
+                uploaded += 1;
+                #[cfg(feature = "diagnostics")]
+                UPLOADED.fetch_add(1, Relaxed);
+            }
+        }
+        if !late.back.is_empty() {
+            // SAFETY: an open list; the barriers name live textures.
+            unsafe { list.list.ResourceBarrier(&late.back) };
+        }
+        list.close();
+        crate::host::unwaited::flights::landed_late(late.work.len(), uploaded, started.elapsed());
     }
 
     /// Whether it holds uploads the background heap worker staged.
@@ -695,6 +769,28 @@ impl Uploads {
     /// GPU fence has completed.
     pub(crate) fn release_worker(&self) {
         drop(self.worker.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+}
+
+impl Drop for Uploads {
+    /// mac: textures kept for later and never landed (not a path
+    /// `crate::host::Host::run` takes): the list is closed with them left
+    /// readable, so that it can be reset; they are brought up next time.
+    fn drop(&mut self) {
+        if !self.pending.swap(false, Relaxed) {
+            return;
+        }
+        tracing::warn!("texture uploads kept for after the submission before were not made: their list is closed without them");
+        let late = std::mem::take(&mut *self.late.lock().unwrap_or_else(|e| e.into_inner()));
+        for (staging, _) in &late.work {
+            staging.invalidate();
+        }
+        let list = self.list();
+        if !late.back.is_empty() {
+            // SAFETY: an open list; the barriers name live textures.
+            unsafe { list.list.ResourceBarrier(&late.back) };
+        }
+        list.close();
     }
 }
 
@@ -742,6 +838,33 @@ pub(crate) fn written(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>)) {
         }
     }
 }
+
+/// mac: what the heap's views for unordered access reach, not the whole
+/// copies they are in ([`written`]): the union of each copy's unordered
+/// ranges (title addresses, `[from, to)`), or the copy's hull of them past
+/// [`UNION_MAX`] ranges. A shader writing through a heap view reaches only
+/// its range (`crate::descriptor::host`'s `buffer_uav` makes the host view
+/// over exactly that range of the copy). For the texture uploads beside a
+/// submission still running (`VICTORY_FLIGHTS_WITH=alias,uploads`).
+pub(crate) fn written_ranges(viewed: &Viewed, mut each: impl FnMut(u64, u64)) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (&(_, uav), (_, starts, ends)) in &inner.ends {
+        if !uav {
+            continue;
+        }
+        if starts.len() > UNION_MAX {
+            if let (Some(&from), Some(&to)) = (starts.keys().next(), ends.keys().next_back()) {
+                each(from, to);
+            }
+        } else {
+            crate::flights::union_of(starts, ends, &mut each);
+        }
+    }
+}
+
+/// Past this many unordered ranges in one copy, [`written_ranges`] gives
+/// their hull (the walk is done under the heap's lock, per submission).
+const UNION_MAX: usize = 4096;
 
 /// The buffer range (title address, bytes) of the view currently in
 /// `index`, changed or not (diagnostics: what a table draw reads there).
